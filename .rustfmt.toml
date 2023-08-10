@@ -1,5 +1,7 @@
 edition = "2021"
 max_width = 120
+comment_width = 120
+wrap_comments = true
 imports_granularity = "Module"
 imports_layout = "HorizontalVertical"
 newline_style = "Unix"
