@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package seamdb;
+
+message Timestamp {
+    uint64 seconds = 1;
+    uint32 nanoseconds = 2;
+    uint32 logical = 3;
+}
+
+message Value {
+    oneof value {
+        int64 int = 1;
+        double float = 2;
+        bytes bytes = 3;
+        string string = 4;
+    }
+}
+
+message TimestampedValue {
+    Value value = 1;
+    Timestamp timestamp = 2;
+}
+
+enum TxnStatus {
+    Pending = 0;
+    Committed = 1;
+    Aborted = 2;
+}
