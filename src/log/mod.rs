@@ -1,17 +1,19 @@
 pub mod kafka;
+pub mod manager;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytesize::ByteSize;
 use compact_str::CompactString;
 
-use super::service_uri::ServiceUri;
+use super::endpoint::{Endpoint, Params, ResourceId};
 
 /// Address to a log.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LogAddress(pub String);
+#[repr(transparent)]
+pub struct LogAddress(String);
 
 impl std::ops::Deref for LogAddress {
     type Target = str;
@@ -24,6 +26,30 @@ impl std::ops::Deref for LogAddress {
 impl std::fmt::Display for LogAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl PartialEq<&str> for LogAddress {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.eq(other)
+    }
+}
+
+impl TryFrom<String> for LogAddress {
+    type Error = anyhow::Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        let id = ResourceId::parse_named("log address", &s)?;
+        if unsafe { id.path().get_unchecked(1..) }.find('/').is_some() {
+            bail!("log address invalid log name: {s}")
+        }
+        Ok(LogAddress(s))
+    }
+}
+
+impl LogAddress {
+    pub fn resource_id(&self) -> ResourceId<'_> {
+        unsafe { ResourceId::new_unchecked(&self.0) }
     }
 }
 
@@ -63,7 +89,7 @@ impl From<LogPosition> for LogOffset {
 
 /// Producer to write byte message to log.
 #[async_trait]
-pub trait ByteLogProducer: Send + std::fmt::Debug {
+pub trait ByteLogProducer: Send + std::fmt::Debug + 'static {
     fn queue(&mut self, payload: &[u8]) -> Result<()>;
 
     async fn wait(&mut self) -> Result<LogPosition>;
@@ -76,7 +102,7 @@ pub trait ByteLogProducer: Send + std::fmt::Debug {
 
 /// Subscriber to read byte message from log.
 #[async_trait]
-pub trait ByteLogSubscriber: Send + Sync + std::fmt::Debug {
+pub trait ByteLogSubscriber: Send + std::fmt::Debug + 'static {
     async fn read(&mut self) -> Result<(LogPosition, &[u8])>;
 
     async fn seek(&mut self, offset: LogOffset) -> Result<()>;
@@ -86,39 +112,22 @@ pub trait ByteLogSubscriber: Send + Sync + std::fmt::Debug {
 
 /// Client to a log cluster.
 #[async_trait]
-pub trait LogClient: Send + Sync + std::fmt::Debug {
-    /// uri to reconstruct this client.
-    fn uri(&self) -> &ServiceUri;
-
-    /// Connection address part from uri with no params for Client customization.
-    fn address(&self) -> &str;
-
-    fn log_address(&self, mut name: String) -> LogAddress {
-        let address = self.address();
-        let i = match address.rfind('?') {
-            None => address.len(),
-            Some(i) => i,
-        };
-        name.reserve(address.len() + 1);
-        name.insert(0, '/');
-        name.insert_str(0, &address[..i]);
-        name.push_str(&address[i..]);
-        LogAddress(name)
-    }
-
+pub trait LogClient: Send + Sync + std::fmt::Debug + 'static {
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>>;
 
     async fn subscribe_log(&self, name: &str, offset: LogOffset) -> Result<Box<dyn ByteLogSubscriber>>;
 
-    async fn create_log(&self, name: &str, retention: ByteSize) -> Result<LogAddress>;
+    async fn create_log(&self, name: &str, retention: ByteSize) -> Result<()>;
 
     async fn delete_log(&self, name: &str) -> Result<()>;
 }
 
 /// Factory to open [LogClient].
 #[async_trait]
-pub trait LogFactory {
-    async fn new_client(uri: ServiceUri) -> Result<Arc<dyn LogClient>>;
+pub trait LogFactory: std::fmt::Debug + 'static {
+    fn scheme(&self) -> &'static str;
+
+    async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>>;
 }
 
 #[cfg(test)]

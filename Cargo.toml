@@ -20,6 +20,9 @@ tonic = { workspace = true }
 prost = { workspace = true }
 prost-derive = { workspace = true }
 num_enum = "0.6.1"
+hashbrown = "0.14.0"
+smallvec = "1.11.0"
+rand = "0.8.5"
 
 [dev-dependencies]
 serial_test = "2.0.0"

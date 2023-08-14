@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Error, Result};
 use async_trait::async_trait;
 use bytesize::ByteSize;
-use compact_str::{CompactString, ToCompactString};
+use compact_str::ToCompactString;
 use derivative::Derivative;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -17,8 +17,8 @@ use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
 use tokio::time;
 
-use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset, LogPosition};
-use crate::service_uri::ServiceUri;
+use crate::log::{ByteLogProducer, ByteLogSubscriber, LogClient, LogFactory, LogOffset, LogPosition};
+use crate::endpoint::{Endpoint, Params};
 
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -177,8 +177,6 @@ impl ByteLogSubscriber for KafkaPartitionConsumer {
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct KafkaLogClient {
-    uri: ServiceUri,
-    address: CompactString,
     config: ClientConfig,
     #[derivative(Debug = "ignore")]
     client: AdminClient<DefaultClientContext>,
@@ -236,14 +234,6 @@ fn into_position(offset: i64) -> LogPosition {
 
 #[async_trait]
 impl LogClient for KafkaLogClient {
-    fn uri(&self) -> &ServiceUri {
-        &self.uri
-    }
-
-    fn address(&self) -> &str {
-        &self.address
-    }
-
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>> {
         let producer = FutureProducer::from_config(&self.config)?;
         Ok(Box::new(KafkaPartitionProducer::new(name.to_string(), producer)))
@@ -258,13 +248,13 @@ impl LogClient for KafkaLogClient {
         Ok(Box::new(KafkaPartitionConsumer::new(name.to_string(), 0, consumer)))
     }
 
-    async fn create_log(&self, name: &str, retention: ByteSize) -> Result<LogAddress> {
+    async fn create_log(&self, name: &str, retention: ByteSize) -> Result<()> {
         let retention_bytes = retention.0.to_compact_string();
         let topics = [new_topic_config(name, self.replication, &retention_bytes)];
         let mut results = self.client.create_topics(&topics, &AdminOptions::default()).await?;
         let topic_result = results.pop().ok_or_else(|| anyhow!("no topic results in topic creation"))?;
         match topic_result {
-            Ok(topic) => Ok(self.log_address(topic)),
+            Ok(_) => Ok(()),
             Err((topic, error_code)) => Err(anyhow!("fail to create kafka topic {}: {}", topic, error_code)),
         }
     }
@@ -278,25 +268,27 @@ impl LogClient for KafkaLogClient {
     }
 }
 
-pub enum KafkaLogFactory {}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KafkaLogFactory {}
 
 #[async_trait]
 impl LogFactory for KafkaLogFactory {
-    async fn new_client(mut uri: ServiceUri) -> Result<Arc<dyn LogClient>> {
+    fn scheme(&self) -> &'static str {
+        "kafka"
+    }
+
+    async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>> {
         let mut config = ClientConfig::new();
-        config.set("bootstrap.servers", uri.address.as_str());
+        config.set("bootstrap.servers", endpoint.address());
         config.set("client.id", "seamdb");
         config.set("group.id", "seamdb");
         config.set("acks", "all");
         let client = AdminClient::from_config(&config)?;
-        let params = std::mem::take(&mut uri.params);
-        let replication = match params.get("replication") {
+        let replication = match params.query("replication") {
             None => 1,
             Some(replication) => replication.parse().map_err(|_| anyhow!("invalid kafka topic replication"))?,
         };
-        let address = uri.to_compact_string();
-        uri.params = params;
-        Ok(Arc::new(KafkaLogClient { uri, address, config, client, replication }))
+        Ok(Arc::new(KafkaLogClient { config, client, replication }))
     }
 }
 
@@ -308,6 +300,7 @@ mod tests {
     use testcontainers::images::generic::GenericImage;
 
     use super::*;
+    use crate::endpoint::*;
 
     fn kafka_image() -> RunnableImage<GenericImage> {
         let image = GenericImage::new("confluentinc/confluent-local", "7.4.1")
@@ -334,12 +327,12 @@ mod tests {
         let kafka = kafka_container();
         let server = format!("kafka://127.0.0.1:{}", kafka.get_host_port_ipv4(9092));
 
-        let uri = server.parse().unwrap();
-        let client = KafkaLogFactory::new_client(uri).await.unwrap();
+        let uri: ServiceUri = server.parse().unwrap();
+        let factory = KafkaLogFactory::default();
+        let client = factory.open_client(&uri.endpoint(), uri.params()).await.unwrap();
 
         let name = "xyz";
-        let topic_uri = client.create_log(name, ByteSize::mib(50)).await.unwrap();
-        assert_that!(topic_uri.0).is_equal_to(format!("{server}/{name}"));
+        client.create_log(name, ByteSize::mib(50)).await.unwrap();
 
         let mut producer = client.produce_log(name).await.unwrap();
         let mut subscriber = client.subscribe_log(name, LogOffset::Earliest).await.unwrap();
