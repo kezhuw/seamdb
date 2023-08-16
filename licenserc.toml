@@ -12,30 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-check: check_fmt lint
+baseDir = "."
 
-verify: check license build test
+headerPath = "Apache-2.0.txt"
 
-fmt:
-	cargo +nightly fmt --all
+excludes = [
+    # Seems that korandoru/hawkeye does not support Makefile
+    # "Makefile",
 
-check_fmt:
-	cargo +nightly fmt --all -- --check
+    "**/Cargo.lock",
 
-license: FORCE
-	docker run -it --rm -v "$$(pwd):/github/workspace" -u "$$(id -u):$$(id -g)" ghcr.io/korandoru/hawkeye-native:v3 check
+    "**/generated/*",
+]
 
-# https://www.gnu.org/software/make/manual/make.html#Force-Targets
-FORCE:
+[properties]
+inceptionYear = 2023
+copyrightOwner = "The SeamDB Authors."
 
-protos:
-	cargo run --manifest-path src/protos/build/Cargo.toml
+[mapping.SCRIPT_STYLE]
+filenames = ["Makefile"]
 
-lint:
-	cargo clippy --no-deps -- -D clippy::all
+[mapping.DOUBLESLASH_STYLE]
+extensions = ["proto"]
 
-build:
-	cargo build
-
-test:
-	cargo test
