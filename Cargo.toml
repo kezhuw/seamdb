@@ -17,6 +17,11 @@ name = "seamdb"
 version = "0.1.0"
 edition = { workspace = true }
 exclude = ["*.proto"]
+license = "Apache-2.0"
+homepage = "https://github.com/kezhuw/seamdb"
+repository = "https://github.com/kezhuw/seamdb"
+description = "A computation cluster to seam existing services to provide database interfaces"
+documentation = "https://docs.rs/seamdb"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
