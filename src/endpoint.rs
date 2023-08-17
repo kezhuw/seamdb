@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Defines textual endpoint for service and resource.
+
 use std::convert::TryFrom;
 use std::fmt::{Display, Formatter, Write as _};
 use std::str::FromStr;
@@ -22,7 +24,9 @@ use hashbrown::Equivalent;
 use hashlink::LinkedHashMap;
 use uriparse::{Authority, Query, Scheme, SchemeError, Segment};
 
-/// Service endpoint for cluster with shape `schema://host1[:port1][,host2]`.
+/// Service endpoint for cluster.
+///
+/// It has shape `schema://host1[:port1][,host2]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Endpoint<'a> {
     scheme: &'a str,
@@ -215,7 +219,9 @@ impl Display for OwnedResourceId {
     }
 }
 
-/// Queryable endpoint for cluster resource with shape `schema://address[path][?param1=abc&param2=xyz]`.
+/// Queryable endpoint for cluster resource.
+///
+/// It has shape `schema://address[path][?param1=abc&param2=xyz]`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ServiceUri {
     scheme: CompactString,
@@ -224,6 +230,7 @@ pub struct ServiceUri {
     params: Params,
 }
 
+/// Query parameters to custom behaviors in connect/open/query to service.
 #[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
 pub struct Params(LinkedHashMap<CompactString, CompactString>);
 

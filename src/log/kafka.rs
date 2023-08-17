@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Kafka log implementation.
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;

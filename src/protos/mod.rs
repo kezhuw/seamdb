@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Generated code for protobuf message and rpc.
+
 #[rustfmt::skip]
 mod generated;
 pub use generated::*;

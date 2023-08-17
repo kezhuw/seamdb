@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! [LogManager] to route log to its client.
+
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
