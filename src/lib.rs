@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod clock;
 pub mod endpoint;
 pub mod log;
 pub mod protos;
