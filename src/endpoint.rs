@@ -43,12 +43,26 @@ impl<'a> Endpoint<'a> {
         self.address
     }
 
-    pub fn with_address(self, address: &'a str) -> Self {
-        Self { scheme: self.scheme, address }
-    }
-
     pub fn to_owned(&self) -> OwnedEndpoint {
         OwnedEndpoint { scheme: self.scheme.into(), address: self.address.into() }
+    }
+
+    pub fn split(self) -> impl Iterator<Item = Endpoint<'a>> + 'a {
+        self.split_with_scheme(self.scheme)
+    }
+
+    pub fn split_once(self) -> Option<(Endpoint<'a>, Endpoint<'a>)> {
+        let address = self.address;
+        let Some((server, remainings)) = address.split_once(',') else {
+            return None;
+        };
+        let scheme = self.scheme;
+        Some((Self { scheme, address: server }, Self { scheme, address: remainings }))
+    }
+
+    pub fn split_with_scheme(self, scheme: &'a str) -> impl Iterator<Item = Endpoint<'a>> + 'a {
+        let address = self.address;
+        address.split(',').map(move |s| Self { scheme, address: s })
     }
 }
 
@@ -425,10 +439,27 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_with_address() {
+    fn test_endpoint_split() {
         let endpoint = Endpoint::try_from("scheme://address,host1:9999,127.0.0.1").unwrap();
-        let endpoint = endpoint.with_address("address1");
-        assert_eq!(endpoint.to_string(), "scheme://address1");
+        let servers: Vec<_> = endpoint.split().collect();
+        assert_eq!(servers, vec![
+            Endpoint { scheme: "scheme", address: "address" },
+            Endpoint { scheme: "scheme", address: "host1:9999" },
+            Endpoint { scheme: "scheme", address: "127.0.0.1" }
+        ]);
+
+        let servers: Vec<_> = endpoint.split_with_scheme("http").collect();
+        assert_eq!(servers, vec![
+            Endpoint { scheme: "http", address: "address" },
+            Endpoint { scheme: "http", address: "host1:9999" },
+            Endpoint { scheme: "http", address: "127.0.0.1" }
+        ]);
+
+        let (server, remainings) = endpoint.split_once().unwrap();
+        assert_eq!(server, Endpoint { scheme: "scheme", address: "address" });
+        assert_eq!(remainings, Endpoint { scheme: "scheme", address: "host1:9999,127.0.0.1" });
+
+        assert_eq!(server.split_once(), None);
     }
 
     #[test]

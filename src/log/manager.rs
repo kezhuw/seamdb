@@ -104,13 +104,12 @@ impl LogManager {
     }
 
     fn add_balanced_client(&mut self, endpoint: &Endpoint, client: &Arc<dyn LogClient>) {
-        // We don't use `split` here to avoid add single-server cluster endpoint.
-        let Some((server, remainings)) = endpoint.address().split_once(',') else {
+        let Some((server, remainings)) = endpoint.split_once() else {
             return;
         };
-        self.add_single_balanced_client(&endpoint.with_address(server), client.clone());
-        for server in remainings.split(',') {
-            self.add_single_balanced_client(&endpoint.with_address(server), client.clone());
+        self.add_single_balanced_client(&server, client.clone());
+        for server in remainings.split() {
+            self.add_single_balanced_client(&server, client.clone());
         }
     }
 
@@ -126,11 +125,11 @@ impl LogManager {
     }
 
     fn get_balanced_client(&self, endpoint: &Endpoint) -> Option<&dyn LogClient> {
-        let mut servers: SmallVec<[&str; 10]> = endpoint.address().split(',').collect();
+        let mut servers: SmallVec<[_; 10]> = endpoint.split().collect();
         let rng = &mut thread_rng();
         servers.shuffle(rng);
         for server in servers {
-            if let Some(clients) = self.balanced_clients.get(&endpoint.with_address(server)) {
+            if let Some(clients) = self.balanced_clients.get(&server) {
                 return Some(clients.choose(rng).unwrap().as_ref());
             };
         }
