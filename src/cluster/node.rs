@@ -304,7 +304,7 @@ impl EtcdNodeRegistry {
         let (resource_id, params) = uri.into();
         let mut client = EtcdHelper::connect(resource_id.endpoint(), &params).await?;
 
-        let tree = format!("{}/nodes/", resource_id.root());
+        let tree = format!("{}/nodes/", resource_id.path());
         let ((nodes, revision), lease) = if let Some(addr) = addr {
             let lease = EtcdHelper::grant_lease(&mut client, None).await?;
             let header = Self::register_node(&mut client, lease.id(), &tree, &node, addr.as_ref()).await?;

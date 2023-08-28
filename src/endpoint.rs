@@ -150,14 +150,6 @@ impl<'a> ResourceId<'a> {
         self.path
     }
 
-    pub fn root(&self) -> &str {
-        if self.path.len() == 1 {
-            ""
-        } else {
-            self.path
-        }
-    }
-
     /// Endpoint of the cluster this resource located in.
     pub fn endpoint(&self) -> Endpoint<'a> {
         Endpoint { scheme: self.scheme, address: self.address }
@@ -187,6 +179,20 @@ impl<'a> ResourceId<'a> {
         let address = trailing.get_unchecked(..slash_index);
         let path = trailing.get_unchecked(slash_index..);
         Self { scheme, address, path }
+    }
+
+    fn is_valid_path(s: &str) -> bool {
+        if s.is_empty() {
+            return true;
+        } else if !s.starts_with('/') {
+            return false;
+        }
+        for segment in s[1..].split('/') {
+            if segment.is_empty() || Segment::try_from(segment).is_err() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -224,14 +230,6 @@ impl OwnedResourceId {
 
     pub fn path(&self) -> &str {
         &self.path
-    }
-
-    pub fn root(&self) -> &str {
-        if self.path.len() == 1 {
-            ""
-        } else {
-            &self.path
-        }
     }
 
     pub fn endpoint(&self) -> Endpoint<'_> {
@@ -287,14 +285,6 @@ impl ServiceUri {
         &self.path
     }
 
-    pub fn root(&self) -> &str {
-        if self.path.len() == 1 {
-            ""
-        } else {
-            &self.path
-        }
-    }
-
     pub fn params(&self) -> &Params {
         &self.params
     }
@@ -309,6 +299,14 @@ impl ServiceUri {
 
     pub fn resource_id(&self) -> ResourceId<'_> {
         ResourceId { scheme: self.scheme(), address: self.address(), path: self.path() }
+    }
+
+    pub fn with_path(self, path: impl Into<CompactString>) -> Result<Self> {
+        let path = path.into();
+        if !ResourceId::is_valid_path(&path) {
+            return Err(anyhow!("invalid path {path} for service uri"));
+        }
+        Ok(Self { path, ..self })
     }
 
     pub fn into(self) -> (OwnedResourceId, Params) {
@@ -345,10 +343,8 @@ impl ServiceUri {
             Some((path, trailing)) => (path, Some(trailing)),
             None => (trailing, None),
         };
-        for segment in path.split('/') {
-            if Segment::try_from(segment).is_err() {
-                return Err(anyhow!("invalid path in service uri: {}", s));
-            }
+        if !ResourceId::is_valid_path(path) {
+            return Err(anyhow!("invalid path in service uri: {}", s));
         }
 
         let params = match trailing {
@@ -500,9 +496,7 @@ mod tests {
 
     #[test]
     fn test_resource_id_ok() {
-        let resource_id = ResourceId::try_from("scheme://address/path").unwrap();
-        assert_eq!(resource_id.root(), "/path");
-        assert_eq!(resource_id.to_owned().root(), "/path");
+        ResourceId::try_from("scheme://address/path").unwrap();
     }
 
     #[test]
@@ -549,6 +543,8 @@ mod tests {
     }
 
     #[test_case("a://host/%"; "")]
+    #[test_case("a://host/a/";)]
+    #[test_case("a://host/a//b";)]
     #[should_panic(expected = "invalid path")]
     fn test_path_invalid(uri: &str) {
         ServiceUri::from_str(uri).unwrap();
@@ -589,7 +585,6 @@ mod tests {
             },
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());
-        assert_that!(uri.root()).is_equal_to("/path/xyz");
 
         let str = "scheme://address/path";
         let uri = ServiceUri::from_str(str).unwrap();
@@ -600,18 +595,6 @@ mod tests {
             params: Default::default(),
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());
-        assert_that!(uri.root()).is_equal_to("/path");
-
-        let str = "scheme://address/";
-        let uri = ServiceUri::from_str(str).unwrap();
-        assert_that!(uri).is_equal_to(ServiceUri {
-            scheme: "scheme".into(),
-            address: "address".into(),
-            path: "/".into(),
-            params: Default::default(),
-        });
-        assert_that!(uri.to_string()).is_equal_to(str.to_string());
-        assert_that!(uri.root()).is_equal_to("");
 
         let str = "scheme+a://address";
         let uri = ServiceUri::from_str(str).unwrap();
@@ -622,7 +605,6 @@ mod tests {
             params: Default::default(),
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());
-        assert_that!(uri.root()).is_equal_to("");
 
         let str = "scheme-b://address";
         let uri = ServiceUri::from_str(str).unwrap();
@@ -633,6 +615,5 @@ mod tests {
             params: Default::default(),
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());
-        assert_that!(uri.root()).is_equal_to("");
     }
 }
