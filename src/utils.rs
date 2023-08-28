@@ -12,9 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod clock;
-pub mod cluster;
-pub mod endpoint;
-pub mod log;
-pub mod protos;
-pub mod utils;
+use tokio::sync::watch;
+
+#[derive(Debug)]
+pub struct DropOwner {
+    sender: watch::Sender<()>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DropWatcher {
+    receiver: watch::Receiver<()>,
+}
+
+impl DropWatcher {
+    pub async fn dropped(&mut self) {
+        self.receiver.changed().await.unwrap_err();
+    }
+}
+
+impl DropOwner {
+    pub fn watch(&self) -> DropWatcher {
+        DropWatcher { receiver: self.sender.subscribe() }
+    }
+}
+
+pub fn drop_watcher() -> (DropOwner, DropWatcher) {
+    let (sender, receiver) = watch::channel(());
+    (DropOwner { sender }, DropWatcher { receiver })
+}

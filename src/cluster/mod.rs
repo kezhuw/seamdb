@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod clock;
-pub mod cluster;
-pub mod endpoint;
-pub mod log;
-pub mod protos;
-pub mod utils;
+mod etcd;
+mod node;
+
+pub use self::node::{EtcdNodeRegistry, NodeId, NodeLease, NodeRegistry, NodeStatistics, NodeStatisticsWatcher};
