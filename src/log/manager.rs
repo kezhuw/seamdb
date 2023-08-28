@@ -82,7 +82,7 @@ impl LogManager {
     ///
     /// This will create a new client if the endpoint is new to any existing clients, otherwise it
     /// will return client opened for same endpoint.
-    #[allow(clippy::cast_ref_to_mut)]
+    #[allow(invalid_reference_casting)]
     pub async fn open_client<'a>(
         &'a mut self,
         endpoint: &Endpoint<'_>,
@@ -175,200 +175,17 @@ impl LogManager {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use speculoos::*;
+    use assertor::*;
+    use bytesize::ByteSize;
 
-    use super::super::*;
-    use super::*;
-    use crate::endpoint::ServiceUri;
-
-    #[derive(Default, Debug)]
-    struct TestLogProducer {}
-
-    #[async_trait]
-    impl ByteLogProducer for TestLogProducer {
-        fn queue(&mut self, _payload: &[u8]) -> Result<()> {
-            unreachable!()
-        }
-
-        async fn wait(&mut self) -> Result<LogPosition> {
-            unreachable!()
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestLogSubscriber {
-        offset: LogOffset,
-    }
-
-    #[async_trait]
-    impl ByteLogSubscriber for TestLogSubscriber {
-        async fn read(&mut self) -> Result<(LogPosition, &[u8])> {
-            unreachable!()
-        }
-
-        async fn seek(&mut self, _offset: LogOffset) -> Result<()> {
-            unreachable!()
-        }
-
-        async fn latest(&self) -> Result<LogPosition> {
-            unreachable!()
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct LogProducerPointer(*const dyn ByteLogProducer);
-
-    impl<T: ByteLogProducer> From<&T> for LogProducerPointer {
-        fn from(r: &T) -> Self {
-            Self(r as *const dyn ByteLogProducer)
-        }
-    }
-
-    impl From<&dyn ByteLogProducer> for LogProducerPointer {
-        fn from(r: &dyn ByteLogProducer) -> Self {
-            Self(r as *const dyn ByteLogProducer)
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct LogSubscriberPointer(*const dyn ByteLogSubscriber);
-
-    impl<T: ByteLogSubscriber> From<&T> for LogSubscriberPointer {
-        fn from(r: &T) -> Self {
-            Self(r as *const dyn ByteLogSubscriber)
-        }
-    }
-
-    impl From<&dyn ByteLogSubscriber> for LogSubscriberPointer {
-        fn from(r: &dyn ByteLogSubscriber) -> Self {
-            Self(r as *const dyn ByteLogSubscriber)
-        }
-    }
-
-    unsafe impl Send for LogProducerPointer {}
-    unsafe impl Send for LogSubscriberPointer {}
-
-    #[derive(Debug)]
-    struct TestLogClient {
-        endpoint: OwnedEndpoint,
-        params: Params,
-        created_logs: Arc<Mutex<HashMap<String, ByteSize>>>,
-        producing_logs: Arc<Mutex<HashMap<String, LogProducerPointer>>>,
-        subscribing_logs: Arc<Mutex<HashMap<String, LogSubscriberPointer>>>,
-    }
-
-    impl TestLogClient {
-        fn new(endpoint: &Endpoint, params: &Params) -> Self {
-            Self {
-                endpoint: endpoint.to_owned(),
-                params: params.to_owned(),
-                created_logs: Default::default(),
-                producing_logs: Default::default(),
-                subscribing_logs: Default::default(),
-            }
-        }
-
-        pub fn endpoint(&self) -> Endpoint<'_> {
-            self.endpoint.as_ref()
-        }
-
-        pub fn params(&self) -> &Params {
-            &self.params
-        }
-
-        pub fn get_log(&self, name: &str) -> Option<ByteSize> {
-            self.created_logs.lock().unwrap().get(name).copied()
-        }
-
-        pub fn get_producer(&self, name: &str) -> Option<&TestLogProducer> {
-            match self.producing_logs.lock().unwrap().get(name).copied() {
-                None => None,
-                Some(pointer) => unsafe { Some(&*(pointer.0 as *const TestLogProducer)) },
-            }
-        }
-
-        pub fn get_subscriber(&self, name: &str) -> Option<&TestLogSubscriber> {
-            match self.subscribing_logs.lock().unwrap().get(name).copied() {
-                None => None,
-                Some(pointer) => unsafe { Some(&*(pointer.0 as *const TestLogSubscriber)) },
-            }
-        }
-    }
-
-    #[async_trait]
-    impl LogClient for TestLogClient {
-        async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>> {
-            if self.created_logs.lock().unwrap().get(name).is_none() {
-                bail!("log not found")
-            }
-            let producer = Box::new(TestLogProducer::default());
-            self.producing_logs.lock().unwrap().insert(name.to_string(), LogProducerPointer::from(producer.as_ref()));
-            Ok(producer)
-        }
-
-        async fn subscribe_log(&self, name: &str, offset: LogOffset) -> Result<Box<dyn ByteLogSubscriber>> {
-            if self.created_logs.lock().unwrap().get(name).is_none() {
-                bail!("log not found")
-            }
-            let subscriber = Box::new(TestLogSubscriber { offset });
-            self.subscribing_logs
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), LogSubscriberPointer::from(subscriber.as_ref()));
-            Ok(subscriber)
-        }
-
-        async fn create_log(&self, name: &str, retention: ByteSize) -> Result<()> {
-            if self.created_logs.lock().unwrap().insert(name.to_string(), retention).is_some() {
-                bail!("log already exists")
-            }
-            Ok(())
-        }
-
-        async fn delete_log(&self, name: &str) -> Result<()> {
-            self.created_logs.lock().unwrap().remove(name);
-            Ok(())
-        }
-    }
-
-    #[derive(Default, Clone, Debug)]
-    struct TestLogFactory {
-        scheme: &'static str,
-        clients: Arc<Mutex<HashMap<OwnedEndpoint, Arc<TestLogClient>>>>,
-    }
-
-    impl TestLogFactory {
-        pub fn new(scheme: &'static str) -> Self {
-            Self { scheme, ..Default::default() }
-        }
-
-        fn add_client(&self, endpoint: &Endpoint, client: Arc<TestLogClient>) {
-            self.clients.lock().unwrap().insert(endpoint.to_owned(), client);
-        }
-
-        pub fn get_client(&self, endpoint: &Endpoint) -> Option<Arc<TestLogClient>> {
-            self.clients.lock().unwrap().get(endpoint).cloned()
-        }
-    }
-
-    #[async_trait]
-    impl LogFactory for TestLogFactory {
-        fn scheme(&self) -> &'static str {
-            self.scheme
-        }
-
-        async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>> {
-            let client = Arc::new(TestLogClient::new(endpoint, params));
-            self.add_client(endpoint, client.clone());
-            Ok(client)
-        }
-    }
+    use crate::endpoint::{Endpoint, Params, ServiceUri};
+    use crate::log::tests::*;
+    use crate::log::{LogAddress, LogClient, LogOffset, LogRegistry};
 
     #[test]
-    fn test_registry_find_factory() {
+    fn test_log_registry_find_factory() {
         let factory1 = TestLogFactory::new("scheme1");
         let factory2 = TestLogFactory::new("scheme2");
         let mut registry = LogRegistry::default();
@@ -382,7 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_registry_new_client() {
+    async fn test_log_registry_new_client() {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
@@ -397,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     #[should_panic(expected = "no log factory for scheme")]
-    async fn test_registry_no_factory() {
+    async fn test_log_registry_no_factory() {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1).unwrap();
@@ -405,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_registry_into_manager() {
+    async fn test_log_registry_into_manager() {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
@@ -415,30 +232,37 @@ mod tests {
         let created_client: Arc<dyn LogClient> = factory1.get_client(&endpoint).unwrap();
         assert_that!(manager.active_address.as_ref()).is_equal_to(endpoint);
         assert!(Arc::ptr_eq(&manager.active_client, &created_client));
-        assert!(std::ptr::eq(
-            manager.get_client(&Endpoint::try_from("scheme1://server1").unwrap()).unwrap(),
-            created_client.as_ref()
-        ));
-        assert!(std::ptr::eq(
-            manager.get_client(&Endpoint::try_from("scheme1://server1,server3").unwrap()).unwrap(),
-            created_client.as_ref()
-        ));
-        assert!(std::ptr::eq(
-            manager.get_client(&Endpoint::try_from("scheme1://server2:2222").unwrap()).unwrap(),
-            created_client.as_ref()
-        ));
-        assert!(std::ptr::eq(
-            manager.get_client(&Endpoint::try_from("scheme1://server1,server2:2222").unwrap()).unwrap(),
-            created_client.as_ref()
-        ));
-        assert!(std::ptr::eq(
-            manager.get_client(&Endpoint::try_from("scheme1://server4,server2:2222").unwrap()).unwrap(),
-            created_client.as_ref()
-        ));
+
+        // https://github.com/rust-lang/rust/issues/106447
+        assert_eq!(
+            manager.get_client(&Endpoint::try_from("scheme1://server1").unwrap()).unwrap() as *const dyn LogClient
+                as *const (),
+            created_client.as_ref() as *const dyn LogClient as *const (),
+        );
+        assert_eq!(
+            manager.get_client(&Endpoint::try_from("scheme1://server1,server3").unwrap()).unwrap()
+                as *const dyn LogClient as *const (),
+            created_client.as_ref() as *const dyn LogClient as *const ()
+        );
+        assert_eq!(
+            manager.get_client(&Endpoint::try_from("scheme1://server2:2222").unwrap()).unwrap() as *const dyn LogClient
+                as *const (),
+            created_client.as_ref() as *const dyn LogClient as *const ()
+        );
+        assert_eq!(
+            manager.get_client(&Endpoint::try_from("scheme1://server1,server2:2222").unwrap()).unwrap()
+                as *const dyn LogClient as *const (),
+            created_client.as_ref() as *const dyn LogClient as *const ()
+        );
+        assert_eq!(
+            manager.get_client(&Endpoint::try_from("scheme1://server4,server2:2222").unwrap()).unwrap()
+                as *const dyn LogClient as *const (),
+            created_client.as_ref() as *const dyn LogClient as *const ()
+        );
     }
 
     #[tokio::test]
-    async fn test_manager_open_client() {
+    async fn test_log_manager_open_client() {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
@@ -454,47 +278,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manager_log() {
+    async fn test_log_manager_logging() {
         let factory = TestLogFactory::new("scheme");
         let mut registry = LogRegistry::default();
         registry.register(factory.clone()).unwrap();
         let active_endpoint = Endpoint::try_from("scheme://server1,server2").unwrap();
         let mut manager = registry.into_manager(&active_endpoint, &Params::default()).await.unwrap();
 
-        let log1 = manager.create_log("log1", ByteSize::mib(512)).await.unwrap();
-        assert!(log1 == "scheme://server1,server2/log1");
+        // given: create a log through log manager
+        let log1_address = manager.create_log("log1", ByteSize::mib(512)).await.unwrap();
+        assert!(log1_address == "scheme://server1,server2/log1");
 
+        // then: log created in active client
         let active_client = factory.get_client(&active_endpoint).unwrap();
-        assert_eq!(active_client.get_log("log1").unwrap(), ByteSize::mib(512));
+        let log1 = active_client.get_log("log1").unwrap();
+        assert_eq!(log1.name(), "log1");
+        assert_eq!(log1.retention(), ByteSize::mib(512));
 
-        let log1_subscriber = manager.subscribe_log(&log1, LogOffset::Latest).await.unwrap();
-        let cached_log1_subscriber = active_client.get_subscriber("log1").unwrap();
-        assert_eq!(cached_log1_subscriber.offset, LogOffset::Latest);
-        assert!(std::ptr::eq(log1_subscriber.as_ref(), cached_log1_subscriber as &dyn ByteLogSubscriber));
+        // given: producer/subscriber to same log
+        let mut log1_producer = manager.produce_log(&log1_address).await.unwrap();
+        let mut log1_subscriber = manager.subscribe_log(&log1_address, LogOffset::Latest).await.unwrap();
 
-        active_client.create_log("log2", ByteSize::default()).await.unwrap();
-        let log2_producer =
-            manager.produce_log(&LogAddress::try_from("scheme://server2/log2".to_string()).unwrap()).await.unwrap();
-        assert!(std::ptr::eq(
-            log2_producer.as_ref(),
-            active_client.get_producer("log2").unwrap() as &dyn ByteLogProducer
-        ));
+        // then: subscriber will read what producer send
+        let payload1_position = log1_producer.send(b"payload1").await.unwrap();
+        assert_that!(log1_subscriber.read().await.unwrap()).is_equal_to((payload1_position, b"payload1".as_slice()));
 
+        // given: log created in balanced client
+        let balanced_client = active_client.clone();
+        balanced_client.create_log("log2", ByteSize::default()).await.unwrap();
+        let log2_address = LogAddress::try_from("scheme://server2/log2".to_string()).unwrap();
+
+        // then: producer and subscriber are connected through balanced client
+        let mut log2_producer = manager.produce_log(&log2_address).await.unwrap();
+        let mut log2_subscriber = manager.subscribe_log(&log2_address, LogOffset::Latest).await.unwrap();
+        let subscriber_handle = tokio::spawn(async move {
+            let (position, payload) = log2_subscriber.read().await.unwrap();
+            (position, payload.to_owned())
+        });
+        let payload2_position = log2_producer.send(b"payload2").await.unwrap();
+        assert_that!(subscriber_handle.await.unwrap())
+            .is_equal_to((payload2_position, b"payload2".as_slice().to_owned()));
+
+        // given: cluster endpoint for "server2"
         let fallback_endpoint2 = Endpoint::try_from("scheme://server2").unwrap();
         manager.open_client(&fallback_endpoint2, &Params::default()).await.unwrap();
-        assert!(manager
+
+        // then: balanced client for "server2" will be shadowed
+        assert_that!(manager
             .produce_log(&LogAddress::try_from("scheme://server2/log2".to_string()).unwrap())
             .await
             .unwrap_err()
-            .to_string()
-            .contains("log not found"));
+            .to_string())
+        .contains("log log2 not found");
 
+        // then: balanced client for "server1" should work as normal
         let log1_address = LogAddress::try_from("scheme://server1/log1".to_string()).unwrap();
-        let log1_producer = manager.produce_log(&log1_address).await.unwrap();
-        assert!(std::ptr::eq(
-            log1_producer.as_ref(),
-            active_client.get_producer("log1").unwrap() as &dyn ByteLogProducer
-        ));
+        let mut log1_producer = manager.produce_log(&log1_address).await.unwrap();
+        let payload3_position = log1_producer.send(b"payload3").await.unwrap();
+        assert_that!(log1_subscriber.read().await.unwrap()).is_equal_to((payload3_position, b"payload3".as_slice()));
 
         manager.delete_log(&log1_address).await.unwrap();
         assert!(active_client.get_log("log1").is_none());
