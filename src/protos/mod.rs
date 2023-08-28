@@ -16,4 +16,34 @@
 
 #[rustfmt::skip]
 mod generated;
-pub use generated::*;
+pub use self::data_message::Operation as DataOperation;
+pub use self::generated::*;
+pub use self::tablet_service_client::TabletServiceClient;
+pub use self::tablet_service_server::{TabletService, TabletServiceServer};
+pub use crate::keys;
+
+impl From<ClusterMeta> for TabletDeployment {
+    fn from(meta: ClusterMeta) -> Self {
+        let tablet = TabletDescriptor {
+            id: 1,
+            generation: 0,
+            range: TabletRange { start: keys::ROOT_KEY_PREFIX.to_owned(), end: keys::RANGE_KEY_PREFIX.to_owned() },
+            log: meta.log,
+            merge_bounds: TabletMergeBounds::None,
+        };
+        Self { tablet, epoch: meta.epoch, generation: meta.generation, servers: meta.servers }
+    }
+}
+
+impl From<&ClusterMeta> for TabletDeployment {
+    fn from(meta: &ClusterMeta) -> Self {
+        let tablet = TabletDescriptor {
+            id: 1,
+            generation: 0,
+            range: TabletRange { start: keys::ROOT_KEY_PREFIX.to_owned(), end: keys::RANGE_KEY_PREFIX.to_owned() },
+            log: meta.log.clone(),
+            merge_bounds: TabletMergeBounds::None,
+        };
+        TabletDeployment { tablet, epoch: meta.epoch, generation: meta.generation, servers: meta.servers.clone() }
+    }
+}

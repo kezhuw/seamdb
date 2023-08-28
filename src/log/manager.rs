@@ -151,6 +151,11 @@ impl LogManager {
         bail!("no client for log address: {address}")
     }
 
+    pub fn locate_log(&self, name: &str) -> LogAddress {
+        let address = format!("{}/{}", self.active_address, name);
+        LogAddress(address)
+    }
+
     pub async fn create_log(&self, name: &str, retention: ByteSize) -> Result<LogAddress> {
         self.active_client.create_log(name, retention).await?;
         let address = format!("{}/{}", self.active_address, name);

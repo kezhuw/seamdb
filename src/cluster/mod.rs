@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod env;
 mod etcd;
+mod meta;
 mod node;
 
+pub use self::env::ClusterEnv;
+pub use self::meta::{ClusterDeploymentWatcher, ClusterMetaHandle, EtcdClusterMetaDaemon};
 pub use self::node::{EtcdNodeRegistry, NodeId, NodeLease, NodeRegistry, NodeStatistics, NodeStatisticsWatcher};
+pub use crate::protos::ClusterMeta;

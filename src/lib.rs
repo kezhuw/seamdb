@@ -15,6 +15,7 @@
 pub mod clock;
 pub mod cluster;
 pub mod endpoint;
+pub mod keys;
 pub mod log;
 pub mod protos;
 pub mod utils;

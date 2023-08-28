@@ -39,9 +39,16 @@ fn main() {
         .type_attribute("Timestamp", "#[derive(Copy, Eq, PartialOrd, Ord)]")
         .type_attribute("TxnStatus", "#[derive(::num_enum::TryFromPrimitive)]")
         .oneof_enum("Value")
+        .oneof_enum("Temporal")
         .enumerate_field(".seamdb")
         .require_field("TimestampedValue.value")
-        .require_field("TimestampedValue.timestamp");
+        .require_field("TimestampedValue.timestamp")
+        .require_field("TabletManifest.tablet")
+        .require_field("TabletDescriptor.range")
+        .require_field("TabletDeployment.tablet")
+        .require_field("TabletListRequest.range")
+        .require_field("TabletDeployRequest.deployment")
+        .require_field("TabletDescription.store");
 
     tonic_build::configure().out_dir(&outdir).compile_with_config(config, &protos, &[protos_dir]).unwrap();
 

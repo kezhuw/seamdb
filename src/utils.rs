@@ -40,3 +40,20 @@ pub fn drop_watcher() -> (DropOwner, DropWatcher) {
     let (sender, receiver) = watch::channel(());
     (DropOwner { sender }, DropWatcher { receiver })
 }
+
+pub trait WatchConsumer<T> {
+    fn consume(&mut self) -> T;
+}
+
+impl<T: Clone> WatchConsumer<T> for watch::Receiver<T> {
+    fn consume(&mut self) -> T {
+        let borrowed = self.borrow_and_update();
+        borrowed.clone()
+    }
+}
+
+impl<T: Clone> WatchConsumer<T> for watch::Sender<T> {
+    fn consume(&mut self) -> T {
+        self.borrow().clone()
+    }
+}

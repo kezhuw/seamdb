@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use compact_str::ToCompactString;
-use etcd_client::{Client, ConnectOptions, LeaseClient, LeaseKeepAliveStream, LeaseKeeper};
+use etcd_client::{Client, ConnectOptions, LeaseClient, LeaseKeepAliveStream, LeaseKeeper, LockOptions};
 use ignore_result::Ignore;
 use tokio::select;
 
@@ -103,6 +103,12 @@ impl EtcdHelper {
         let (owner, watcher) = utils::drop_watcher();
         tokio::spawn(Self::heartbeat_lease(client, keeper, alive_stream, watcher, ttl));
         Ok(owner)
+    }
+
+    pub async fn lock(client: &mut Client, lock: impl Into<String>, lease_id: i64) -> Result<Vec<u8>> {
+        let options = LockOptions::new().with_lease(lease_id);
+        let response = client.lock(lock.into(), Some(options)).await?;
+        Ok(response.0.key)
     }
 }
 

@@ -16,6 +16,74 @@ syntax = "proto3";
 
 package seamdb;
 
+message MessageId {
+    uint64 epoch = 1;
+    // Sequence for deduplication.
+    uint64 sequence = 2;
+}
+
+message TabletRange {
+    bytes start = 1;
+    bytes end = 2;
+}
+
+message TabletSegment {
+    string file = 1;
+    string log = 2;
+    TabletRange range = 3;
+}
+
+message TabletStore {
+    repeated TabletSegment segments = 1;
+    string file = 2;
+    // kafka://kafka-cluster-address/topic-name?start=1
+    string log = 3;
+    TabletRange range = 4;
+}
+
+enum TabletMergeBounds {
+    All = 0;
+    Left = 1;
+    Right = 2;
+    None = 3;
+}
+
+message TabletDescriptor {
+    uint64 id = 1;
+    // Increment on each split/merge.
+    uint64 generation = 2;
+    TabletRange range = 3;
+    string log = 4;
+
+    // Default to All.
+    TabletMergeBounds merge_bounds = 5;
+}
+
+message TabletDescription {
+    uint64 id = 1;
+    uint64 generation = 2;
+    TabletStore store = 4;
+}
+
+message TabletManifest {
+    TabletDescription tablet = 1;
+    repeated TabletDescriptor splits = 2;
+
+    TabletWatermark watermark = 5;
+
+    // Empty logs and files for future usage.
+    repeated string empty_logs = 30;
+    repeated string empty_files = 31;
+
+    // Dirty logs and files from previous runs. We are uncertain about their
+    // states, so we are going to delete them in future.
+    repeated string dirty_logs = 32;
+    repeated string dirty_files = 33;
+
+    repeated string obsoleted_logs = 34;
+    repeated string obsoleted_files = 35;
+}
+
 message Timestamp {
     uint64 seconds = 1;
     uint32 nanoseconds = 2;
@@ -36,8 +104,237 @@ message TimestampedValue {
     Timestamp timestamp = 2;
 }
 
+message KeyValue {
+    bytes key = 1;
+    // Tombstone if empty.
+    Value value = 2;
+}
+
+message Temporal {
+    oneof value {
+        Timestamp timestamp = 1;
+        Transaction transaction = 2;
+    }
+}
+
+message Write {
+    bytes key = 1;
+
+    // Tombstone if empty.
+    Value value = 2;
+
+    uint32 sequence = 3;
+}
+
+message Batch {
+    repeated Write writes = 2;
+}
+
+message TabletServerAssignment {
+    uint64 generation = 1;
+    repeated string servers = 2;
+}
+
+message ManifestMessage {
+    uint64 epoch = 1;
+
+    uint64 sequence = 2;
+
+    TabletManifest manifest = 3;
+}
+
+message DataMessage {
+    uint64 epoch = 1;
+
+    // Sequence for deduplication.
+    uint64 sequence = 2;
+
+    Temporal temporal = 3;
+
+    // None for epoch update.
+    oneof operation {
+        Write write = 4;
+        Batch batch = 5;
+    }
+
+    Timestamp closed_timestamp = 6;
+    Timestamp leader_expiration = 7;
+}
+
+message Transaction {
+    bytes id = 1;
+
+    // Tablet locating key where this txn record resides in.
+    bytes key = 2;
+
+    // Increase on restart.
+    uint32 epoch = 3;
+
+    // Increase on write.
+    uint32 sequence = 4;
+
+    Timestamp create_ts = 5;
+
+    // Default to create_ts if not pushed forward.
+    Timestamp commit_ts = 6;
+
+    TxnStatus status = 7;
+
+    // Write set to resolve in txn commitment.
+    repeated Span write_set = 8;
+
+    // Milliseconds that transaction read will fence write.
+    uint32 fence_duration = 10;
+}
+
+message TxnRecord {
+    bytes id = 1;
+
+    // Tablet locating key where this txn record resides in.
+    bytes key = 2;
+
+    // Increment on transaction restart.
+    uint32 epoch = 3;
+
+    // Timestamp at which point this transaction was created and got timestamp assigned.
+    //
+    // This is required as writes of transaction record and data records are parallel.
+    // In transaction query, it is agnostic whether transaction record has been written.
+    //
+    // * In query, node use this timestamp to decide whether this transaction is aborted or
+    //   has not been created yet.
+    // * In creation, node use this timestamp to decide whether this transaction is able to create.
+    //
+    // This field should never be changed after assigned.
+    Timestamp create_ts = 5;
+
+    // Timestamp at which point this transaction was considered as committed or aborted.
+    //
+    // Fallback to create_ts if None.
+    Timestamp commit_ts = 6;
+
+    TxnStatus status = 7;
+
+    repeated Span write_set = 8;
+
+    Timestamp heartbeat_ts = 9;
+}
+
+message TxnMeta {
+    bytes id = 1;
+
+    // Tablet locating key where this txn record resides in.
+    bytes key = 2;
+
+    // Increment on transaction restart.
+    uint32 epoch = 3;
+
+    // Increase on write.
+    uint32 sequence = 4;
+
+    // Timestamp at which point this transaction was created and got timestamp assigned.
+    //
+    // This is required as writes of transaction record and data records are parallel.
+    // In transaction query, it is agnostic whether transaction record has been written.
+    //
+    // * In query, node use this timestamp to decide whether this transaction is aborted or
+    //   has not been created yet.
+    // * In creation, node use this timestamp to decide whether this transaction is able to create.
+    //
+    // This field should never be changed after assigned.
+    Timestamp create_ts = 5;
+
+    // Timestamp at which point this transaction was considered as committed or aborted.
+    //
+    // Fallback to create_ts if None.
+    Timestamp commit_ts = 6;
+}
+
+message TxnIntent {
+    TxnMeta txn = 1;
+
+    Value value = 2;
+
+    message Intent {
+        Value value = 1;
+
+        // Sequence of this intent.
+        uint32 sequence = 2;
+    }
+
+    repeated Intent history = 4;
+}
+
+message TabletDeployment {
+    TabletDescriptor tablet = 1;
+    // Increment on leader change.
+    uint64 epoch = 2;
+    // Increment on not-leader change and reset on leader change.
+    uint64 generation = 3;
+    repeated string servers = 4;
+}
+
+message TabletDeployRequest {
+    TabletDeployment deployment = 1;
+}
+
+message TabletDeployResponse {
+    repeated TabletDeployment deployments = 1;
+}
+
+message TabletWatermark {
+    MessageId cursor = 1;
+    Timestamp closed_timestamp = 3;
+    Timestamp leader_expiration = 4;
+}
+
+message TabletListRequest {
+    TabletRange range = 1;
+}
+
+message TabletListResponse {
+    repeated TabletDeployment deployments = 1;
+}
+
+message ClusterMeta {
+    string name = 1;
+
+    uint64 epoch = 2;
+    uint64 generation = 3;
+    repeated string servers = 4;
+
+    string log = 5;
+
+    repeated string bootstrap_logs = 6;
+    repeated string obsoleted_logs = 7;
+}
+
+message SequenceRange {
+    uint32 start = 1;
+    uint32 end = 2;
+}
+
+message Span {
+    bytes key = 1;
+    bytes end_key = 2;
+}
+
 enum TxnStatus {
     Pending = 0;
     Committed = 1;
     Aborted = 2;
+}
+
+message HeartbeatRequest {
+    uint64 tablet_id = 1;
+}
+
+message HeartbeatResponse {}
+
+service TabletService {
+    rpc ListTablets(TabletListRequest) returns (TabletListResponse);
+
+    rpc DeployTablet(TabletDeployRequest) returns (TabletDeployResponse);
+
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
