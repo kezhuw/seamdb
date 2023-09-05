@@ -22,7 +22,7 @@ use hashbrown::hash_map::{Entry, HashMap};
 use rand::prelude::*;
 use smallvec::SmallVec;
 
-use super::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset};
+use super::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset, OwnedLogAddress};
 use crate::endpoint::{Endpoint, OwnedEndpoint, Params};
 
 #[derive(Debug)]
@@ -144,35 +144,39 @@ impl LogManager {
     }
 
     fn find_client<'a, 'b>(&'a self, address: &'b LogAddress) -> Result<(&'a dyn LogClient, &'b str)> {
-        let resource_id = address.resource_id();
-        if let Some(client) = self.get_client(&resource_id.endpoint()) {
-            return Ok((client, &resource_id.path()[1..]));
+        let uri = address.uri();
+        if let Some(client) = self.get_client(&uri.endpoint()) {
+            return Ok((client, &uri.path()[1..]));
         };
         bail!("no client for log address: {address}")
     }
 
-    pub fn locate_log(&self, name: &str) -> LogAddress {
+    pub fn locate_log(&self, name: &str) -> OwnedLogAddress {
         let address = format!("{}/{}", self.active_address, name);
-        LogAddress(address)
+        OwnedLogAddress::new(address).unwrap()
     }
 
-    pub async fn create_log(&self, name: &str, retention: ByteSize) -> Result<LogAddress> {
+    pub async fn create_log(&self, name: &str, retention: ByteSize) -> Result<OwnedLogAddress> {
         self.active_client.create_log(name, retention).await?;
         let address = format!("{}/{}", self.active_address, name);
-        Ok(LogAddress(address))
+        Ok(OwnedLogAddress::new(address).unwrap())
     }
 
-    pub async fn delete_log(&self, address: &LogAddress) -> Result<()> {
+    pub async fn delete_log(&self, address: &LogAddress<'_>) -> Result<()> {
         let (client, name) = self.find_client(address)?;
         client.delete_log(name).await
     }
 
-    pub async fn produce_log(&self, address: &LogAddress) -> Result<Box<dyn ByteLogProducer>> {
+    pub async fn produce_log(&self, address: &LogAddress<'_>) -> Result<Box<dyn ByteLogProducer>> {
         let (client, name) = self.find_client(address)?;
         client.produce_log(name).await
     }
 
-    pub async fn subscribe_log(&self, address: &LogAddress, offset: LogOffset) -> Result<Box<dyn ByteLogSubscriber>> {
+    pub async fn subscribe_log(
+        &self,
+        address: &LogAddress<'_>,
+        offset: LogOffset,
+    ) -> Result<Box<dyn ByteLogSubscriber>> {
         let (client, name) = self.find_client(address)?;
         client.subscribe_log(name, offset).await
     }
@@ -311,7 +315,7 @@ mod tests {
         // given: log created in balanced client
         let balanced_client = active_client.clone();
         balanced_client.create_log("log2", ByteSize::default()).await.unwrap();
-        let log2_address = LogAddress::try_from("scheme://server2/log2".to_string()).unwrap();
+        let log2_address = LogAddress::try_from("scheme://server2/log2").unwrap();
 
         // then: producer and subscriber are connected through balanced client
         let mut log2_producer = manager.produce_log(&log2_address).await.unwrap();
@@ -330,14 +334,14 @@ mod tests {
 
         // then: balanced client for "server2" will be shadowed
         assert_that!(manager
-            .produce_log(&LogAddress::try_from("scheme://server2/log2".to_string()).unwrap())
+            .produce_log(&LogAddress::try_from("scheme://server2/log2").unwrap())
             .await
             .unwrap_err()
             .to_string())
         .contains("log log2 not found");
 
         // then: balanced client for "server1" should work as normal
-        let log1_address = LogAddress::try_from("scheme://server1/log1".to_string()).unwrap();
+        let log1_address = LogAddress::try_from("scheme://server1/log1").unwrap();
         let mut log1_producer = manager.produce_log(&log1_address).await.unwrap();
         let payload3_position = log1_producer.send(b"payload3").await.unwrap();
         assert_that!(log1_subscriber.read().await.unwrap()).is_equal_to((payload3_position, b"payload3".as_slice()));

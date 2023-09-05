@@ -17,63 +17,119 @@
 mod kafka;
 mod manager;
 
+use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytesize::ByteSize;
 use compact_str::CompactString;
+use derivative::Derivative;
 
 pub use self::kafka::KafkaLogFactory;
 pub use self::manager::{LogManager, LogRegistry};
 use super::endpoint::{Endpoint, Params, ResourceId};
 
-/// Address to a log.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct LogAddress(String);
+pub type OwnedLogAddress = LogAddress<'static>;
 
-impl std::ops::Deref for LogAddress {
+/// Address to a log.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct LogAddress<'a> {
+    str: Cow<'a, str>,
+    #[derivative(Debug = "ignore")]
+    uri: ResourceId<'a>,
+}
+
+impl<'a> TryFrom<&'a str> for LogAddress<'a> {
+    type Error = anyhow::Error;
+
+    fn try_from(str: &'a str) -> Result<Self> {
+        Self::new(str)
+    }
+}
+
+impl std::ops::Deref for LogAddress<'_> {
     type Target = str;
 
     fn deref(&self) -> &str {
-        &self.0
+        &self.str
     }
 }
 
-impl std::fmt::Display for LogAddress {
+impl std::fmt::Display for LogAddress<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        f.write_str(&self.str)
     }
 }
 
-impl PartialEq<&str> for LogAddress {
+impl PartialEq<&str> for LogAddress<'_> {
     fn eq(&self, other: &&str) -> bool {
-        self.0.eq(other)
+        self.str.eq(*other)
     }
 }
 
-impl TryFrom<String> for LogAddress {
-    type Error = anyhow::Error;
+impl PartialEq<Self> for LogAddress<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.str.eq(&other.str)
+    }
+}
 
-    fn try_from(s: String) -> Result<Self> {
-        let id = ResourceId::parse_named("log address", &s)?;
-        if unsafe { id.path().get_unchecked(1..) }.find('/').is_some() {
-            bail!("log address invalid log name: {s}")
+impl From<LogAddress<'_>> for String {
+    fn from(address: LogAddress<'_>) -> Self {
+        address.str.into_owned()
+    }
+}
+
+impl Hash for LogAddress<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.str.as_ref().hash(state)
+    }
+}
+
+impl Clone for LogAddress<'_> {
+    fn clone(&self) -> Self {
+        let str = self.str.clone();
+        if matches!(str, Cow::Borrowed(_)) {
+            return Self { str, uri: self.uri };
         }
-        Ok(LogAddress(s))
+        let uri = unsafe { self.uri.relocate(std::mem::transmute(str.as_ref())) };
+        Self { str, uri }
     }
 }
 
-impl From<LogAddress> for String {
-    fn from(address: LogAddress) -> String {
-        address.0
+impl<'a> LogAddress<'a> {
+    pub fn new(str: impl Into<Cow<'a, str>>) -> Result<Self> {
+        let str = str.into();
+        let uri = ResourceId::parse_named("log address", str.as_ref())?;
+        if unsafe { uri.path().get_unchecked(1..) }.find('/').is_some() {
+            bail!("log address invalid log name: {str}")
+        }
+        let uri: ResourceId<'a> = unsafe { std::mem::transmute(uri) };
+        Ok(Self { str, uri })
     }
-}
 
-impl LogAddress {
-    pub fn resource_id(&self) -> ResourceId<'_> {
-        unsafe { ResourceId::new_unchecked(&self.0) }
+    pub fn uri(&self) -> ResourceId<'_> {
+        self.uri
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.str
+    }
+
+    pub fn to_owned(&self) -> LogAddress<'static> {
+        self.clone().into_owned()
+    }
+
+    pub fn into_owned(self) -> LogAddress<'static> {
+        let str = match &self.str {
+            Cow::Owned(_) => return unsafe { std::mem::transmute(self) },
+            Cow::Borrowed(str) => str.to_string(),
+        };
+        let str: Cow<'static, str> = Cow::Owned(str);
+        let uri = unsafe { self.uri.relocate(std::mem::transmute(str.as_ref())) };
+        LogAddress { str, uri }
     }
 }
 
@@ -165,6 +221,7 @@ pub mod tests {
     use bytesize::ByteSize;
     use hashbrown::hash_map::HashMap;
     use speculoos::*;
+    use test_case::test_case;
     use tokio::sync::watch;
 
     use crate::endpoint::{Endpoint, OwnedEndpoint, Params};
@@ -378,8 +435,43 @@ pub mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "log address expect path")]
+    fn test_log_address_no_name() {
+        LogAddress::new("kafka://localhost:9092").unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "log address invalid log name")]
+    fn test_log_address_invalid_path() {
+        LogAddress::new("kafka://localhost:9092/a/b").unwrap();
+    }
+
+    #[test]
     fn test_log_address_display() {
-        let address = "kafka://localhost:9092/xyz".to_string();
-        assert_that!(LogAddress(address.clone()).to_string()).is_equal_to(address);
+        let address = "kafka://localhost:9092/xyz";
+        assert_that!(LogAddress::new(address).unwrap().to_string()).is_equal_to(address.to_string());
+    }
+
+    #[test_case("kafka://localhost/abc")]
+    fn test_log_address_str(uri: &str) {
+        let address = LogAddress::new(uri).unwrap();
+        assert_that!(address.as_str()).is_equal_to(uri);
+        assert_that!(address.uri().to_string().as_ref()).is_equal_to(uri);
+    }
+
+    #[test_case("kafka://localhost/abc")]
+    fn test_log_address_equal(uri: &str) {
+        let address = LogAddress::new(uri).unwrap();
+        assert_eq!(address, uri);
+        assert_that!(address.as_str()).is_equal_to(uri);
+        assert_that!(address.uri().to_string().as_ref()).is_equal_to(uri);
+    }
+
+    #[test_case("kafka://localhost/abc")]
+    fn test_log_address_owned(uri: &str) {
+        let address = LogAddress::new(uri).unwrap();
+        assert_that!(address).is_equal_to(LogAddress::new(uri.to_string()).unwrap());
+        assert_that!(address).is_equal_to(address.to_owned());
+        assert_that!(address.into_owned().as_str()).is_equal_to(uri);
     }
 }

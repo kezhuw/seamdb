@@ -45,7 +45,7 @@ use super::node::{NodeId, NodeRegistry};
 use super::ClusterEnv;
 use crate::endpoint::{Endpoint, OwnedEndpoint, ServiceUri};
 use crate::keys;
-use crate::log::LogAddress;
+use crate::log::OwnedLogAddress;
 use crate::protos::{
     self,
     ClusterMeta,
@@ -141,7 +141,7 @@ impl EtcdClusterMetaDaemon {
         log_name: String,
         writes: impl Into<Vec<protos::Write>>,
         ts: Timestamp,
-    ) -> Result<LogAddress> {
+    ) -> Result<OwnedLogAddress> {
         let log_address = self.env.log().create_log(&log_name, ByteSize::mib(512)).await?;
         let mut log_producer = self.env.log().produce_log(&log_address).await?;
         let message = DataMessage {
@@ -159,11 +159,11 @@ impl EtcdClusterMetaDaemon {
     async fn bootstrap_tablet_manifest_log(
         &mut self,
         log_name: String,
-        data_log_uri: LogAddress,
+        data_log_uri: OwnedLogAddress,
         id: u64,
         start: &[u8],
         end: &[u8],
-    ) -> Result<LogAddress> {
+    ) -> Result<OwnedLogAddress> {
         let tablet = TabletDescription {
             id,
             generation: 0,
@@ -185,7 +185,7 @@ impl EtcdClusterMetaDaemon {
     async fn bootstrap_tablet_manifest(
         &mut self,
         log_name: String,
-        data_log_uri: LogAddress,
+        data_log_uri: OwnedLogAddress,
         id: u64,
         start: &[u8],
         end: &[u8],
@@ -237,7 +237,7 @@ impl EtcdClusterMetaDaemon {
         log_names: &mut Vec<String>,
         range_tablet_descriptor: TabletDescriptor,
         ts: Timestamp,
-    ) -> Result<LogAddress> {
+    ) -> Result<OwnedLogAddress> {
         let key = keys::root_key(keys::MAX_KEY);
         let deployment =
             TabletDeployment { tablet: range_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };

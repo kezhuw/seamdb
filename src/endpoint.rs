@@ -170,15 +170,13 @@ impl<'a> ResourceId<'a> {
     }
 
     /// # Safety
-    ///
-    /// Must be valid resource id.
-    pub unsafe fn new_unchecked(s: &'a str) -> ResourceId<'a> {
-        let (scheme, trailing) = s.split_once(':').unwrap_unchecked();
-        let trailing = trailing.get_unchecked(2..);
-        let slash_index = trailing.find('/').unwrap_unchecked();
-        let address = trailing.get_unchecked(..slash_index);
-        let path = trailing.get_unchecked(slash_index..);
-        Self { scheme, address, path }
+    /// The given string must equal to resource uri.
+    pub unsafe fn relocate(self, s: &str) -> ResourceId<'_> {
+        debug_assert_eq!(self.to_string(), s);
+        let scheme = &s[..self.scheme.len()];
+        let address = &s[self.scheme.len() + 3..self.scheme.len() + 3 + self.address.len()];
+        let path = &s[s.len() - self.path.len()..];
+        ResourceId { scheme, address, path }
     }
 
     fn is_valid_path(s: &str) -> bool {
