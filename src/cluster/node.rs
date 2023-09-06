@@ -127,7 +127,7 @@ pub trait NodeRegistry: Send + Sync {
 
     fn select_node(&self) -> Option<(NodeId, OwnedEndpoint)>;
 
-    fn get_node_endpoint(&self, node_id: &NodeId) -> Option<OwnedEndpoint>;
+    fn get_endpoint(&self, node_id: &NodeId) -> Option<OwnedEndpoint>;
 
     fn watch_statistics(&self) -> NodeStatisticsWatcher;
 }
@@ -218,7 +218,7 @@ impl NodeRegistry for EtcdNodeRegistry {
         Some((node.clone(), addr.clone()))
     }
 
-    fn get_node_endpoint(&self, node_id: &NodeId) -> Option<OwnedEndpoint> {
+    fn get_endpoint(&self, node_id: &NodeId) -> Option<OwnedEndpoint> {
         let nodes = self.state.nodes.lock().unwrap();
         nodes.get(node_id).cloned()
     }
@@ -344,7 +344,7 @@ mod tests {
         let (registry1, lease1) =
             EtcdNodeRegistry::join(cluster.clone(), node1.clone(), Some(endpoint1.to_owned())).await.unwrap();
 
-        assert_that!(registry1.get_node_endpoint(&node1).unwrap()).is_equal_to(endpoint1.to_owned());
+        assert_that!(registry1.get_endpoint(&node1).unwrap()).is_equal_to(endpoint1.to_owned());
         assert_that!(registry1.select_node()).is_equal_to(Some((node1.clone(), endpoint1.to_owned())));
 
         let mut statistics1 = registry1.watch_statistics();

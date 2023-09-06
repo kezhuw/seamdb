@@ -447,8 +447,7 @@ trait ClusterMetaDeployer {
     fn nodes(&self) -> &dyn NodeRegistry;
 
     async fn connect_node(&self, node: &NodeId) -> Result<TabletServiceClient<Channel>> {
-        let addr =
-            self.nodes().get_node_endpoint(node).ok_or_else(|| anyhow!("node {node} not found, probably died"))?;
+        let addr = self.nodes().get_endpoint(node).ok_or_else(|| anyhow!("node {node} not found, probably died"))?;
         self.connect_node_with_addr(node, addr.as_ref()).await
     }
 
