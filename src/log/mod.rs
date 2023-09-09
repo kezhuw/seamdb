@@ -16,6 +16,7 @@
 
 mod kafka;
 mod manager;
+mod memory;
 
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -29,6 +30,7 @@ use derivative::Derivative;
 
 pub use self::kafka::KafkaLogFactory;
 pub use self::manager::{LogManager, LogRegistry};
+pub use self::memory::MemoryLogFactory;
 use super::endpoint::{Endpoint, Params, ResourceId};
 
 pub type OwnedLogAddress = LogAddress<'static>;

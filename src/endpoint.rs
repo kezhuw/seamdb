@@ -34,6 +34,12 @@ pub struct Endpoint<'a> {
 }
 
 impl<'a> Endpoint<'a> {
+    /// # Safety
+    /// It is caller's duty to provide valid arguments.
+    pub const unsafe fn new_unchecked(scheme: &'static str, address: &'static str) -> Endpoint<'static> {
+        Endpoint { scheme, address }
+    }
+
     pub fn scheme(&self) -> &'a str {
         self.scheme
     }
