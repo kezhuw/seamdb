@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-check: check_fmt lint
+check: check_fmt license lint
 
-verify: check license build test
+verify: check build test
 
 fmt:
 	cargo +nightly fmt --all
@@ -35,7 +35,7 @@ lint:
 	cargo clippy --no-deps -- -D clippy::all
 
 build:
-	cargo build
+	cargo build --tests
 
 test:
 	cargo test

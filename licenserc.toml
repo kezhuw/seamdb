@@ -17,9 +17,6 @@ baseDir = "."
 headerPath = "Apache-2.0.txt"
 
 excludes = [
-    # Seems that korandoru/hawkeye does not support Makefile
-    # "Makefile",
-
     "**/Cargo.lock",
 
     "**/generated/*",
