@@ -190,7 +190,7 @@ impl EtcdClusterMetaDaemon {
             generation: 0,
             range: TabletRange { start: start.to_owned(), end: end.to_owned() },
             log: log_uri.into(),
-            merge_bounds: TabletMergeBounds::All,
+            merge_bounds: TabletMergeBounds::None,
         };
         Ok(descriptor)
     }
