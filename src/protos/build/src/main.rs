@@ -43,12 +43,13 @@ fn main() {
         .enumerate_field(".seamdb")
         .require_field("TimestampedValue.value")
         .require_field("TimestampedValue.timestamp")
+        .require_field("TabletDepot.range")
         .require_field("TabletManifest.tablet")
         .require_field("TabletDescriptor.range")
         .require_field("TabletDeployment.tablet")
         .require_field("TabletListRequest.range")
         .require_field("TabletDeployRequest.deployment")
-        .require_field("TabletDescription.store");
+        .require_field("TabletDescription.depot");
 
     tonic_build::configure().out_dir(&outdir).compile_with_config(config, &protos, &[protos_dir]).unwrap();
 

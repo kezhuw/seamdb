@@ -27,14 +27,14 @@ message TabletRange {
     bytes end = 2;
 }
 
-message TabletSegment {
+message TabletDepotSegment {
     string file = 1;
     string log = 2;
     TabletRange range = 3;
 }
 
-message TabletStore {
-    repeated TabletSegment segments = 1;
+message TabletDepot {
+    repeated TabletDepotSegment segments = 1;
     string file = 2;
     // kafka://kafka-cluster-address/topic-name?start=1
     string log = 3;
@@ -62,7 +62,7 @@ message TabletDescriptor {
 message TabletDescription {
     uint64 id = 1;
     uint64 generation = 2;
-    TabletStore store = 4;
+    TabletDepot depot = 4;
 }
 
 message TabletManifest {

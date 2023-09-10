@@ -17,7 +17,7 @@ pub struct TabletRange {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletSegment {
+pub struct TabletDepotSegment {
     #[prost(string, tag = "1")]
     pub file: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -27,16 +27,16 @@ pub struct TabletSegment {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletStore {
+pub struct TabletDepot {
     #[prost(message, repeated, tag = "1")]
-    pub segments: ::prost::alloc::vec::Vec<TabletSegment>,
+    pub segments: ::prost::alloc::vec::Vec<TabletDepotSegment>,
     #[prost(string, tag = "2")]
     pub file: ::prost::alloc::string::String,
     /// kafka://kafka-cluster-address/topic-name?start=1
     #[prost(string, tag = "3")]
     pub log: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "4")]
-    pub range: ::core::option::Option<TabletRange>,
+    #[prost(message, required, tag = "4")]
+    pub range: TabletRange,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -62,7 +62,7 @@ pub struct TabletDescription {
     #[prost(uint64, tag = "2")]
     pub generation: u64,
     #[prost(message, required, tag = "4")]
-    pub store: TabletStore,
+    pub depot: TabletDepot,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

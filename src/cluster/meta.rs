@@ -53,12 +53,12 @@ use crate::protos::{
     DataOperation,
     ManifestMessage,
     TabletDeployment,
+    TabletDepot,
     TabletDescription,
     TabletDescriptor,
     TabletManifest,
     TabletMergeBounds,
     TabletRange,
-    TabletStore,
     Temporal,
     Timestamp,
 };
@@ -162,11 +162,11 @@ impl EtcdClusterMetaDaemon {
         let tablet = TabletDescription {
             id,
             generation: 0,
-            store: TabletStore {
+            depot: TabletDepot {
                 segments: Default::default(),
                 log: data_log_uri.into(),
                 file: Default::default(),
-                range: Some(TabletRange { start: start.to_owned(), end: end.to_owned() }),
+                range: TabletRange { start: start.to_owned(), end: end.to_owned() },
             },
         };
         let manifest = TabletManifest { tablet, ..TabletManifest::default() };
