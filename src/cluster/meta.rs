@@ -141,7 +141,7 @@ impl EtcdClusterMetaDaemon {
         let message = DataMessage {
             epoch: 0,
             sequence: 1,
-            temporal: Some(Temporal::Timestamp(Timestamp::default())),
+            temporal: Some(Temporal::Timestamp(ts)),
             operation: Some(DataOperation::Batch(protos::Batch { writes: writes.into() })),
             closed_timestamp: Some(ts),
             leader_expiration: Some(ts),
