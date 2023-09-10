@@ -14,14 +14,14 @@
 
 use anyhow::{bail, Result};
 
-pub const ROOT_KEY_PREFIX: &[u8] = &[b'r', b'1'];
-pub const RANGE_KEY_PREFIX: &[u8] = &[b'r', b'2'];
+pub const ROOT_KEY_PREFIX: &[u8] = &[b'a', b'1'];
+pub const RANGE_KEY_PREFIX: &[u8] = &[b'a', b'2'];
 pub const DATA_KEY_PREFIX: &[u8] = &[b'd'];
-pub const USER_KEY_PREFIX: &[u8] = &[b'd', b'u'];
 pub const SYSTEM_KEY_PREFIX: &[u8] = &[b'd', b's'];
+pub const USER_KEY_PREFIX: &[u8] = &[b'd', b'u'];
 pub const MAX_KEY: &[u8] = &[0xffu8];
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum KeyKind {
     Range { root: bool },
     Data { system: bool },
@@ -29,16 +29,20 @@ pub enum KeyKind {
 
 pub fn identify_key(key: &[u8]) -> Result<(KeyKind, &[u8])> {
     let n = key.len();
-    if n < 3 {
-        bail!("invalid key: {:?}", key)
+    match n {
+        0 => bail!("invalid key: no key"),
+        1 => match key[0] {
+            b'd' => Ok((KeyKind::Data { system: false }, b"")),
+            _ => bail!("invalid key: {:?}", key),
+        },
+        _ => Ok(match (key[0], key[1], &key[2..]) {
+            (b'a', b'1', key) => (KeyKind::Range { root: true }, key),
+            (b'a', b'2', key) => (KeyKind::Range { root: false }, key),
+            (b'd', b'u', key) => (KeyKind::Data { system: false }, key),
+            (b'd', b's', key) => (KeyKind::Data { system: true }, key),
+            _ => bail!("invalid key: {:?}", key),
+        }),
     }
-    Ok(match (key[0], key[1], &key[2..]) {
-        (b'r', b'1', key) => (KeyKind::Range { root: true }, key),
-        (b'r', b'2', key) => (KeyKind::Range { root: false }, key),
-        (b'd', b'u', key) => (KeyKind::Data { system: false }, key),
-        (b'd', b's', key) => (KeyKind::Data { system: true }, key),
-        _ => bail!("invalid key: {:?}", key),
-    })
 }
 
 pub fn root_key(key: &[u8]) -> Vec<u8> {
@@ -67,4 +71,66 @@ pub fn system_key(key: &[u8]) -> Vec<u8> {
     buf.extend(SYSTEM_KEY_PREFIX.iter());
     buf.extend(key.iter());
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use assertor::*;
+
+    use crate::keys::*;
+
+    #[test]
+    fn test_keys_invariants() {
+        assert_that!(ROOT_KEY_PREFIX).is_less_than(RANGE_KEY_PREFIX);
+        assert_that!(RANGE_KEY_PREFIX).is_less_than(DATA_KEY_PREFIX);
+        assert_that!(DATA_KEY_PREFIX).is_less_than(SYSTEM_KEY_PREFIX);
+        assert_that!(SYSTEM_KEY_PREFIX).is_less_than(USER_KEY_PREFIX);
+        assert_that!(USER_KEY_PREFIX).is_less_than(MAX_KEY);
+
+        assert_that!(ROOT_KEY_PREFIX.len()).is_equal_to(RANGE_KEY_PREFIX.len());
+        assert_that!(USER_KEY_PREFIX.len()).is_equal_to(SYSTEM_KEY_PREFIX.len());
+
+        assert_that!(identify_key(ROOT_KEY_PREFIX).unwrap())
+            .is_equal_to((KeyKind::Range { root: true }, b"".as_slice()));
+        assert_that!(identify_key(RANGE_KEY_PREFIX).unwrap())
+            .is_equal_to((KeyKind::Range { root: false }, b"".as_slice()));
+        assert_that!(identify_key(DATA_KEY_PREFIX).unwrap())
+            .is_equal_to((KeyKind::Data { system: false }, b"".as_slice()));
+        assert_that!(identify_key(USER_KEY_PREFIX).unwrap())
+            .is_equal_to((KeyKind::Data { system: false }, b"".as_slice()));
+        assert_that!(identify_key(SYSTEM_KEY_PREFIX).unwrap())
+            .is_equal_to((KeyKind::Data { system: true }, b"".as_slice()));
+    }
+
+    #[test]
+    fn test_keys_root_key() {
+        let key = root_key(b"x");
+        assert_that!(key.as_slice()).is_greater_than(ROOT_KEY_PREFIX);
+        assert_that!(key.as_slice()).is_less_than(RANGE_KEY_PREFIX);
+        assert_that!(identify_key(&key).unwrap()).is_equal_to((KeyKind::Range { root: true }, b"x".as_slice()));
+    }
+
+    #[test]
+    fn test_keys_range_key() {
+        let key = range_key(b"x");
+        assert_that!(key.as_slice()).is_greater_than(RANGE_KEY_PREFIX);
+        assert_that!(key.as_slice()).is_less_than(DATA_KEY_PREFIX);
+        assert_that!(identify_key(&key).unwrap()).is_equal_to((KeyKind::Range { root: false }, b"x".as_slice()));
+    }
+
+    #[test]
+    fn test_keys_system_key() {
+        let key = system_key(b"x");
+        assert_that!(key.as_slice()).is_greater_than(SYSTEM_KEY_PREFIX);
+        assert_that!(key.as_slice()).is_less_than(USER_KEY_PREFIX);
+        assert_that!(identify_key(&key).unwrap()).is_equal_to((KeyKind::Data { system: true }, b"x".as_slice()));
+    }
+
+    #[test]
+    fn test_keys_user_key() {
+        let key = user_key(b"x");
+        assert_that!(key.as_slice()).is_greater_than(USER_KEY_PREFIX);
+        assert_that!(key.as_slice()).is_less_than(MAX_KEY);
+        assert_that!(identify_key(&key).unwrap()).is_equal_to((KeyKind::Data { system: false }, b"x".as_slice()));
+    }
 }
