@@ -169,7 +169,7 @@ impl EtcdClusterMetaDaemon {
             },
         };
         let manifest = TabletManifest { tablet, ..TabletManifest::default() };
-        let message = ManifestMessage { epoch: 0, sequence: 1, manifest: Some(manifest) }.encode_to_vec();
+        let message = ManifestMessage { epoch: 0, sequence: 1, manifest: Some(manifest) };
         let log_address = self.env.log().create_log(&log_name, ByteSize::mib(10)).await?;
         let mut log_producer = self.env.log().produce_log(&log_address).await?;
         log_producer.send(&message.encode_to_vec()).await?;
