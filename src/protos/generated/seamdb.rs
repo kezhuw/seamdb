@@ -1,3 +1,4 @@
+#[derive(Copy, Eq, PartialOrd, Ord)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MessageId {
@@ -71,8 +72,8 @@ pub struct TabletManifest {
     pub tablet: TabletDescription,
     #[prost(message, repeated, tag = "2")]
     pub splits: ::prost::alloc::vec::Vec<TabletDescriptor>,
-    #[prost(message, optional, tag = "5")]
-    pub watermark: ::core::option::Option<TabletWatermark>,
+    #[prost(message, required, tag = "5")]
+    pub watermark: TabletWatermark,
     /// Empty logs and files for future usage.
     #[prost(string, repeated, tag = "30")]
     pub empty_logs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
@@ -216,8 +217,8 @@ pub struct Transaction {
     /// Increase on write.
     #[prost(uint32, tag = "4")]
     pub sequence: u32,
-    #[prost(message, optional, tag = "5")]
-    pub create_ts: ::core::option::Option<Timestamp>,
+    #[prost(message, required, tag = "5")]
+    pub create_ts: Timestamp,
     /// Default to create_ts if not pushed forward.
     #[prost(message, optional, tag = "6")]
     pub commit_ts: ::core::option::Option<Timestamp>,
@@ -251,8 +252,8 @@ pub struct TxnRecord {
     /// * In creation, node use this timestamp to decide whether this transaction is able to create.
     ///
     /// This field should never be changed after assigned.
-    #[prost(message, optional, tag = "5")]
-    pub create_ts: ::core::option::Option<Timestamp>,
+    #[prost(message, required, tag = "5")]
+    pub create_ts: Timestamp,
     /// Timestamp at which point this transaction was considered as committed or aborted.
     ///
     /// Fallback to create_ts if None.
@@ -289,8 +290,8 @@ pub struct TxnMeta {
     /// * In creation, node use this timestamp to decide whether this transaction is able to create.
     ///
     /// This field should never be changed after assigned.
-    #[prost(message, optional, tag = "5")]
-    pub create_ts: ::core::option::Option<Timestamp>,
+    #[prost(message, required, tag = "5")]
+    pub create_ts: Timestamp,
     /// Timestamp at which point this transaction was considered as committed or aborted.
     ///
     /// Fallback to create_ts if None.
@@ -345,15 +346,16 @@ pub struct TabletDeployResponse {
     #[prost(message, repeated, tag = "1")]
     pub deployments: ::prost::alloc::vec::Vec<TabletDeployment>,
 }
+#[derive(Copy)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletWatermark {
-    #[prost(message, optional, tag = "1")]
-    pub cursor: ::core::option::Option<MessageId>,
-    #[prost(message, optional, tag = "3")]
-    pub closed_timestamp: ::core::option::Option<Timestamp>,
-    #[prost(message, optional, tag = "4")]
-    pub leader_expiration: ::core::option::Option<Timestamp>,
+    #[prost(message, required, tag = "1")]
+    pub cursor: MessageId,
+    #[prost(message, required, tag = "3")]
+    pub closed_timestamp: Timestamp,
+    #[prost(message, required, tag = "4")]
+    pub leader_expiration: Timestamp,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -387,11 +389,27 @@ pub struct ClusterMeta {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SequenceRange {
-    #[prost(uint32, tag = "1")]
-    pub start: u32,
-    #[prost(uint32, tag = "2")]
-    pub end: u32,
+pub enum DataRequest {
+    #[prost(message, tag = "1")]
+    Get(GetRequest),
+    #[prost(message, tag = "2")]
+    Put(PutRequest),
+    #[prost(message, tag = "3")]
+    Increment(IncrementRequest),
+    #[prost(message, tag = "4")]
+    Find(FindRequest),
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub enum DataResponse {
+    #[prost(message, tag = "1")]
+    Get(GetResponse),
+    #[prost(message, tag = "2")]
+    Put(PutResponse),
+    #[prost(message, tag = "3")]
+    Increment(IncrementResponse),
+    #[prost(message, tag = "4")]
+    Find(FindResponse),
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -400,6 +418,113 @@ pub struct Span {
     pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub end_key: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BatchRequest {
+    #[prost(uint64, tag = "1")]
+    pub tablet_id: u64,
+    #[prost(message, optional, tag = "2")]
+    pub uncertainty: ::core::option::Option<Timestamp>,
+    /// An atomic transactional batch request could be committed in one phase.
+    /// This means that all writes resides in one tablet.
+    #[prost(bool, tag = "6")]
+    pub atomic: bool,
+    #[prost(message, optional, tag = "3")]
+    pub temporal: ::core::option::Option<Temporal>,
+    #[prost(message, repeated, tag = "5")]
+    pub requests: ::prost::alloc::vec::Vec<DataRequest>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BatchResponse {
+    /// Pushed timestamp.
+    #[prost(message, optional, tag = "1")]
+    pub timestamp: ::core::option::Option<Timestamp>,
+    #[prost(message, repeated, tag = "2")]
+    pub responses: ::prost::alloc::vec::Vec<DataResponse>,
+    #[prost(message, repeated, tag = "3")]
+    pub deployments: ::prost::alloc::vec::Vec<TabletDeployment>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LocateRequest {
+    /// Empty for cluster deployment.
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LocateResponse {
+    #[prost(message, required, tag = "1")]
+    pub deployment: TabletDeployment,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub sequence: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetResponse {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<TimestampedValue>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FindRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    pub sequence: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FindResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub value: ::core::option::Option<TimestampedValue>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PutRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub value: ::core::option::Option<Value>,
+    #[prost(uint32, tag = "3")]
+    pub sequence: u32,
+    /// None => put anyway
+    /// Some(Timestamp::default()) => put if absent
+    /// Some(ts) => put if ts is newest(not tombstone)
+    #[prost(message, optional, tag = "4")]
+    pub expect_ts: ::core::option::Option<Timestamp>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PutResponse {
+    #[prost(message, required, tag = "1")]
+    pub write_ts: Timestamp,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IncrementRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(int64, tag = "2")]
+    pub increment: i64,
+    #[prost(uint32, tag = "3")]
+    pub sequence: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IncrementResponse {
+    #[prost(int64, tag = "1")]
+    pub value: i64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -607,6 +732,50 @@ pub mod tablet_service_client {
                 .insert(GrpcMethod::new("seamdb.TabletService", "DeployTablet"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/seamdb.TabletService/Batch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("seamdb.TabletService", "Batch"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn locate(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LocateRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocateResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/seamdb.TabletService/Locate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("seamdb.TabletService", "Locate"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn heartbeat(
             &mut self,
             request: impl tonic::IntoRequest<super::HeartbeatRequest>,
@@ -655,6 +824,14 @@ pub mod tablet_service_server {
             tonic::Response<super::TabletDeployResponse>,
             tonic::Status,
         >;
+        async fn batch(
+            &self,
+            request: tonic::Request<super::BatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchResponse>, tonic::Status>;
+        async fn locate(
+            &self,
+            request: tonic::Request<super::LocateRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocateResponse>, tonic::Status>;
         async fn heartbeat(
             &self,
             request: tonic::Request<super::HeartbeatRequest>,
@@ -819,6 +996,93 @@ pub mod tablet_service_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = DeployTabletSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/seamdb.TabletService/Batch" => {
+                    #[allow(non_camel_case_types)]
+                    struct BatchSvc<T: TabletService>(pub Arc<T>);
+                    impl<
+                        T: TabletService,
+                    > tonic::server::UnaryService<super::BatchRequest> for BatchSvc<T> {
+                        type Response = super::BatchResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { (*inner).batch(request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = BatchSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/seamdb.TabletService/Locate" => {
+                    #[allow(non_camel_case_types)]
+                    struct LocateSvc<T: TabletService>(pub Arc<T>);
+                    impl<
+                        T: TabletService,
+                    > tonic::server::UnaryService<super::LocateRequest>
+                    for LocateSvc<T> {
+                        type Response = super::LocateResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LocateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { (*inner).locate(request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = LocateSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

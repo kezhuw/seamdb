@@ -136,10 +136,16 @@ impl<'a> LogAddress<'a> {
 }
 
 /// Absolute position in log.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogPosition {
     Offset(u128),
     Cursor(CompactString),
+}
+
+impl Default for LogPosition {
+    fn default() -> Self {
+        Self::Offset(0)
+    }
 }
 
 impl LogPosition {
@@ -151,6 +157,25 @@ impl LogPosition {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    pub fn is_next_of(&self, previous: &LogPosition) -> bool {
+        let Some(current) = self.as_u64() else {
+            return false;
+        };
+        let Some(previous) = previous.as_u64() else {
+            return false;
+        };
+        previous + 1 == current
+    }
+}
+
+impl std::fmt::Display for LogPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogPosition::Offset(offset) => f.write_fmt(format_args!("{}", offset)),
+            LogPosition::Cursor(cursor) => f.write_str(cursor),
         }
     }
 }
@@ -172,6 +197,10 @@ impl From<LogPosition> for LogOffset {
 /// Producer to write byte message to log.
 #[async_trait]
 pub trait ByteLogProducer: Send + std::fmt::Debug + 'static {
+    fn exclusive(&self) -> bool {
+        false
+    }
+
     fn queue(&mut self, payload: &[u8]) -> Result<()>;
 
     async fn wait(&mut self) -> Result<LogPosition>;
@@ -184,7 +213,7 @@ pub trait ByteLogProducer: Send + std::fmt::Debug + 'static {
 
 /// Subscriber to read byte message from log.
 #[async_trait]
-pub trait ByteLogSubscriber: Send + std::fmt::Debug + 'static {
+pub trait ByteLogSubscriber: Send + Sync + std::fmt::Debug {
     async fn read(&mut self) -> Result<(LogPosition, &[u8])>;
 
     async fn seek(&mut self, offset: LogOffset) -> Result<()>;

@@ -51,6 +51,8 @@ static_assertions = "1.1.0"
 scopeguard = "1.2.0"
 arc-swap = "1.6.0"
 either = "1.9.0"
+atomic = "0.6.0"
+bytemuck = { version = "1.13.1", features = ["derive"] }
 
 [dev-dependencies]
 assertor = "0.0.2"

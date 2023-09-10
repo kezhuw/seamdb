@@ -45,6 +45,10 @@ impl NodeId {
     pub fn new_random() -> Self {
         Self(Uuid::new_v4().to_string())
     }
+
+    pub fn new(s: &String) -> &NodeId {
+        unsafe { std::mem::transmute::<&String, &NodeId>(s) }
+    }
 }
 
 impl AsRef<str> for NodeId {

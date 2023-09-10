@@ -21,3 +21,8 @@ pub use self::env::ClusterEnv;
 pub use self::meta::{ClusterDeploymentMonitor, ClusterDeploymentWatcher, ClusterMetaHandle, EtcdClusterMetaDaemon};
 pub use self::node::{EtcdNodeRegistry, NodeId, NodeLease, NodeRegistry, NodeStatistics, NodeStatisticsWatcher};
 pub use crate::protos::ClusterMeta;
+
+#[cfg(test)]
+pub mod tests {
+    pub use super::etcd::tests::{etcd_container, EtcdContainer};
+}

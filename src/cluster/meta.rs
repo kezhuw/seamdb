@@ -706,8 +706,12 @@ mod tests {
     use crate::log::tests::*;
     use crate::log::LogRegistry;
     use crate::protos::{
+        BatchRequest,
+        BatchResponse,
         HeartbeatRequest,
         HeartbeatResponse,
+        LocateRequest,
+        LocateResponse,
         TabletDeployRequest,
         TabletDeployResponse,
         TabletDeployment,
@@ -837,6 +841,20 @@ mod tests {
         ) -> Result<tonic::Response<HeartbeatResponse>, tonic::Status> {
             self.inner.lock().unwrap().heartbeat.0.send_replace(request.into_inner());
             Ok(tonic::Response::new(HeartbeatResponse::default()))
+        }
+
+        async fn batch(
+            &self,
+            _request: tonic::Request<BatchRequest>,
+        ) -> Result<tonic::Response<BatchResponse>, tonic::Status> {
+            todo!()
+        }
+
+        async fn locate(
+            &self,
+            _request: tonic::Request<LocateRequest>,
+        ) -> Result<tonic::Response<LocateResponse>, tonic::Status> {
+            todo!()
         }
     }
 

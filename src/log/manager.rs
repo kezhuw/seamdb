@@ -78,6 +78,12 @@ impl LogRegistry {
 }
 
 impl LogManager {
+    pub async fn new(factory: impl LogFactory, endpoint: &Endpoint<'_>, params: &Params) -> Result<LogManager> {
+        let mut registry = LogRegistry::default();
+        registry.register(factory).unwrap();
+        registry.into_manager(endpoint, params).await
+    }
+
     /// Open a client to produce, subscribe and delete existing logs.
     ///
     /// This will create a new client if the endpoint is new to any existing clients, otherwise it

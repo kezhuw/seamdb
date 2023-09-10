@@ -309,9 +309,22 @@ message ClusterMeta {
     repeated string obsoleted_logs = 7;
 }
 
-message SequenceRange {
-    uint32 start = 1;
-    uint32 end = 2;
+message DataRequest {
+    oneof request {
+        GetRequest get = 1;
+        PutRequest put = 2;
+        IncrementRequest increment = 3;
+        FindRequest find = 4;
+    }
+}
+
+message DataResponse {
+    oneof response {
+        GetResponse get = 1;
+        PutResponse put = 2;
+        IncrementResponse increment = 3;
+        FindResponse find = 4;
+    }
 }
 
 message Span {
@@ -325,6 +338,82 @@ enum TxnStatus {
     Aborted = 2;
 }
 
+message BatchRequest {
+    uint64 tablet_id = 1;
+
+    Timestamp uncertainty = 2;
+
+    // An atomic transactional batch request could be committed in one phase.
+    // This means that all writes resides in one tablet.
+    bool atomic = 6;
+
+    Temporal temporal = 3;
+
+    repeated DataRequest requests = 5;
+}
+
+message BatchResponse {
+    // Pushed timestamp.
+    Timestamp timestamp = 1;
+
+    repeated DataResponse responses = 2;
+
+    repeated TabletDeployment deployments = 3;
+}
+
+message LocateRequest {
+    // Empty for cluster deployment.
+    bytes key = 1;
+}
+
+message LocateResponse {
+    TabletDeployment deployment = 1;
+}
+
+message GetRequest {
+    bytes key = 1;
+    uint32 sequence = 2;
+}
+
+message GetResponse {
+    TimestampedValue value = 1;
+}
+
+message FindRequest {
+    bytes key = 1;
+    uint32 sequence = 2;
+}
+
+message FindResponse {
+    bytes key = 1;
+    TimestampedValue value = 2;
+}
+
+message PutRequest {
+    bytes key = 1;
+    Value value = 2;
+    uint32 sequence = 3;
+
+    // None => put anyway
+    // Some(Timestamp::default()) => put if absent
+    // Some(ts) => put if ts is newest(not tombstone)
+    Timestamp expect_ts= 4;
+}
+
+message PutResponse {
+    Timestamp write_ts = 1;
+}
+
+message IncrementRequest {
+    bytes key = 1;
+    int64 increment = 2;
+    uint32 sequence = 3;
+}
+
+message IncrementResponse {
+    int64 value = 1;
+}
+
 message HeartbeatRequest {
     uint64 tablet_id = 1;
 }
@@ -335,6 +424,10 @@ service TabletService {
     rpc ListTablets(TabletListRequest) returns (TabletListResponse);
 
     rpc DeployTablet(TabletDeployRequest) returns (TabletDeployResponse);
+
+    rpc Batch(BatchRequest) returns (BatchResponse);
+
+    rpc Locate(LocateRequest) returns (LocateResponse);
 
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
