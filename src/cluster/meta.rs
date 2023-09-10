@@ -214,16 +214,9 @@ impl EtcdClusterMetaDaemon {
         let deployment =
             TabletDeployment { tablet: user_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };
         let value = protos::Value::Bytes(deployment.encode_to_vec());
-        let write = protos::Write { key, value: Some(value), sequence: 0 };
+        let write = protos::Write { key: key.clone(), value: Some(value), sequence: 0 };
         let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), [write], ts).await?;
-        self.bootstrap_tablet_manifest(
-            log_names.pop().unwrap(),
-            data_log_uri,
-            2,
-            keys::RANGE_KEY_PREFIX,
-            keys::DATA_KEY_PREFIX,
-        )
-        .await
+        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, 2, keys::RANGE_KEY_PREFIX, &key).await
     }
 
     async fn bootstrap_root_tablet(
@@ -236,16 +229,9 @@ impl EtcdClusterMetaDaemon {
         let deployment =
             TabletDeployment { tablet: range_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };
         let value = protos::Value::Bytes(deployment.encode_to_vec());
-        let write = protos::Write { key, value: Some(value), sequence: 0 };
+        let write = protos::Write { key: key.clone(), value: Some(value), sequence: 0 };
         let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), [write], ts).await?;
-        self.bootstrap_tablet_manifest_log(
-            log_names.pop().unwrap(),
-            data_log_uri,
-            1,
-            keys::ROOT_KEY_PREFIX,
-            keys::RANGE_KEY_PREFIX,
-        )
-        .await
+        self.bootstrap_tablet_manifest_log(log_names.pop().unwrap(), data_log_uri, 1, keys::ROOT_KEY_PREFIX, &key).await
     }
 
     async fn bootstrap_meta(
