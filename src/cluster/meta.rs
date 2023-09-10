@@ -136,7 +136,7 @@ impl EtcdClusterMetaDaemon {
         writes: impl Into<Vec<protos::Write>>,
         ts: Timestamp,
     ) -> Result<OwnedLogAddress> {
-        let log_address = self.env.log().create_log(&log_name, ByteSize::mib(512)).await?;
+        let log_address = self.env.log().create_log(&log_name, ByteSize::default()).await?;
         let mut log_producer = self.env.log().produce_log(&log_address).await?;
         let message = DataMessage {
             epoch: 0,
