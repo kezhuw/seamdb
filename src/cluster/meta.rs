@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytesize::ByteSize;
 use compact_str::{CompactString, ToCompactString};
@@ -62,7 +63,7 @@ use crate::protos::{
     Timestamp,
 };
 use crate::tablet::TabletDeployer;
-use crate::utils::{self, DropOwner};
+use crate::utils::{self, DropOwner, WatchConsumer as _};
 
 type Revision = i64;
 
@@ -486,7 +487,7 @@ trait ClusterMetaClient: Send + Sync + 'static {
                 },
             }
         };
-        Ok(ClusterDeploymentWatcher::watch(watcher, stream, meta))
+        Ok(ClusterDeploymentWatcher::watch(watcher, stream, meta).await)
     }
 }
 
@@ -533,7 +534,40 @@ impl ClusterMetaClient for EtcdClusterMetaHandle {
 }
 
 #[derive(Clone)]
+pub struct ClusterDeploymentMonitor {
+    _dropper: Arc<DropOwner>,
+    deployment: Arc<ArcSwapOption<TabletDeployment>>,
+}
+
+impl ClusterDeploymentMonitor {
+    pub async fn new(mut receiver: watch::Receiver<Arc<TabletDeployment>>, deployment: Arc<TabletDeployment>) -> Self {
+        let (drop_owner, mut drop_watcher) = utils::drop_watcher();
+        let deployment = Arc::new(ArcSwapOption::new(Some(deployment)));
+        let publisher = deployment.clone();
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    _ = drop_watcher.dropped() => break,
+                    r = receiver.changed() => if r.is_err() {
+                        publisher.swap(None);
+                        break;
+                    } else {
+                        publisher.swap(Some(receiver.consume()));
+                    },
+                }
+            }
+        });
+        Self { _dropper: Arc::new(drop_owner), deployment }
+    }
+
+    pub fn latest(&self) -> Option<Arc<TabletDeployment>> {
+        self.deployment.load_full()
+    }
+}
+
+#[derive(Clone)]
 pub struct ClusterDeploymentWatcher {
+    monitor: ClusterDeploymentMonitor,
     receiver: watch::Receiver<Arc<TabletDeployment>>,
     deployment: Arc<TabletDeployment>,
 }
@@ -562,6 +596,10 @@ impl ClusterDeploymentWatcher {
             self.deployment = deployment;
         }
         &self.deployment
+    }
+
+    pub fn monitor(&self) -> ClusterDeploymentMonitor {
+        self.monitor.clone()
     }
 
     fn read_deployment(&mut self) -> Option<Arc<TabletDeployment>> {
@@ -616,12 +654,13 @@ impl ClusterDeploymentWatcher {
         Ok(())
     }
 
-    fn watch(watcher: Watcher, stream: WatchStream, mut meta: ClusterMeta) -> Self {
+    async fn watch(watcher: Watcher, stream: WatchStream, mut meta: ClusterMeta) -> Self {
         let name = std::mem::take(&mut meta.name);
         let deployment = Arc::new(TabletDeployment::from(meta));
         let (sender, receiver) = watch::channel(deployment.clone());
         tokio::spawn(async move { Self::poll(name, watcher, stream, sender).await });
-        ClusterDeploymentWatcher { receiver, deployment }
+        let monitor = ClusterDeploymentMonitor::new(receiver.clone(), deployment.clone()).await;
+        ClusterDeploymentWatcher { monitor, receiver, deployment }
     }
 }
 
@@ -857,6 +896,7 @@ mod tests {
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env).await.unwrap();
 
         let mut deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let deployment_monitor = deployment_watcher.monitor();
         let cluster_deployment =
             deployment_watcher.wait_for(|deployment| !deployment.servers.is_empty()).await.unwrap().clone();
 
@@ -864,6 +904,9 @@ mod tests {
         deployment_receiver.changed().await.unwrap();
         assert_that!(deployment_receiver.consume()).is_equal_to(&cluster_deployment);
         assert_that!(cluster_deployment.servers).is_equal_to(vec![node1.node_id.to_string()]);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_that!(deployment_monitor.latest().unwrap().as_ref()).is_equal_to(&cluster_deployment);
 
         let mut heartbeat_receiver = node1.service.subscribe_heartbeat();
 
@@ -877,6 +920,9 @@ mod tests {
 
         deployment_receiver.changed().await.unwrap();
         assert_that!(deployment_receiver.consume()).is_equal_to(&cluster_deployment);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_that!(deployment_monitor.latest().unwrap().as_ref()).is_equal_to(&cluster_deployment);
 
         let node3 = TestNode::start(cluster_uri.clone()).await;
         select! {
@@ -893,6 +939,9 @@ mod tests {
         assert_that!(cluster_deployment.servers)
             .is_equal_to(vec![node2.node_id.to_string(), node3.node_id.to_string()]);
 
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_that!(deployment_monitor.latest().unwrap().as_ref()).is_equal_to(&cluster_deployment);
+
         drop(node2);
         let cluster_deployment = deployment_watcher
             .wait_for(|deployment| *deployment.servers.first().unwrap() == node3.node_id.to_string())
@@ -900,6 +949,9 @@ mod tests {
             .unwrap()
             .clone();
         assert_that!(cluster_deployment.servers).is_equal_to(vec![node3.node_id.to_string()]);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_that!(deployment_monitor.latest().unwrap().as_ref()).is_equal_to(&cluster_deployment);
 
         let (nodes2, _cluster_lease2) =
             EtcdNodeRegistry::join(cluster_uri.clone(), NodeId::new_random(), None).await.unwrap();
