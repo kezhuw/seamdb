@@ -12,11 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod clock;
-pub mod cluster;
-pub mod endpoint;
-pub mod keys;
-pub mod log;
-pub mod protos;
-pub mod tablet;
-pub mod utils;
+mod deployer;
+pub use self::deployer::TabletDeployer;
