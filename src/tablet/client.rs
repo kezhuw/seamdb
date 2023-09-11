@@ -132,6 +132,69 @@ impl TabletClient {
         Ok(deployment)
     }
 
+    async fn relocate_one_request(&self, request: &mut DataRequest) -> Result<TabletDeployment> {
+        let user_key = keys::user_key(request.key());
+        let deployment = self.locate_key(&user_key).await?;
+        request.set_key(user_key);
+        Ok(deployment)
+    }
+
+    async fn relocate_deployment_request(
+        &self,
+        deployment: &TabletDeployment,
+        request: &mut DataRequest,
+    ) -> Result<()> {
+        let user_key = keys::user_key(request.key());
+        if !deployment.tablet.range.contains(&user_key) {
+            bail!(
+                "key {:?} does not resides in tablet {} with range {:?}",
+                request.key(),
+                deployment.tablet.id,
+                deployment.tablet.range
+            )
+        }
+        request.set_key(user_key);
+        Ok(())
+    }
+
+    fn relocate_user_responses(responses: &mut [DataResponse]) {
+        for response in responses {
+            if let Some(find) = response.as_find_mut() {
+                find.key.drain(0..keys::USER_KEY_PREFIX.len());
+            }
+        }
+    }
+
+    async fn request_batch(
+        &self,
+        deployment: &TabletDeployment,
+        requests: Vec<DataRequest>,
+    ) -> Result<Vec<DataResponse>> {
+        let node = NodeId::new(&deployment.servers[0]);
+        let Some(addr) = self.cluster.nodes().get_endpoint(node) else { bail!("server {} is not available", node) };
+        let mut client =
+            TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
+        let n = requests.len();
+        let batch =
+            BatchRequest { tablet_id: deployment.tablet.id, uncertainty: None, atomic: true, temporal: None, requests };
+        let response = client.batch(batch).await?.into_inner();
+        if response.responses.len() != n {
+            bail!("unexpected responses: {:?}", response)
+        }
+        Ok(response.responses)
+    }
+
+    pub async fn batch(&self, mut requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
+        let Some((first, remains)) = requests.split_first_mut() else { bail!("empty requests") };
+        let deployment = self.relocate_one_request(first).await?;
+        for request in remains {
+            self.relocate_deployment_request(&deployment, request).await?;
+        }
+        let mut responses = self.request_batch(&deployment, requests).await?;
+        Self::relocate_user_responses(&mut responses);
+        Ok(responses)
+    }
+
     pub async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
         let user_key = keys::user_key(key);
         let deployment = self.locate_key(&user_key).await?;
@@ -206,12 +269,21 @@ mod tests {
     use crate::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
     use crate::endpoint::{Endpoint, Params};
     use crate::log::{LogManager, MemoryLogFactory};
-    use crate::protos::{Timestamp, Value};
+    use crate::protos::{
+        DataRequest,
+        FindRequest,
+        GetRequest,
+        IncrementRequest,
+        PutRequest,
+        Timestamp,
+        TimestampedValue,
+        Value,
+    };
     use crate::tablet::{TabletClient, TabletNode};
 
     #[tokio::test]
     #[traced_test]
-    async fn test_tablet_client() {
+    async fn test_tablet_client_basic() {
         let etcd = etcd_container();
         let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
 
@@ -262,5 +334,86 @@ mod tests {
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_3".to_vec());
 
         assert_that!(client.find(b"kz").await.unwrap().is_none()).is_true();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_tablet_client_batch() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let requests = vec![
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Get(GetRequest { key: b"count".to_vec(), sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Put(PutRequest {
+                key: b"k1".to_vec(),
+                value: Some(Value::String("v1_1".to_owned())),
+                expect_ts: None,
+                sequence: 0,
+            }),
+        ];
+        let mut responses = client.batch(requests).await.unwrap();
+        let put_ts = responses.pop().unwrap().into_put().unwrap().write_ts;
+        assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(10);
+        assert_that!(responses.pop().unwrap().into_get().unwrap().value.unwrap().value.into_int().unwrap())
+            .is_equal_to(5);
+        assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(5);
+
+        let requests = vec![
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Put(PutRequest {
+                key: b"k1".to_vec(),
+                value: Some(Value::String("v1_1".to_owned())),
+                expect_ts: Some(Timestamp::zero()),
+                sequence: 0,
+            }),
+        ];
+        client.batch(requests).await.unwrap_err();
+
+        let requests = vec![
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Put(PutRequest {
+                key: b"k1".to_vec(),
+                value: Some(Value::String("v1_2".to_owned())),
+                expect_ts: Some(put_ts),
+                sequence: 0,
+            }),
+        ];
+        let mut responses = client.batch(requests).await.unwrap();
+        let put_ts = responses.pop().unwrap().into_put().unwrap().write_ts;
+        assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(15);
+
+        let requests = vec![
+            DataRequest::Get(GetRequest { key: b"k1".to_vec(), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"k1".to_vec(), sequence: 0 }),
+        ];
+        let mut responses = client.batch(requests).await.unwrap();
+
+        let expect_value = TimestampedValue { value: Value::String("v1_2".to_owned()), timestamp: put_ts };
+
+        let find = responses.pop().unwrap().into_find().unwrap();
+        assert_that!(find.key).is_equal_to(b"k1".to_vec());
+        assert_that!(find.value.unwrap()).is_equal_to(&expect_value);
+
+        let get = responses.pop().unwrap().into_get().unwrap();
+        assert_that!(get.value.unwrap()).is_equal_to(&expect_value);
     }
 }

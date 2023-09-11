@@ -106,6 +106,12 @@ impl BatchRequest {
     }
 }
 
+impl TabletRange {
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.start.as_slice() <= key && key < self.end.as_slice()
+    }
+}
+
 impl TabletDeployment {
     pub fn update(&mut self, epoch: u64, generation: u64, servers: Vec<String>) -> bool {
         if self.epoch < epoch || (self.epoch == epoch && self.generation < generation) {
@@ -130,6 +136,24 @@ impl TabletDeployment {
 impl DataRequest {
     pub fn is_read(&self) -> bool {
         matches!(self, DataRequest::Get(_) | DataRequest::Find(_))
+    }
+
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Get(request) => &request.key,
+            Self::Find(request) => &request.key,
+            Self::Put(request) => &request.key,
+            Self::Increment(request) => &request.key,
+        }
+    }
+
+    pub fn set_key(&mut self, key: Vec<u8>) {
+        match self {
+            Self::Get(request) => request.key = key,
+            Self::Find(request) => request.key = key,
+            Self::Put(request) => request.key = key,
+            Self::Increment(request) => request.key = key,
+        }
     }
 }
 
@@ -193,6 +217,13 @@ impl Value {
     pub fn from_message(message: &impl prost::Message) -> Value {
         let bytes = message.encode_to_vec();
         Self::Bytes(bytes)
+    }
+
+    pub fn into_int(self) -> Result<i64, Self> {
+        match self {
+            Self::Int(i) => Ok(i),
+            _ => Err(self),
+        }
     }
 
     pub fn into_bytes(self) -> Result<Vec<u8>, Self> {
@@ -274,6 +305,13 @@ impl DataResponse {
         match self {
             Self::Increment(increment) => Ok(increment),
             _ => Err(self),
+        }
+    }
+
+    pub fn as_find_mut(&mut self) -> Option<&mut FindResponse> {
+        match self {
+            Self::Find(find) => Some(find),
+            _ => None,
         }
     }
 }

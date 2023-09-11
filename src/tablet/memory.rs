@@ -88,12 +88,6 @@ impl Iterator for Writes {
 }
 
 #[derive(Default)]
-pub struct WriteContext {
-    writes: Vec<protos::Write>,
-    replication: ReplicationTracker,
-}
-
-#[derive(Default)]
 pub struct MemoryTabletStore {
     watermark: TabletWatermark,
     watermarks: VecDeque<TabletWatermark>,
@@ -125,53 +119,6 @@ impl MemoryTabletStore {
             self.watermark.closed_timestamp = watermark.closed_timestamp;
             self.watermark.leader_expiration = watermark.leader_expiration;
         }
-    }
-
-    fn check_write(&self, temporal: &Temporal, key: &[u8]) -> Result<TimestampedValue> {
-        let value = self.get(temporal, key)?;
-        if temporal.timestamp() <= value.timestamp {
-            return Err(anyhow!("write@{} encounters newer timestamp {}", temporal.timestamp(), value.timestamp));
-        }
-        Ok(value.adjust_timestamp())
-    }
-
-    fn add_write(&mut self, context: &mut WriteContext, ts: Timestamp, key: Vec<u8>, value: Option<protos::Value>) {
-        let write = protos::Write { key: key.clone(), value: value.clone(), sequence: 0 };
-        context.writes.push(write);
-        let (value, replication) = Value::new(value);
-        self.table.put(key, ts, value);
-        context.replication.batch(replication);
-    }
-
-    fn put(
-        &mut self,
-        context: &mut WriteContext,
-        temporal: &Temporal,
-        key: &[u8],
-        value: Option<protos::Value>,
-        expect_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
-        let existing_value = self.check_write(temporal, key)?;
-        if let Some(expect_ts) = expect_ts.filter(|ts| *ts != existing_value.timestamp) {
-            bail!("mismatch timestamp check: existing ts {}, expect ts {:}", existing_value.timestamp, expect_ts)
-        }
-        self.add_write(context, temporal.timestamp(), key.to_owned(), value);
-        Ok(temporal.timestamp())
-    }
-
-    fn increment(
-        &mut self,
-        context: &mut WriteContext,
-        temporal: &Temporal,
-        key: &[u8],
-        increment: i64,
-    ) -> Result<i64> {
-        let value = self.check_write(temporal, key)?;
-        let i = value.value.read_int(key, "increment")?;
-        let incremented = i + increment;
-        let value = protos::Value::Int(incremented);
-        self.add_write(context, temporal.timestamp(), key.to_owned(), Some(value));
-        Ok(incremented)
     }
 }
 
@@ -231,45 +178,40 @@ impl TabletStore for MemoryTabletStore {
     }
 
     fn batch(&mut self, temporal: &mut Temporal, requests: Vec<DataRequest>) -> Result<BatchResult> {
-        let mut context = WriteContext::default();
+        let mut tablet = VirtualTablet::new(self);
         let mut blocker = ReplicationWatcher::default();
         let mut responses = Vec::with_capacity(requests.len());
         for request in requests {
             match request {
                 DataRequest::Get(get) => {
-                    let value = self.get(temporal, &get.key)?;
+                    let value = tablet.get(temporal, &get.key)?;
                     blocker.watch(&value.value);
                     let response = GetResponse { value: value.into() };
                     responses.push(DataResponse::Get(response));
                 },
                 DataRequest::Find(find) => {
-                    let (key, value) = self.find(&find.key, temporal)?;
+                    let (key, value) = tablet.find(temporal, &find.key)?;
                     blocker.watch(&value.value);
                     let response = FindResponse { key, value: value.into() };
                     responses.push(DataResponse::Find(response));
                 },
                 DataRequest::Put(put) => {
-                    let ts = self.put(&mut context, temporal, &put.key, put.value, put.expect_ts)?;
+                    let ts = tablet.put(temporal, &put.key, put.value, put.expect_ts)?;
                     let response = PutResponse { write_ts: ts };
                     responses.push(DataResponse::Put(response));
                 },
                 DataRequest::Increment(increment) => {
-                    let incremented = self.increment(&mut context, temporal, &increment.key, increment.increment)?;
+                    let incremented = tablet.increment(temporal, &increment.key, increment.increment)?;
                     let response = IncrementResponse { value: incremented };
                     responses.push(DataResponse::Increment(response));
                 },
             }
         }
-        if !context.writes.is_empty() {
+        let (writes, replication) = tablet.commit();
+        if !writes.is_empty() {
             self.step();
         }
-        Ok(BatchResult {
-            ts: temporal.timestamp(),
-            blocker,
-            responses,
-            writes: context.writes,
-            replication: context.replication,
-        })
+        Ok(BatchResult { ts: temporal.timestamp(), blocker, responses, writes, replication })
     }
 }
 
@@ -310,5 +252,83 @@ impl<S: Copy + Ord + std::fmt::Debug, V: Clone + std::fmt::Debug> MemoryTable<S,
             },
             Entry::Occupied(occupied) => occupied.into_mut().push((seq, value)),
         }
+    }
+}
+
+struct VirtualTablet<'a> {
+    tablet: &'a mut MemoryTabletStore,
+    provision: MemoryTable<Timestamp, Value>,
+
+    writes: Vec<protos::Write>,
+    replication: ReplicationTracker,
+}
+
+impl<'a> VirtualTablet<'a> {
+    pub fn new(tablet: &'a mut MemoryTabletStore) -> Self {
+        Self { tablet, provision: Default::default(), writes: Default::default(), replication: Default::default() }
+    }
+
+    pub fn get(&self, temporal: &Temporal, key: &[u8]) -> Result<TimestampedValue> {
+        if let Some((ts, value)) = self.provision.get(key, temporal.timestamp()) {
+            return Ok(TimestampedValue::new(ts, value).adjust_timestamp());
+        };
+        self.tablet.get(temporal, key)
+    }
+
+    pub fn find(&self, temporal: &Temporal, key: &[u8]) -> Result<(Vec<u8>, TimestampedValue)> {
+        if let Some((key, ts, value)) = self.provision.find(key, temporal.timestamp()) {
+            return Ok((key.to_owned(), TimestampedValue::new(ts, value).adjust_timestamp()));
+        }
+        self.tablet.find(key, temporal)
+    }
+
+    fn check_write(&self, temporal: &Temporal, key: &[u8]) -> Result<TimestampedValue> {
+        let value = self.get(temporal, key)?;
+        // FIXME: allow equal timestamp for now to gain write-your-write.
+        if temporal.timestamp() < value.timestamp {
+            return Err(anyhow!("write@{} encounters newer timestamp {}", temporal.timestamp(), value.timestamp));
+        }
+        Ok(value.adjust_timestamp())
+    }
+
+    fn add_write(&mut self, ts: Timestamp, key: Vec<u8>, value: Option<protos::Value>) {
+        let write = protos::Write { key: key.clone(), value: value.clone(), sequence: 0 };
+        self.writes.push(write);
+        let (value, replication) = Value::new(value);
+        self.provision.put(key, ts, value);
+        self.replication.batch(replication);
+    }
+
+    fn put(
+        &mut self,
+        temporal: &Temporal,
+        key: &[u8],
+        value: Option<protos::Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
+        let existing_value = self.check_write(temporal, key)?;
+        if let Some(expect_ts) = expect_ts.filter(|ts| *ts != existing_value.timestamp) {
+            bail!("mismatch timestamp check: existing ts {}, expect ts {:}", existing_value.timestamp, expect_ts)
+        }
+        self.add_write(temporal.timestamp(), key.to_owned(), value);
+        Ok(temporal.timestamp())
+    }
+
+    fn increment(&mut self, temporal: &Temporal, key: &[u8], increment: i64) -> Result<i64> {
+        let value = self.check_write(temporal, key)?;
+        let i = value.value.read_int(key, "increment")?;
+        let incremented = i + increment;
+        let value = protos::Value::Int(incremented);
+        self.add_write(temporal.timestamp(), key.to_owned(), Some(value));
+        Ok(incremented)
+    }
+
+    pub fn commit(self) -> (Vec<protos::Write>, ReplicationTracker) {
+        for (key, values) in self.provision.map.into_iter() {
+            for (ts, value) in values.into_iter() {
+                self.tablet.table.put(key.clone(), ts, value);
+            }
+        }
+        (self.writes, self.replication)
     }
 }
