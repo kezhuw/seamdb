@@ -142,7 +142,12 @@ impl TabletClient {
         Ok(response.value.map(|v| (v.timestamp, v.value)))
     }
 
-    pub async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+    async fn put_internally(
+        &self,
+        key: &[u8],
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
         let user_key = keys::user_key(key);
         let deployment = self.locate_key(&user_key).await?;
         let put = PutRequest { key: user_key, value, sequence: 0, expect_ts };
@@ -150,6 +155,15 @@ impl TabletClient {
         let response = self.request(deployment.tablet.id, node_id, DataRequest::Put(put)).await?;
         let response = response.into_put().map_err(|r| anyhow!("expect put response, get {:?}", r))?;
         Ok(response.write_ts)
+    }
+
+    pub async fn delete(&self, key: &[u8], expect_ts: Option<Timestamp>) -> Result<()> {
+        self.put_internally(key, None, expect_ts).await?;
+        Ok(())
+    }
+
+    pub async fn put(&self, key: &[u8], value: Value, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+        self.put_internally(key, Some(value), expect_ts).await
     }
 
     pub async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
@@ -223,19 +237,19 @@ mod tests {
         let count = client.increment(b"count", 5).await.unwrap();
         assert_eq!(count, 10);
 
-        let put_ts = client.put(b"k1", Some(Value::Bytes(b"v1_1".to_vec())), None).await.unwrap();
+        let put_ts = client.put(b"k1", Value::Bytes(b"v1_1".to_vec()), None).await.unwrap();
         let (get_ts, value) = client.get(b"k1").await.unwrap().unwrap();
         assert_that!(get_ts).is_equal_to(put_ts);
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_1".to_vec());
 
-        let put_ts = client.put(b"k1", Some(Value::Bytes(b"v1_2".to_vec())), Some(put_ts)).await.unwrap();
+        let put_ts = client.put(b"k1", Value::Bytes(b"v1_2".to_vec()), Some(put_ts)).await.unwrap();
         let (get_ts, value) = client.get(b"k1").await.unwrap().unwrap();
         assert_that!(get_ts).is_equal_to(put_ts);
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_2".to_vec());
 
-        client.put(b"k1", None, Some(put_ts)).await.unwrap();
+        client.delete(b"k1", Some(put_ts)).await.unwrap();
         assert_that!(client.get(b"k1").await.unwrap().is_none()).is_true();
-        let put_ts = client.put(b"k1", Some(Value::Bytes(b"v1_3".to_vec())), Some(Timestamp::default())).await.unwrap();
+        let put_ts = client.put(b"k1", Value::Bytes(b"v1_3".to_vec()), Some(Timestamp::default())).await.unwrap();
 
         let (ts, key, value) = client.find(b"k").await.unwrap().unwrap();
         assert_that!(ts).is_equal_to(put_ts);

@@ -249,8 +249,7 @@ impl TabletStore for MemoryTabletStore {
                     responses.push(DataResponse::Find(response));
                 },
                 DataRequest::Put(put) => {
-                    let ts =
-                        self.put(&mut context, temporal, &put.key, put.value, put.expect_ts.map(Timestamp::from))?;
+                    let ts = self.put(&mut context, temporal, &put.key, put.value, put.expect_ts)?;
                     let response = PutResponse { write_ts: ts };
                     responses.push(DataResponse::Put(response));
                 },
