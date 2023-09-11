@@ -32,16 +32,14 @@ use etcd_client::{
     WatchStream,
     Watcher,
 };
-use ignore_result::Ignore;
 use prost::Message as _;
 use tokio::select;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{span, Instrument, Level};
 use uuid::Uuid;
 
 use super::etcd::EtcdHelper;
-use super::node::NodeId;
+use super::node::NodeRegistry;
 use super::ClusterEnv;
 use crate::endpoint::ServiceUri;
 use crate::keys;
@@ -102,6 +100,29 @@ struct EtcdClusterMetaHandle {
     client: EtcdClusterClient,
     daemon: JoinHandle<Result<()>>,
     _dropper: DropOwner,
+}
+
+#[async_trait]
+impl TabletDeployer for EtcdClusterMetaDaemon {
+    type Deployment = ClusterMeta;
+    type Version = Revision;
+
+    fn nodes(&self) -> &Arc<dyn NodeRegistry> {
+        self.env.nodes()
+    }
+
+    fn replicas(&self) -> usize {
+        self.env.replicas()
+    }
+
+    async fn put_deployment(
+        &self,
+        key: &[u8],
+        version: Self::Version,
+        deployment: &Self::Deployment,
+    ) -> Result<Self::Version> {
+        self.put_meta(key, deployment, Some(version)).await
+    }
 }
 
 impl EtcdClusterMetaDaemon {
@@ -253,107 +274,6 @@ impl EtcdClusterMetaDaemon {
         Ok((revision, meta))
     }
 
-    async fn sleep(d: Duration) {
-        if !d.is_zero() {
-            tokio::time::sleep(d).await
-        }
-    }
-
-    async fn publish_meta(
-        &mut self,
-        lock: &[u8],
-        revision: Option<Revision>,
-        meta: &ClusterMeta,
-        channel: &watch::Sender<TabletDeployment>,
-    ) -> Result<Revision> {
-        let revision = self.put_meta(lock, meta, revision).await?;
-        channel.send(TabletDeployment::from(meta)).ignore();
-        Ok(revision)
-    }
-
-    async fn serve_meta(&mut self, lock: Vec<u8>, mut revision: Revision, mut meta: ClusterMeta) -> Result<()> {
-        let (crash_reporter, mut crash_watcher) = mpsc::unbounded_channel();
-        let (deployment_sender, deployment_watcher) = watch::channel(TabletDeployment::from(&meta));
-        for node in meta.servers.clone().into_iter() {
-            let node = NodeId(node);
-            let nodes = self.env.nodes().clone();
-            let deployment_receiver = deployment_watcher.clone();
-            let crash_reporter = crash_reporter.clone();
-            let deployment_span = span!(Level::INFO, "cluster meta deployment(recover)", %node);
-            tokio::spawn(
-                async move {
-                    if let Err(err) = nodes.recover_deployment(&node, deployment_receiver).await {
-                        tracing::info!("meta deployment terminated: {}", err);
-                    }
-                    crash_reporter.send(node).ignore();
-                }
-                .instrument(deployment_span),
-            );
-        }
-        let mut changed = false;
-        let min_servers = self.env.replicas();
-        let mut backoff = Duration::ZERO;
-        loop {
-            select! {
-                biased;
-                _ = Self::sleep(backoff), if changed || meta.servers.len() < min_servers => {
-                    if meta.servers.len() >= min_servers {
-                        changed = false;
-                        meta.generation += 1;
-                        revision = self.publish_meta(&lock, Some(revision), &meta, &deployment_sender).await?;
-                        continue;
-                    }
-                    // TODO: the selected node could be the one just reported as crashed
-                    let Some((node, addr)) = self.env.nodes().select_node() else {
-                        continue;
-                    };
-                    if !meta.servers.iter().any(|s| *s == node.0) {
-                        if meta.servers.is_empty() {
-                            meta.epoch += 1;
-                            meta.generation = 0;
-                        } else {
-                            meta.generation += 1;
-                        }
-                        meta.servers.push(node.0.clone());
-                        revision = self.publish_meta(&lock, Some(revision), &meta, &deployment_sender).await?;
-                        let nodes = self.env.nodes().clone();
-                        let deployment_receiver = deployment_watcher.clone();
-                        let crash_reporter = crash_reporter.clone();
-                        let deployment_span = span!(Level::INFO, "cluster meta deployment", %node, %addr);
-                        tokio::spawn(async move {
-                            if let Err(err) = nodes.start_deployment(&node, addr, deployment_receiver).await {
-                                tracing::info!("meta deployment terminated: {}", err);
-                            }
-                            crash_reporter.send(node).ignore();
-                        }.instrument(deployment_span));
-                        continue;
-                    } else if changed {
-                        meta.generation += 1;
-                        revision = self.publish_meta(&lock, Some(revision), &meta, &deployment_sender).await?;
-                        continue;
-                    }
-                    backoff += backoff / 2 + Duration::from_secs(1);
-                },
-                Some(node) = crash_watcher.recv() => {
-                    let Some(position) = meta.servers.iter().position(|s| *s == node.0) else {
-                        continue;
-                    };
-                    meta.servers.remove(position);
-                    if meta.servers.is_empty() {
-                        backoff = Duration::ZERO;
-                    } else if position == 0 {
-                        meta.epoch += 1;
-                        meta.generation = 0;
-                        revision = self.publish_meta(&lock, Some(revision), &meta, &deployment_sender).await?;
-                        continue;
-                    }
-                    changed = true;
-                    backoff = backoff.min(Duration::from_secs(1));
-                },
-            }
-        }
-    }
-
     async fn init_meta(&mut self, lock: &[u8]) -> Result<(Revision, ClusterMeta)> {
         let (revision, log_names, meta) = self.create_meta(lock).await?;
         self.bootstrap_meta(lock, revision, log_names, meta).await
@@ -386,7 +306,7 @@ impl EtcdClusterMetaDaemon {
             (_, None) => self.init_meta(&lock).await?,
             (revision, Some(meta)) => self.restore_meta(&lock, revision, meta).await?,
         };
-        self.serve_meta(lock, revision, meta).await
+        self.serve_deployment(lock, revision, meta).await
     }
 
     pub async fn start(
@@ -415,7 +335,9 @@ trait ClusterMetaClient: Send + Sync + 'static {
 
     fn root(&self) -> &str;
 
-    fn etcd(&mut self) -> &mut Client;
+    fn etcd(&self) -> &Client;
+
+    fn etcd_mut(&mut self) -> &mut Client;
 
     fn meta_key(&self) -> String {
         format!("{}/meta/data", self.root())
@@ -427,12 +349,12 @@ trait ClusterMetaClient: Send + Sync + 'static {
 
     async fn lock(&mut self, lease_id: i64) -> Result<Vec<u8>> {
         let path = self.lock_key();
-        EtcdHelper::lock(self.etcd(), path, lease_id).await
+        EtcdHelper::lock(self.etcd_mut(), path, lease_id).await
     }
 
     async fn get_meta(&mut self) -> Result<(Revision, Option<ClusterMeta>)> {
         let path = self.meta_key();
-        let mut response = self.etcd().get(path, None).await?.0;
+        let mut response = self.etcd_mut().get(path, None).await?.0;
         if let Some(kv) = response.kvs.pop() {
             let revision = kv.mod_revision;
             let meta = ClusterMeta::decode(kv.value.as_slice())?;
@@ -447,7 +369,7 @@ trait ClusterMetaClient: Send + Sync + 'static {
         }
     }
 
-    async fn put_meta(&mut self, lock: &[u8], meta: &ClusterMeta, revision: Option<Revision>) -> Result<Revision> {
+    async fn put_meta(&self, lock: &[u8], meta: &ClusterMeta, revision: Option<Revision>) -> Result<Revision> {
         let key = self.meta_key().into_bytes();
         let revision_cmp = if let Some(revision) = revision {
             Compare::mod_revision(key.clone(), CompareOp::Equal, revision)
@@ -457,7 +379,7 @@ trait ClusterMetaClient: Send + Sync + 'static {
         let lock_cmp = Compare::create_revision(lock, CompareOp::NotEqual, 0);
         let put = TxnOp::put(key, meta.encode_to_vec(), None);
         let txn = Txn::new().when([revision_cmp, lock_cmp]).and_then([put]);
-        let response = self.etcd().txn(txn).await?;
+        let response = self.etcd().kv_client().txn(txn).await?;
         if !response.succeeded() {
             return Err(anyhow!("cluster meta changed or lock expired"));
         }
@@ -475,7 +397,7 @@ trait ClusterMetaClient: Send + Sync + 'static {
         let (revision, meta) = self.get_meta().await?;
         let key = self.meta_key();
         let options = WatchOptions::new().with_start_revision(revision + 1);
-        let (watcher, mut stream) = self.etcd().watch(key, Some(options)).await?;
+        let (watcher, mut stream) = self.etcd_mut().watch(key, Some(options)).await?;
         let meta = if let Some(meta) = meta {
             meta
         } else {
@@ -500,7 +422,11 @@ impl ClusterMetaClient for EtcdClusterClient {
         &self.root
     }
 
-    fn etcd(&mut self) -> &mut Client {
+    fn etcd(&self) -> &Client {
+        &self.etcd
+    }
+
+    fn etcd_mut(&mut self) -> &mut Client {
         &mut self.etcd
     }
 }
@@ -514,7 +440,11 @@ impl ClusterMetaClient for EtcdClusterMetaDaemon {
         &self.client.root
     }
 
-    fn etcd(&mut self) -> &mut Client {
+    fn etcd(&self) -> &Client {
+        &self.client.etcd
+    }
+
+    fn etcd_mut(&mut self) -> &mut Client {
         &mut self.client.etcd
     }
 }
@@ -528,7 +458,11 @@ impl ClusterMetaClient for EtcdClusterMetaHandle {
         &self.client.root
     }
 
-    fn etcd(&mut self) -> &mut Client {
+    fn etcd(&self) -> &Client {
+        &self.client.etcd
+    }
+
+    fn etcd_mut(&mut self) -> &mut Client {
         &mut self.client.etcd
     }
 }

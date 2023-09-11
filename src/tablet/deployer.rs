@@ -32,6 +32,7 @@ use crate::protos::{
     self,
     BatchRequest,
     DataRequest,
+    Deployment,
     FindRequest,
     FindResponse,
     HeartbeatRequest,
@@ -49,21 +50,137 @@ const HEARTBEAT_DURATION: Duration = Duration::from_secs(1);
 const HEARTBEAT_EXPIRATION: Duration = HEARTBEAT_DURATION.saturating_mul(4);
 
 #[async_trait]
-impl TabletDeployer for Arc<dyn NodeRegistry> {
+pub trait TabletDeployer {
+    type Version: Send + Sync;
+    type Deployment: Deployment + Send + Sync;
+
+    fn nodes(&self) -> &Arc<dyn NodeRegistry>;
+
+    fn replicas(&self) -> usize;
+
+    async fn put_deployment(
+        &self,
+        key: &[u8],
+        version: Self::Version,
+        deployment: &Self::Deployment,
+    ) -> Result<Self::Version>;
+
+    async fn publish_deployment(
+        &self,
+        key: &[u8],
+        version: Self::Version,
+        deployment: &Self::Deployment,
+        channel: &watch::Sender<TabletDeployment>,
+    ) -> Result<Self::Version> {
+        let version = self.put_deployment(key, version, deployment).await?;
+        channel.send(deployment.to_deployment()).ignore();
+        Ok(version)
+    }
+
+    async fn serve_deployment(
+        &self,
+        key: Vec<u8>,
+        mut version: Self::Version,
+        mut deployment: Self::Deployment,
+    ) -> Result<()> {
+        let tablet_id = deployment.tablet_id();
+        let (crash_reporter, mut crash_watcher) = mpsc::unbounded_channel();
+        let (deployment_sender, deployment_watcher) = watch::channel(deployment.to_deployment());
+        for node in deployment.servers().iter().cloned() {
+            let node = NodeId(node);
+            let nodes = self.nodes().clone();
+            let deployment_receiver = deployment_watcher.clone();
+            let crash_reporter = crash_reporter.clone();
+            let deployment_span = span!(Level::INFO, "tablet deployment(recover)", %node, tablet_id);
+            tokio::spawn(
+                async move {
+                    if let Err(err) = nodes.recover_deployment(&node, deployment_receiver).await {
+                        tracing::info!("tablet deployment terminated: {}", err);
+                    }
+                    crash_reporter.send(node).ignore();
+                }
+                .instrument(deployment_span),
+            );
+        }
+        let mut changed = false;
+        let min_servers = self.replicas();
+        let mut backoff = Duration::ZERO;
+        loop {
+            select! {
+                biased;
+                _ = tokio::time::sleep(backoff), if changed || deployment.servers().len() < min_servers => {
+                    if deployment.servers().len() >= min_servers {
+                        changed = false;
+                        deployment.enter_next_generation();
+                        version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
+                        continue;
+                    }
+                    // TODO: the selected node could be the one just reported as crashed
+                    let Some((node, addr)) = self.nodes().select_node() else {
+                        continue;
+                    };
+                    if !deployment.servers().iter().any(|s| *s == node.0) {
+                        if deployment.servers().is_empty() {
+                            deployment.enter_next_epoch();
+                        } else {
+                            deployment.enter_next_generation();
+                        }
+                        deployment.servers_mut().push(node.0.clone());
+                        version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
+                        let nodes = self.nodes().clone();
+                        let deployment_receiver = deployment_watcher.clone();
+                        let crash_reporter = crash_reporter.clone();
+                        let deployment_span = span!(Level::INFO, "cluster deployment deployment", %node, %addr);
+                        tokio::spawn(async move {
+                            if let Err(err) = nodes.start_deployment(&node, addr, deployment_receiver).await {
+                                tracing::info!("deployment deployment terminated: {}", err);
+                            }
+                            crash_reporter.send(node).ignore();
+                        }.instrument(deployment_span));
+                        continue;
+                    } else if changed {
+                        deployment.enter_next_generation();
+                        version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
+                        continue;
+                    }
+                    backoff += backoff / 2 + Duration::from_secs(1);
+                },
+                Some(node) = crash_watcher.recv() => {
+                    let Some(position) = deployment.servers().iter().position(|s| *s == node.0) else {
+                        continue;
+                    };
+                    deployment.servers_mut().remove(position);
+                    if deployment.servers().is_empty() {
+                        backoff = Duration::ZERO;
+                    } else if position == 0 {
+                        deployment.enter_next_epoch();
+                        version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
+                        continue;
+                    }
+                    changed = true;
+                    backoff = backoff.min(Duration::from_secs(1));
+                },
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TabletDeployServant for Arc<dyn NodeRegistry> {
     fn nodes(&self) -> &dyn NodeRegistry {
         self.as_ref()
     }
 }
 
 #[async_trait]
-impl TabletDeployer for dyn NodeRegistry {
+impl TabletDeployServant for dyn NodeRegistry {
     fn nodes(&self) -> &dyn NodeRegistry {
         self
     }
 }
 
 #[async_trait]
-pub trait TabletDeployer {
+pub trait TabletDeployServant {
     fn nodes(&self) -> &dyn NodeRegistry;
 
     async fn connect_node(&self, node: &NodeId) -> Result<TabletServiceClient<Channel>> {
@@ -153,6 +270,47 @@ pub trait TabletDeployer {
     }
 }
 
+#[async_trait]
+impl TabletDeployer for RangeTabletDeployer {
+    type Deployment = TabletDeployment;
+    type Version = Timestamp;
+
+    fn nodes(&self) -> &Arc<dyn NodeRegistry> {
+        self.cluster.nodes()
+    }
+
+    fn replicas(&self) -> usize {
+        self.cluster.replicas()
+    }
+
+    async fn put_deployment(
+        &self,
+        key: &[u8],
+        timestamp: Timestamp,
+        deployment: &TabletDeployment,
+    ) -> Result<Timestamp> {
+        let put = PutRequest {
+            key: key.to_owned(),
+            value: Some(protos::Value::from_message(deployment)),
+            sequence: 0,
+            expect_ts: Some(timestamp),
+        };
+        let batch = BatchRequest {
+            tablet_id: self.tablet_id,
+            uncertainty: None,
+            atomic: true,
+            temporal: None,
+            requests: vec![DataRequest::Put(put)],
+        };
+        let (sender, receiver) = oneshot::channel();
+        let request = TabletRequest::Batch { batch, responser: sender };
+        self.requester.send(request)?;
+        let response = receiver.await??;
+        let put = response.into_put().map_err(|r| anyhow!("expect put response, but got {:?}", r))?;
+        Ok(put.write_ts)
+    }
+}
+
 pub struct RangeTabletDeployer {
     tablet_id: u64,
     requester: mpsc::UnboundedSender<TabletRequest>,
@@ -186,134 +344,6 @@ impl RangeTabletDeployer {
             deployment
         );
         Ok(Some((located_key, value.timestamp, deployment)))
-    }
-
-    async fn put_deployment(
-        &self,
-        key: &[u8],
-        timestamp: Timestamp,
-        deployment: TabletDeployment,
-    ) -> Result<Timestamp> {
-        let put = PutRequest {
-            key: key.to_owned(),
-            value: Some(protos::Value::from_message(&deployment)),
-            sequence: 0,
-            expect_ts: Some(timestamp),
-        };
-        let batch = BatchRequest {
-            tablet_id: self.tablet_id,
-            uncertainty: None,
-            atomic: true,
-            temporal: None,
-            requests: vec![DataRequest::Put(put)],
-        };
-        let (sender, receiver) = oneshot::channel();
-        let request = TabletRequest::Batch { batch, responser: sender };
-        self.requester.send(request)?;
-        let response = receiver.await??;
-        let put = response.into_put().map_err(|r| anyhow!("expect put response, but got {:?}", r))?;
-        Ok(put.write_ts)
-    }
-
-    async fn publish_deployment(
-        &self,
-        key: &[u8],
-        timestamp: Timestamp,
-        deployment: &TabletDeployment,
-        channel: &watch::Sender<TabletDeployment>,
-    ) -> Result<Timestamp> {
-        let write_ts = self.put_deployment(key, timestamp, deployment.clone()).await?;
-        channel.send(deployment.clone()).ignore();
-        Ok(write_ts)
-    }
-
-    async fn serve_deployment(
-        &self,
-        key: Vec<u8>,
-        mut timestamp: Timestamp,
-        mut deployment: TabletDeployment,
-    ) -> Result<()> {
-        let tablet_id = deployment.tablet.id;
-        let (crash_reporter, mut crash_watcher) = mpsc::unbounded_channel();
-        let (deployment_sender, deployment_watcher) = watch::channel(deployment.clone());
-        for node in deployment.servers.clone().into_iter() {
-            let node = NodeId(node);
-            let nodes = self.cluster.nodes().clone();
-            let deployment_receiver = deployment_watcher.clone();
-            let crash_reporter = crash_reporter.clone();
-            let deployment_span = span!(Level::INFO, "tablet deployment(recover)", %node, tablet_id);
-            tokio::spawn(
-                async move {
-                    if let Err(err) = nodes.recover_deployment(&node, deployment_receiver).await {
-                        tracing::info!("tablet deployment terminated: {}", err);
-                    }
-                    crash_reporter.send(node).ignore();
-                }
-                .instrument(deployment_span),
-            );
-        }
-        let mut changed = false;
-        let min_servers = self.cluster.replicas();
-        let mut backoff = Duration::ZERO;
-        loop {
-            select! {
-                biased;
-                _ = tokio::time::sleep(backoff), if changed || deployment.servers.len() < min_servers => {
-                    if deployment.servers.len() >= min_servers {
-                        changed = false;
-                        deployment.generation += 1;
-                        timestamp = self.publish_deployment(&key, timestamp, &deployment, &deployment_sender).await?;
-                        continue;
-                    }
-                    // TODO: the selected node could be the one just reported as crashed
-                    let Some((node, addr)) = self.cluster.nodes().select_node() else {
-                        continue;
-                    };
-                    if !deployment.servers.iter().any(|s| *s == node.0) {
-                        if deployment.servers.is_empty() {
-                            deployment.epoch += 1;
-                            deployment.generation = 0;
-                        } else {
-                            deployment.generation += 1;
-                        }
-                        deployment.servers.push(node.0.clone());
-                        timestamp = self.publish_deployment(&key, timestamp, &deployment, &deployment_sender).await?;
-                        let nodes = self.cluster.nodes().clone();
-                        let deployment_receiver = deployment_watcher.clone();
-                        let crash_reporter = crash_reporter.clone();
-                        let deployment_span = span!(Level::INFO, "cluster deployment deployment", %node, %addr);
-                        tokio::spawn(async move {
-                            if let Err(err) = nodes.start_deployment(&node, addr, deployment_receiver).await {
-                                tracing::info!("deployment deployment terminated: {}", err);
-                            }
-                            crash_reporter.send(node).ignore();
-                        }.instrument(deployment_span));
-                        continue;
-                    } else if changed {
-                        deployment.generation += 1;
-                        timestamp = self.publish_deployment(&key, timestamp, &deployment, &deployment_sender).await?;
-                        continue;
-                    }
-                    backoff += backoff / 2 + Duration::from_secs(1);
-                },
-                Some(node) = crash_watcher.recv() => {
-                    let Some(position) = deployment.servers.iter().position(|s| *s == node.0) else {
-                        continue;
-                    };
-                    deployment.servers.remove(position);
-                    if deployment.servers.is_empty() {
-                        backoff = Duration::ZERO;
-                    } else if position == 0 {
-                        deployment.epoch += 1;
-                        deployment.generation = 0;
-                        timestamp = self.publish_deployment(&key, timestamp, &deployment, &deployment_sender).await?;
-                        continue;
-                    }
-                    changed = true;
-                    backoff = backoff.min(Duration::from_secs(1));
-                },
-            }
-        }
     }
 
     async fn serve(&self) -> Result<()> {

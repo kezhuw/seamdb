@@ -52,6 +52,74 @@ impl From<&ClusterMeta> for TabletDeployment {
     }
 }
 
+pub trait Deployment {
+    fn tablet_id(&self) -> u64;
+
+    fn servers(&self) -> &[String];
+
+    fn servers_mut(&mut self) -> &mut Vec<String>;
+
+    fn enter_next_generation(&mut self);
+
+    fn enter_next_epoch(&mut self);
+
+    fn to_deployment(&self) -> TabletDeployment;
+}
+
+impl Deployment for ClusterMeta {
+    fn tablet_id(&self) -> u64 {
+        1
+    }
+
+    fn servers(&self) -> &[String] {
+        &self.servers
+    }
+
+    fn servers_mut(&mut self) -> &mut Vec<String> {
+        &mut self.servers
+    }
+
+    fn to_deployment(&self) -> TabletDeployment {
+        TabletDeployment::from(self)
+    }
+
+    fn enter_next_generation(&mut self) {
+        self.generation += 1;
+    }
+
+    fn enter_next_epoch(&mut self) {
+        self.epoch += 1;
+        self.generation = 0;
+    }
+}
+
+impl Deployment for TabletDeployment {
+    fn tablet_id(&self) -> u64 {
+        self.tablet.id
+    }
+
+    fn servers(&self) -> &[String] {
+        &self.servers
+    }
+
+    fn servers_mut(&mut self) -> &mut Vec<String> {
+        &mut self.servers
+    }
+
+    fn to_deployment(&self) -> TabletDeployment {
+        self.clone()
+    }
+
+    fn enter_next_generation(&mut self) {
+        self.generation += 1;
+    }
+
+    fn enter_next_epoch(&mut self) {
+        self.epoch += 1;
+        self.generation = 0;
+    }
+}
+
 impl MessageId {
     pub fn new(epoch: u64, sequence: u64) -> Self {
         Self { epoch, sequence }

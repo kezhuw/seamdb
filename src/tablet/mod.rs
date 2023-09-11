@@ -21,7 +21,7 @@ mod service;
 mod types;
 
 pub use self::client::TabletClient;
-pub use self::deployer::TabletDeployer;
+pub use self::deployer::{TabletDeployServant, TabletDeployer};
 pub use self::loader::{
     FollowingTablet,
     FollowingTabletManifest,
