@@ -32,7 +32,7 @@ bytesize = "1.2.0"
 compact_str = "0.7.1"
 derivative = "2.2.0"
 hashlink = "0.8.3"
-rdkafka = "0.33.2"
+rdkafka = "0.34.0"
 tokio = {version = "1.30.0", features = ["full"]}
 uriparse = "0.6.4"
 tonic = { workspace = true }

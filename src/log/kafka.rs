@@ -334,6 +334,7 @@ mod tests {
     fn kafka_container() -> Container<'static, GenericImage> {
         let docker = DockerCli::default();
         let kafka = docker.run(kafka_image());
+        tracing::debug!("kafka container started, listen on host port {}", kafka.get_host_port_ipv4(9092));
         unsafe { std::mem::transmute(kafka) }
     }
 
@@ -368,6 +369,15 @@ mod tests {
         let (read_position, read_bytes) = subscriber.read().await.unwrap();
         assert_that!(read_position).is_equal_to(write_position);
         assert_that!(read_bytes).is_equal_to("a2".as_bytes());
+
+        // Drop of Kafka consumer is likely to hang indefinitely in case of log deletion/recreation, so let's drop them
+        // first.
+        //
+        // https://github.com/fede1024/rust-rdkafka/issues/509
+        // https://github.com/fede1024/rust-rdkafka/issues/453
+        // https://github.com/fede1024/rust-rdkafka/issues/48
+        drop(subscriber);
+        drop(producer);
 
         client.delete_log(name).await.unwrap();
         client.create_log(name, ByteSize::mib(50)).await.unwrap();

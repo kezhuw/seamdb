@@ -58,7 +58,7 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     env:
-      RUST_LOG: debug
+      RUST_LOG: trace
     steps:
     - run: sudo apt install -y protobuf-compiler libprotobuf-dev
     - uses: actions/checkout@v2
