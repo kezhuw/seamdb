@@ -338,7 +338,8 @@ mod tests {
     use crate::cluster::{EtcdNodeRegistry, NodeId, NodeStatistics};
     use crate::endpoint::*;
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn test_etcd_node_registry() {
         let etcd = etcd_container();
         let cluster = etcd.uri();

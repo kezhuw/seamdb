@@ -696,7 +696,6 @@ mod tests {
     use tokio::select;
     use tokio::sync::watch;
     use tonic::transport::server::TcpIncoming;
-    use tracing_test::traced_test;
 
     use crate::cluster::etcd::tests::*;
     use crate::cluster::etcd::EtcdHelper;
@@ -723,14 +722,16 @@ mod tests {
     };
     use crate::utils::{self, DropOwner, WatchConsumer as _};
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     #[should_panic(expected = "cluster meta not found")]
     async fn test_cluster_meta_watcher_not_found() {
         let etcd = etcd_container();
         ClusterDeploymentWatcher::new("cluster1", etcd.uri(), Some(Duration::from_secs(2))).await.unwrap();
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     #[should_panic(expected = "cluster meta name mismatch")]
     async fn test_cluster_meta_watcher_mismatch_name() {
         let etcd = etcd_container();
@@ -742,7 +743,8 @@ mod tests {
         ClusterDeploymentWatcher::new("cluster1", etcd_uri, Some(Duration::from_secs(2))).await.unwrap();
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn test_cluster_meta_watcher_update() {
         let etcd = etcd_container();
         let etcd_uri = etcd.uri();
@@ -763,7 +765,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn test_cluster_meta_watcher_deleted() {
         let etcd = etcd_container();
         let etcd_uri = etcd.uri();
@@ -890,8 +893,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[traced_test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn test_cluster_meta_deploy() {
         let etcd = etcd_container();
         let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();

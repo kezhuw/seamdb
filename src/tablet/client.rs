@@ -263,7 +263,6 @@ mod tests {
 
     use assertor::*;
     use tokio::net::TcpListener;
-    use tracing_test::traced_test;
 
     use crate::cluster::tests::etcd_container;
     use crate::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
@@ -281,8 +280,8 @@ mod tests {
     };
     use crate::tablet::{TabletClient, TabletNode};
 
-    #[tokio::test]
-    #[traced_test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn test_tablet_client_basic() {
         let etcd = etcd_container();
         let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
@@ -336,8 +335,8 @@ mod tests {
         assert_that!(client.find(b"kz").await.unwrap().is_none()).is_true();
     }
 
-    #[tokio::test]
-    #[traced_test]
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn test_tablet_client_batch() {
         let etcd = etcd_container();
         let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();

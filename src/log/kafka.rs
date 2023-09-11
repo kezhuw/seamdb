@@ -337,8 +337,9 @@ mod tests {
         unsafe { std::mem::transmute(kafka) }
     }
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     #[serial_test::serial("kafka_9092")]
+    #[tracing_test::traced_test]
     async fn test_kafka_basic() {
         let kafka = kafka_container();
         let server = format!("kafka://127.0.0.1:{}", kafka.get_host_port_ipv4(9092));
