@@ -311,11 +311,11 @@ impl EtcdClusterMetaDaemon {
 
     pub async fn start(
         name: impl Into<CompactString>,
-        uri: ServiceUri,
+        uri: ServiceUri<'_>,
         env: ClusterEnv,
     ) -> Result<Box<dyn ClusterMetaHandle>> {
-        let (resource_id, params) = uri.into();
-        let etcd = EtcdHelper::connect(resource_id.endpoint(), &params).await?;
+        let (resource_id, params) = uri.parts();
+        let etcd = EtcdHelper::connect(resource_id.endpoint(), params).await?;
         let client = EtcdClusterClient { name: name.into(), root: resource_id.path().to_compact_string(), etcd };
         let (drop_owner, mut drop_watcher) = utils::drop_watcher();
         let mut daemon = EtcdClusterMetaDaemon { env, client: client.clone() };
@@ -507,9 +507,9 @@ pub struct ClusterDeploymentWatcher {
 }
 
 impl ClusterDeploymentWatcher {
-    pub async fn new(name: &str, uri: ServiceUri, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
-        let (resource_id, params) = uri.into();
-        let etcd = EtcdHelper::connect(resource_id.endpoint(), &params).await?;
+    pub async fn new(name: &str, uri: ServiceUri<'_>, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
+        let (resource_id, params) = uri.parts();
+        let etcd = EtcdHelper::connect(resource_id.endpoint(), params).await?;
         let mut client =
             EtcdClusterClient { name: name.to_compact_string(), root: resource_id.path().to_compact_string(), etcd };
         client.watch_deployment(timeout).await
@@ -802,7 +802,7 @@ mod tests {
     }
 
     impl TestNode {
-        async fn start(uri: ServiceUri) -> Self {
+        async fn start(uri: ServiceUri<'_>) -> Self {
             let node_id = NodeId::new_random();
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let address = format!("http://{}", listener.local_addr().unwrap());

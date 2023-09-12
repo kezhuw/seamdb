@@ -19,14 +19,12 @@ mod manager;
 mod memory;
 
 use std::borrow::Cow;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytesize::ByteSize;
 use compact_str::CompactString;
-use derivative::Derivative;
 
 pub use self::kafka::KafkaLogFactory;
 pub use self::manager::{LogManager, LogRegistry};
@@ -36,11 +34,8 @@ use super::endpoint::{Endpoint, Params, ResourceId};
 pub type OwnedLogAddress = LogAddress<'static>;
 
 /// Address to a log.
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LogAddress<'a> {
-    str: Cow<'a, str>,
-    #[derivative(Debug = "ignore")]
     uri: ResourceId<'a>,
 }
 
@@ -56,68 +51,44 @@ impl std::ops::Deref for LogAddress<'_> {
     type Target = str;
 
     fn deref(&self) -> &str {
-        &self.str
-    }
-}
-
-impl std::fmt::Display for LogAddress<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.str)
+        &self.uri
     }
 }
 
 impl PartialEq<&str> for LogAddress<'_> {
     fn eq(&self, other: &&str) -> bool {
-        self.str.eq(*other)
+        self.as_str() == *other
     }
 }
 
-impl PartialEq<Self> for LogAddress<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.str.eq(&other.str)
+impl std::fmt::Display for LogAddress<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.uri)
     }
 }
 
 impl From<LogAddress<'_>> for String {
-    fn from(address: LogAddress<'_>) -> Self {
-        address.str.into_owned()
-    }
-}
-
-impl Hash for LogAddress<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.str.as_ref().hash(state)
-    }
-}
-
-impl Clone for LogAddress<'_> {
-    fn clone(&self) -> Self {
-        let str = self.str.clone();
-        if matches!(str, Cow::Borrowed(_)) {
-            return Self { str, uri: self.uri };
-        }
-        let uri = unsafe { self.uri.relocate(std::mem::transmute(str.as_ref())) };
-        Self { str, uri }
+    fn from(address: LogAddress<'_>) -> String {
+        address.uri.into()
     }
 }
 
 impl<'a> LogAddress<'a> {
     pub fn new(str: impl Into<Cow<'a, str>>) -> Result<Self> {
-        let str = str.into();
-        let uri = ResourceId::parse_named("log address", str.as_ref())?;
+        let uri = ResourceId::parse_named("log address", str)?;
         if unsafe { uri.path().get_unchecked(1..) }.find('/').is_some() {
-            bail!("log address invalid log name: {str}")
+            bail!("log address invalid log name: {uri}")
         }
         let uri: ResourceId<'a> = unsafe { std::mem::transmute(uri) };
-        Ok(Self { str, uri })
+        Ok(Self { uri })
     }
 
-    pub fn uri(&self) -> ResourceId<'_> {
-        self.uri
+    pub fn uri(&self) -> &ResourceId<'_> {
+        &self.uri
     }
 
     pub fn as_str(&self) -> &str {
-        &self.str
+        &self.uri
     }
 
     pub fn to_owned(&self) -> LogAddress<'static> {
@@ -125,13 +96,7 @@ impl<'a> LogAddress<'a> {
     }
 
     pub fn into_owned(self) -> LogAddress<'static> {
-        let str = match &self.str {
-            Cow::Owned(_) => return unsafe { std::mem::transmute(self) },
-            Cow::Borrowed(str) => str.to_string(),
-        };
-        let str: Cow<'static, str> = Cow::Owned(str);
-        let uri = unsafe { self.uri.relocate(std::mem::transmute(str.as_ref())) };
-        LogAddress { str, uri }
+        LogAddress { uri: self.uri.into_owned() }
     }
 }
 
@@ -255,7 +220,7 @@ pub mod tests {
     use test_case::test_case;
     use tokio::sync::watch;
 
-    use crate::endpoint::{Endpoint, OwnedEndpoint, Params};
+    use crate::endpoint::{Endpoint, OwnedEndpoint, OwnedParams, Params};
     use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset, LogPosition};
 
     #[derive(Clone, Debug)]
@@ -384,7 +349,7 @@ pub mod tests {
     #[derive(Debug)]
     pub struct TestLogClient {
         endpoint: OwnedEndpoint,
-        params: Params,
+        params: OwnedParams,
         logs: Arc<Mutex<HashMap<String, TestLog>>>,
     }
 

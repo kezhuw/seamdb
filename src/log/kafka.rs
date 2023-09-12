@@ -345,7 +345,7 @@ mod tests {
         let kafka = kafka_container();
         let server = format!("kafka://127.0.0.1:{}", kafka.get_host_port_ipv4(9092));
 
-        let uri: ServiceUri = server.parse().unwrap();
+        let uri: OwnedServiceUri = server.try_into().unwrap();
         let factory = KafkaLogFactory::default();
         let client = factory.open_client(&uri.endpoint(), uri.params()).await.unwrap();
 

@@ -301,12 +301,12 @@ impl EtcdNodeRegistry {
     }
 
     pub async fn join(
-        uri: ServiceUri,
+        uri: ServiceUri<'_>,
         node: NodeId,
         addr: Option<OwnedEndpoint>,
     ) -> Result<(Arc<dyn NodeRegistry>, Box<dyn NodeLease>)> {
-        let (resource_id, params) = uri.into();
-        let mut client = EtcdHelper::connect(resource_id.endpoint(), &params).await?;
+        let (resource_id, params) = uri.parts();
+        let mut client = EtcdHelper::connect(resource_id.endpoint(), params).await?;
 
         let tree = format!("{}/nodes/", resource_id.path());
         let ((nodes, revision), lease) = if let Some(addr) = addr {

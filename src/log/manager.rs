@@ -55,7 +55,7 @@ impl LogRegistry {
         self.factories.get(scheme).map(|f| f.as_ref())
     }
 
-    async fn new_client(&self, endpoint: &Endpoint<'_>, params: &Params) -> Result<Arc<dyn LogClient>> {
+    async fn new_client(&self, endpoint: &Endpoint<'_>, params: &Params<'_>) -> Result<Arc<dyn LogClient>> {
         let scheme = endpoint.scheme();
         let Some(factory) = self.find_factory(scheme) else {
             bail!("no log factory for scheme of endpoint {}", endpoint)
@@ -63,7 +63,7 @@ impl LogRegistry {
         factory.open_client(endpoint, params).await
     }
 
-    pub async fn into_manager(self, endpoint: &Endpoint<'_>, params: &Params) -> Result<LogManager> {
+    pub async fn into_manager(self, endpoint: &Endpoint<'_>, params: &Params<'_>) -> Result<LogManager> {
         let client = self.new_client(endpoint, params).await?;
         let mut manager = LogManager {
             registry: self,
@@ -78,7 +78,7 @@ impl LogRegistry {
 }
 
 impl LogManager {
-    pub async fn new(factory: impl LogFactory, endpoint: &Endpoint<'_>, params: &Params) -> Result<LogManager> {
+    pub async fn new(factory: impl LogFactory, endpoint: &Endpoint<'_>, params: &Params<'_>) -> Result<LogManager> {
         let mut registry = LogRegistry::default();
         registry.register(factory).unwrap();
         registry.into_manager(endpoint, params).await
@@ -92,7 +92,7 @@ impl LogManager {
     pub async fn open_client<'a>(
         &'a mut self,
         endpoint: &Endpoint<'_>,
-        params: &Params,
+        params: &Params<'_>,
     ) -> Result<&'a Arc<dyn LogClient>> {
         if let Some(client) = self.get_cluster_client(endpoint) {
             return Ok(client);
@@ -218,12 +218,12 @@ mod tests {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
-        let (resource_id, params) = ServiceUri::parse("scheme1://address?param1=value1").unwrap();
-        let endpoint = resource_id.endpoint();
-        let client = registry.new_client(&endpoint, &params).await.unwrap();
+        let uri = ServiceUri::parse("scheme1://address?param1=value1").unwrap();
+        let endpoint = uri.endpoint();
+        let client = registry.new_client(&endpoint, uri.params()).await.unwrap();
         let created_client = factory1.get_client(&endpoint).unwrap();
         assert_that!(created_client.endpoint()).is_equal_to(endpoint);
-        assert_that!(created_client.params()).is_equal_to(&params);
+        assert_that!(created_client.params()).is_equal_to(uri.params());
         assert!(Arc::ptr_eq(&client, &(created_client as Arc<dyn LogClient>)));
     }
 
@@ -241,9 +241,9 @@ mod tests {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
-        let (resource_id, params) = ServiceUri::parse("scheme1://server1,server2:2222?param1=value1").unwrap();
-        let endpoint = resource_id.endpoint();
-        let manager = registry.into_manager(&endpoint, &params).await.unwrap();
+        let uri = ServiceUri::parse("scheme1://server1,server2:2222?param1=value1").unwrap();
+        let endpoint = uri.endpoint();
+        let manager = registry.into_manager(&endpoint, uri.params()).await.unwrap();
         let created_client: Arc<dyn LogClient> = factory1.get_client(&endpoint).unwrap();
         assert_that!(manager.active_address.as_ref()).is_equal_to(endpoint);
         assert!(Arc::ptr_eq(&manager.active_client, &created_client));
@@ -302,7 +302,7 @@ mod tests {
 
         // given: create a log through log manager
         let log1_address = manager.create_log("log1", ByteSize::mib(512)).await.unwrap();
-        assert!(log1_address == "scheme://server1,server2/log1");
+        assert_eq!(log1_address, "scheme://server1,server2/log1");
 
         // then: log created in active client
         let active_client = factory.get_client(&active_endpoint).unwrap();

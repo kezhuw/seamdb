@@ -49,7 +49,7 @@ impl EtcdLease {
 pub(super) enum EtcdHelper {}
 
 impl EtcdHelper {
-    pub async fn connect(endpoint: Endpoint<'_>, params: &Params) -> Result<Client> {
+    pub async fn connect(endpoint: Endpoint<'_>, params: &Params<'_>) -> Result<Client> {
         let scheme = match endpoint.scheme() {
             "etcd" => "http",
             "etcd+tls" => "https",
@@ -130,9 +130,9 @@ pub mod tests {
     }
 
     impl EtcdContainer {
-        pub fn uri(&self) -> ServiceUri {
+        pub fn uri(&self) -> ServiceUri<'static> {
             let cluster = format!("etcd://127.0.0.1:{}", self.container.get_host_port_ipv4(2379));
-            cluster.parse().unwrap()
+            cluster.try_into().unwrap()
         }
     }
 
