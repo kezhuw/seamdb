@@ -232,7 +232,7 @@ impl EtcdClusterMetaDaemon {
         user_tablet_descriptor: TabletDescriptor,
         ts: Timestamp,
     ) -> Result<TabletDescriptor> {
-        let key = keys::range_key(keys::MAX_KEY);
+        let key = keys::range_key(&user_tablet_descriptor.range.end);
         let deployment =
             TabletDeployment { tablet: user_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };
         let value = protos::Value::Bytes(deployment.encode_to_vec());
@@ -247,7 +247,7 @@ impl EtcdClusterMetaDaemon {
         range_tablet_descriptor: TabletDescriptor,
         ts: Timestamp,
     ) -> Result<OwnedLogAddress> {
-        let key = keys::root_key(keys::MAX_KEY);
+        let key = keys::root_key(&range_tablet_descriptor.range.end);
         let deployment =
             TabletDeployment { tablet: range_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };
         let value = protos::Value::Bytes(deployment.encode_to_vec());

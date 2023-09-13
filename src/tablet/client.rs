@@ -19,7 +19,7 @@ use prost::Message as _;
 use tonic::Status;
 
 use crate::cluster::{ClusterEnv, NodeId};
-use crate::keys::{self, KeyKind};
+use crate::keys;
 use crate::protos::{
     BatchRequest,
     DataRequest,
@@ -91,20 +91,23 @@ impl TabletClient {
             return Ok(meta.as_ref().clone());
         }
 
-        let (kind, raw_key) = keys::identify_key(&key).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let root_key = keys::root_key(raw_key);
-        if matches!(kind, KeyKind::Range { root: true }) {
+        let (kind, _raw_key) = keys::identify_key(&key).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if kind.is_root() {
             return Ok(meta.as_ref().clone());
         }
 
+        let range_key = match kind.is_range() {
+            true => key,
+            false => Cow::Owned(keys::range_key(&key)),
+        };
+
+        let root_key = keys::root_key(&range_key);
         let Some(deployment1) = self.find_deployment(1, NodeId::new(&meta.servers[0]), root_key).await? else {
             return Err(Status::not_found("no deployment found in root range tablet"));
         };
-        if matches!(kind, KeyKind::Range { .. }) {
+        if kind.is_range() {
             return Ok(deployment1);
         }
-
-        let range_key = keys::range_key(raw_key);
         let Some(deployment) =
             self.find_deployment(deployment1.tablet.id, NodeId::new(&deployment1.servers[0]), range_key).await?
         else {

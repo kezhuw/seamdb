@@ -27,6 +27,16 @@ pub enum KeyKind {
     Data { system: bool },
 }
 
+impl KeyKind {
+    pub fn is_root(&self) -> bool {
+        *self == Self::Range { root: true }
+    }
+
+    pub fn is_range(&self) -> bool {
+        *self == Self::Range { root: false }
+    }
+}
+
 pub fn identify_key(key: &[u8]) -> Result<(KeyKind, &[u8])> {
     let n = key.len();
     match n {
