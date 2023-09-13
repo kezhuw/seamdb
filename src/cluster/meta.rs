@@ -67,7 +67,7 @@ type Revision = i64;
 
 const CLUSTER_BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 
-const BOOTSTRAP_LOGS_NUMBER: usize = 6;
+const BOOTSTRAP_LOGS_NUMBER: usize = 8;
 
 fn parse_meta(name: &str, response: WatchResponse) -> Result<ClusterMeta> {
     let event = response.events().last().ok_or_else(|| anyhow!("cluster meta watch receives no event"))?;
@@ -217,27 +217,48 @@ impl EtcdClusterMetaDaemon {
         Ok(descriptor)
     }
 
-    async fn bootstrap_user_tablet(&mut self, log_names: &mut Vec<String>, ts: Timestamp) -> Result<TabletDescriptor> {
+    async fn bootstrap_system_tablet(
+        &mut self,
+        log_names: &mut Vec<String>,
+        ts: Timestamp,
+    ) -> Result<TabletDescriptor> {
         let key = keys::system_key("tablet-id-counter".as_bytes());
-        let value = protos::Value::Int(3);
+        let value = protos::Value::Int(4);
         let write = protos::Write { key, value: Some(value), sequence: 0 };
         let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), [write], ts).await?;
-        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, 3, keys::DATA_KEY_PREFIX, keys::MAX_KEY)
+        self.bootstrap_tablet_manifest(
+            log_names.pop().unwrap(),
+            data_log_uri,
+            3,
+            keys::SYSTEM_KEY_PREFIX,
+            keys::USER_KEY_PREFIX,
+        )
+        .await
+    }
+
+    async fn bootstrap_user_tablet(&mut self, log_names: &mut Vec<String>, ts: Timestamp) -> Result<TabletDescriptor> {
+        let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), vec![], ts).await?;
+        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, 4, keys::USER_KEY_PREFIX, keys::MAX_KEY)
             .await
     }
 
     async fn bootstrap_range_tablet(
         &mut self,
         log_names: &mut Vec<String>,
-        user_tablet_descriptor: TabletDescriptor,
+        descriptors: Vec<TabletDescriptor>,
         ts: Timestamp,
     ) -> Result<TabletDescriptor> {
-        let key = keys::range_key(&user_tablet_descriptor.range.end);
-        let deployment =
-            TabletDeployment { tablet: user_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };
-        let value = protos::Value::Bytes(deployment.encode_to_vec());
-        let write = protos::Write { key: key.clone(), value: Some(value), sequence: 0 };
-        let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), [write], ts).await?;
+        let mut writes = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            let key = keys::range_key(&descriptor.range.end);
+            let deployment =
+                TabletDeployment { tablet: descriptor, epoch: 0, generation: 0, servers: Default::default() };
+            let value = protos::Value::Bytes(deployment.encode_to_vec());
+            let write = protos::Write { key, value: Some(value), sequence: 0 };
+            writes.push(write);
+        }
+        let key = writes.last().unwrap().key.clone();
+        let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), writes, ts).await?;
         self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, 2, keys::RANGE_KEY_PREFIX, &key).await
     }
 
@@ -264,8 +285,11 @@ impl EtcdClusterMetaDaemon {
         mut meta: ClusterMeta,
     ) -> Result<(Revision, ClusterMeta)> {
         let now = self.env.clock().now();
+        let system_tablet_descriptor = self.bootstrap_system_tablet(&mut log_names, now).await?;
         let user_tablet_descriptor = self.bootstrap_user_tablet(&mut log_names, now).await?;
-        let range_tablet_descriptor = self.bootstrap_range_tablet(&mut log_names, user_tablet_descriptor, now).await?;
+        let range_tablet_descriptor = self
+            .bootstrap_range_tablet(&mut log_names, vec![system_tablet_descriptor, user_tablet_descriptor], now)
+            .await?;
         let root_tablet_log_uri = self.bootstrap_root_tablet(&mut log_names, range_tablet_descriptor, now).await?;
         meta.generation += 1;
         meta.log = root_tablet_log_uri.into();

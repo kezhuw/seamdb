@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use ignore_result::Ignore;
 use prost::Message as _;
 use tokio::select;
@@ -311,6 +312,7 @@ impl TabletDeployer for RangeTabletDeployer {
     }
 }
 
+#[derive(Clone)]
 pub struct RangeTabletDeployer {
     tablet_id: u64,
     requester: mpsc::UnboundedSender<TabletRequest>,
@@ -346,11 +348,53 @@ impl RangeTabletDeployer {
         Ok(Some((located_key, value.timestamp, deployment)))
     }
 
-    async fn serve(&self) -> Result<()> {
+    async fn poll_deployments(
+        &self,
+        sender: &mpsc::Sender<Result<(Vec<u8>, Timestamp, TabletDeployment)>>,
+    ) -> Result<()> {
         let Some((key, timestamp, deployment)) = self.find_deployment(vec![]).await? else {
             bail!("no deployments found")
         };
-        self.serve_deployment(key, timestamp, deployment).await
+        sender.send(Ok((key.clone(), timestamp, deployment))).await.map_err(|_| anyhow!("deployer receiver closed"))?;
+        let mut next_key = key;
+        next_key.push(0);
+        while let Some((key, timestamp, deployment)) = self.find_deployment(next_key).await? {
+            sender
+                .send(Ok((key.clone(), timestamp, deployment)))
+                .await
+                .map_err(|_| anyhow!("deployer receiver closed"))?;
+            next_key = key;
+            next_key.push(0);
+        }
+        Ok(())
+    }
+
+    fn load_deployments(&self) -> mpsc::Receiver<Result<(Vec<u8>, Timestamp, TabletDeployment)>> {
+        let (sender, receiver) = mpsc::channel(100);
+        let deployer = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = deployer.poll_deployments(&sender).await {
+                sender.send(Err(err)).await.ignore();
+            }
+        });
+        receiver
+    }
+
+    async fn serve(&self) -> Result<()> {
+        let mut deployments = self.load_deployments();
+        let mut load_completed = false;
+        let mut serve_futures = FuturesUnordered::new();
+        while !(load_completed && serve_futures.is_empty()) {
+            select! {
+                r = deployments.recv(), if !load_completed => match r {
+                    None => load_completed = true,
+                    Some(Ok((key, timestamp, deployment))) => serve_futures.push(self.serve_deployment(key, timestamp, deployment)),
+                    Some(Err(err)) => return Err(err),
+                },
+                Some(r) = serve_futures.next(), if !serve_futures.is_empty() => r?,
+            }
+        }
+        Ok(())
     }
 
     pub fn start(
