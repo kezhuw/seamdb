@@ -20,8 +20,8 @@ use ignore_result::Ignore;
 use tokio::sync::{oneshot, watch};
 
 pub use crate::clock::Timestamp;
-pub use crate::protos::{self, MessageId, TabletWatermark};
-use crate::protos::{BatchRequest, BatchResponse, HeartbeatResponse, TabletDeployment, TabletRange};
+pub use crate::protos::{self, MessageId, ShardId, TabletDescription, TabletWatermark};
+use crate::protos::{BatchRequest, BatchResponse, TabletDeployment, TabletHeartbeatResponse, TabletId, WriteSpan};
 
 pub enum Temporal {
     Timestamp(Timestamp),
@@ -64,7 +64,7 @@ pub struct TxnMeta {
 pub struct Transaction {
     pub meta: TxnMeta,
     pub status: TxnStatus,
-    pub write_set: Vec<protos::Span>,
+    pub write_set: Vec<WriteSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -490,47 +490,14 @@ impl ReplicationWatcher {
     }
 }
 
-pub struct BatchResult {
-    pub ts: Timestamp,
-
-    pub blocker: ReplicationWatcher,
-    pub responses: Vec<protos::DataResponse>,
-
-    pub writes: Vec<protos::Write>,
-    pub replication: ReplicationTracker,
-}
-
-impl BatchResult {
-    pub fn take_writes(&mut self) -> Vec<protos::Write> {
-        std::mem::take(&mut self.writes)
-    }
-}
-
-pub trait TabletStore: Send + Sync {
-    fn cursor(&self) -> MessageId;
-
-    fn watermark(&self) -> &TabletWatermark;
-
-    fn update_watermark(&mut self, watermark: TabletWatermark);
-
-    fn get(&self, temporal: &Temporal, key: &[u8]) -> Result<TimestampedValue>;
-
-    fn find(&self, key: &[u8], temporal: &Temporal) -> Result<(Vec<u8>, TimestampedValue)>;
-
-    fn apply(&mut self, message: protos::DataMessage) -> Result<()>;
-
-    fn batch(&mut self, temporal: &mut Temporal, writes: Vec<protos::DataRequest>) -> Result<BatchResult>;
-}
-
 pub enum TabletRequest {
     Batch { batch: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>> },
     Deploy { epoch: u64, generation: u64, servers: Vec<String> },
 }
 
 pub enum TabletServiceRequest {
-    ListTablets { range: TabletRange, responser: oneshot::Sender<Vec<TabletDeployment>> },
     DeployTablet { deployment: TabletDeployment, responser: oneshot::Sender<Result<Vec<TabletDeployment>>> },
+    HeartbeatTablet { tablet_id: TabletId, responser: oneshot::Sender<TabletHeartbeatResponse> },
     Batch { batch: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>> },
     UnloadTablet { deployment: TabletDeployment },
-    HeartbeatTablet { tablet_id: u64, responser: oneshot::Sender<HeartbeatResponse> },
 }

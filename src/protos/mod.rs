@@ -16,9 +16,12 @@
 
 #[rustfmt::skip]
 mod generated;
+
 use std::cmp;
+use std::fmt::{Display, Error, Formatter};
 
 use anyhow::{anyhow, bail, Result};
+use hashbrown::Equivalent;
 
 pub use self::data_message::Operation as DataOperation;
 pub use self::generated::*;
@@ -26,97 +29,103 @@ pub use self::tablet_service_client::TabletServiceClient;
 pub use self::tablet_service_server::{TabletService, TabletServiceServer};
 pub use crate::keys;
 
-impl From<ClusterMeta> for TabletDeployment {
-    fn from(meta: ClusterMeta) -> Self {
-        let tablet = TabletDescriptor {
-            id: 1,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct TabletId(u64);
+
+impl From<u64> for TabletId {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<TabletId> for u64 {
+    fn from(id: TabletId) -> Self {
+        id.0
+    }
+}
+
+impl Display for TabletId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        f.write_fmt(format_args!("{:#x}", self.0))
+    }
+}
+
+impl Equivalent<TabletId> for u64 {
+    fn equivalent(&self, key: &TabletId) -> bool {
+        *self == key.0
+    }
+}
+
+impl TabletId {
+    pub const ROOT: Self = Self(1);
+
+    pub fn into_raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ShardId(u64);
+
+impl Display for ShardId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        f.write_fmt(format_args!("{:#x}", self.0))
+    }
+}
+
+impl From<u64> for ShardId {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<ShardId> for u64 {
+    fn from(id: ShardId) -> Self {
+        id.0
+    }
+}
+
+impl ShardId {
+    pub const DEPLOYMENT: Self = Self(3);
+    pub const DESCRIPTOR: Self = Self(2);
+    pub const ROOT: Self = Self(1);
+
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl ShardDescriptor {
+    pub fn root() -> Self {
+        Self { id: ShardId::ROOT.into(), generation: 0, range: KeyRange::root(), tablet_id: TabletId::ROOT.into() }
+    }
+
+    pub fn descriptor() -> Self {
+        Self {
+            id: ShardId::DESCRIPTOR.into(),
             generation: 0,
-            range: TabletRange { start: keys::ROOT_KEY_PREFIX.to_owned(), end: keys::RANGE_KEY_PREFIX.to_owned() },
-            log: meta.log,
-            merge_bounds: TabletMergeBounds::None,
-        };
-        Self { tablet, epoch: meta.epoch, generation: meta.generation, servers: meta.servers }
+            range: keys::descriptor_range(),
+            tablet_id: TabletId::ROOT.into(),
+        }
     }
-}
 
-impl From<&ClusterMeta> for TabletDeployment {
-    fn from(meta: &ClusterMeta) -> Self {
-        let tablet = TabletDescriptor {
-            id: 1,
+    pub fn deployment() -> Self {
+        Self {
+            id: ShardId::DEPLOYMENT.into(),
             generation: 0,
-            range: TabletRange { start: keys::ROOT_KEY_PREFIX.to_owned(), end: keys::RANGE_KEY_PREFIX.to_owned() },
-            log: meta.log.clone(),
-            merge_bounds: TabletMergeBounds::None,
-        };
-        TabletDeployment { tablet, epoch: meta.epoch, generation: meta.generation, servers: meta.servers.clone() }
-    }
-}
-
-pub trait Deployment {
-    fn tablet_id(&self) -> u64;
-
-    fn servers(&self) -> &[String];
-
-    fn servers_mut(&mut self) -> &mut Vec<String>;
-
-    fn enter_next_generation(&mut self);
-
-    fn enter_next_epoch(&mut self);
-
-    fn to_deployment(&self) -> TabletDeployment;
-}
-
-impl Deployment for ClusterMeta {
-    fn tablet_id(&self) -> u64 {
-        1
-    }
-
-    fn servers(&self) -> &[String] {
-        &self.servers
-    }
-
-    fn servers_mut(&mut self) -> &mut Vec<String> {
-        &mut self.servers
-    }
-
-    fn to_deployment(&self) -> TabletDeployment {
-        TabletDeployment::from(self)
-    }
-
-    fn enter_next_generation(&mut self) {
-        self.generation += 1;
-    }
-
-    fn enter_next_epoch(&mut self) {
-        self.epoch += 1;
-        self.generation = 0;
-    }
-}
-
-impl Deployment for TabletDeployment {
-    fn tablet_id(&self) -> u64 {
-        self.tablet.id
-    }
-
-    fn servers(&self) -> &[String] {
-        &self.servers
-    }
-
-    fn servers_mut(&mut self) -> &mut Vec<String> {
-        &mut self.servers
-    }
-
-    fn to_deployment(&self) -> TabletDeployment {
-        self.clone()
-    }
-
-    fn enter_next_generation(&mut self) {
-        self.generation += 1;
-    }
-
-    fn enter_next_epoch(&mut self) {
-        self.epoch += 1;
-        self.generation = 0;
+            range: keys::deployment_range(),
+            tablet_id: TabletId::ROOT.into(),
+        }
     }
 }
 
@@ -174,9 +183,19 @@ impl BatchRequest {
     }
 }
 
-impl TabletRange {
+impl KeyRange {
+    pub fn new(start: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> Self {
+        Self { start: start.into(), end: end.into() }
+    }
+
     pub fn contains(&self, key: &[u8]) -> bool {
         self.start.as_slice() <= key && key < self.end.as_slice()
+    }
+
+    pub fn root() -> Self {
+        let end = keys::range_key(keys::MAX_KEY);
+        let end = keys::root_key(&end);
+        Self::new(keys::ROOT_KEY_PREFIX, end)
     }
 }
 
@@ -198,6 +217,10 @@ impl TabletDeployment {
 
     pub fn order(&self, other: &Self) -> std::cmp::Ordering {
         (self.epoch, self.generation).cmp(&(other.epoch, other.generation))
+    }
+
+    pub fn generation(&self) -> (u64, u64) {
+        (self.epoch, self.generation)
     }
 }
 
@@ -380,6 +403,16 @@ impl DataResponse {
         match self {
             Self::Find(find) => Some(find),
             _ => None,
+        }
+    }
+}
+
+impl ClusterDescriptor {
+    pub fn to_tablet(&self) -> TabletDescriptor {
+        TabletDescriptor {
+            id: TabletId::ROOT.into(),
+            generation: self.generation,
+            manifest_log: self.manifest_log.clone(),
         }
     }
 }

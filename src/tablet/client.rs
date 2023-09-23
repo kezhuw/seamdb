@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::anyhow;
 use prost::Message as _;
+use thiserror::Error;
 use tonic::Status;
 
 use crate::cluster::{ClusterEnv, NodeId};
@@ -29,135 +31,318 @@ use crate::protos::{
     GetRequest,
     IncrementRequest,
     PutRequest,
+    ShardDescriptor,
+    ShardId,
     TabletDeployment,
+    TabletDescriptor,
+    TabletId,
     TabletServiceClient,
     Timestamp,
     Value,
 };
 
+// TODO: cache and invalidate on error
 #[derive(Clone)]
 pub struct TabletClient {
+    root: Arc<ShardDescriptor>,
+    descriptor: Arc<ShardDescriptor>,
+    deployment: Arc<ShardDescriptor>,
     cluster: ClusterEnv,
+}
+
+#[derive(Debug, Error)]
+pub enum TabletClientError {
+    #[error("cluster not ready")]
+    ClusterNotReady,
+    #[error("cluster not deployed")]
+    ClusterNotDeployed,
+    #[error("tablet {id} deployment not found")]
+    DeploymentNotFound { id: TabletId },
+    #[error("node {node} not available")]
+    NodeNotAvailable { node: NodeId },
+    #[error("node {node} not connectable: {message}")]
+    NodeNotConnectable { node: NodeId, message: String },
+    #[error("{status}")]
+    GrpcError { status: tonic::Status },
+    #[error("unexpected: {message}")]
+    UnexpectedError { message: String },
+    #[error("tablet {tablet_id} shard {shard_id} contains not shard for {key:?}")]
+    ShardNotFound { tablet_id: TabletId, shard_id: ShardId, key: Vec<u8> },
+    #[error("data corruption: {message}")]
+    DataCorruption { message: String },
+    #[error("invalid argument: {message}")]
+    InvalidArgument { message: String },
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl From<tonic::Status> for TabletClientError {
+    fn from(status: tonic::Status) -> Self {
+        Self::GrpcError { status }
+    }
+}
+
+impl From<TabletClientError> for tonic::Status {
+    fn from(err: TabletClientError) -> Self {
+        match err {
+            TabletClientError::ClusterNotReady | TabletClientError::ClusterNotDeployed => {
+                Status::unavailable(err.to_string())
+            },
+            TabletClientError::DeploymentNotFound { .. }
+            | TabletClientError::DataCorruption { .. }
+            | TabletClientError::ShardNotFound { .. } => Status::data_loss(err.to_string()),
+            TabletClientError::NodeNotAvailable { .. } | TabletClientError::NodeNotConnectable { .. } => {
+                Status::unavailable(err.to_string())
+            },
+            TabletClientError::GrpcError { status } => status,
+            TabletClientError::Internal(_) | TabletClientError::InvalidArgument { .. } => {
+                Status::internal(err.to_string())
+            },
+            TabletClientError::UnexpectedError { .. } => Status::unknown(err.to_string()),
+        }
+    }
+}
+
+impl TabletClientError {
+    pub fn unexpected(message: impl Into<String>) -> Self {
+        Self::UnexpectedError { message: message.into() }
+    }
+
+    pub fn corrupted(message: impl Into<String>) -> Self {
+        Self::DataCorruption { message: message.into() }
+    }
+
+    pub fn node_not_available(node: impl Into<NodeId>) -> Self {
+        Self::NodeNotAvailable { node: node.into() }
+    }
+
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::InvalidArgument { message: message.into() }
+    }
+}
+
+type Result<T, E = TabletClientError> = std::result::Result<T, E>;
+
+#[derive(Clone, Debug)]
+pub struct ShardDeployment {
+    shard: Arc<ShardDescriptor>,
+    tablet: Arc<TabletDeployment>,
+}
+
+impl ShardDeployment {
+    pub fn new(shard: Arc<ShardDescriptor>, tablet: Arc<TabletDeployment>) -> Self {
+        Self { shard, tablet }
+    }
+
+    pub fn shard_id(&self) -> ShardId {
+        self.shard.id.into()
+    }
+
+    pub fn tablet_id(&self) -> TabletId {
+        self.tablet.id.into()
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        NodeId::new(&self.tablet.servers[0])
+    }
+
+    pub fn shard(&self) -> &ShardDescriptor {
+        self.shard.as_ref()
+    }
+
+    pub fn deployment(&self) -> &TabletDeployment {
+        self.tablet.as_ref()
+    }
 }
 
 impl TabletClient {
     pub fn new(cluster: ClusterEnv) -> Self {
-        Self { cluster }
+        Self {
+            cluster,
+            root: Arc::new(ShardDescriptor::root()),
+            descriptor: Arc::new(ShardDescriptor::descriptor()),
+            deployment: Arc::new(ShardDescriptor::deployment()),
+        }
     }
 
-    async fn find_deployment(
-        &self,
-        tablet_id: u64,
-        node: &NodeId,
-        key: impl Into<Vec<u8>>,
-    ) -> Result<Option<TabletDeployment>, Status> {
+    fn get_cluster_descriptor(&self) -> Result<(Timestamp, TabletDescriptor)> {
+        let Some(descriptor) = self.cluster.latest_descriptor() else {
+            return Err(TabletClientError::ClusterNotReady);
+        };
+        Ok((descriptor.timestamp, descriptor.to_tablet()))
+    }
+
+    fn get_root_tablet_deployment(&self) -> Result<Arc<TabletDeployment>> {
+        let Some(deployment) = self.cluster.latest_deployment() else {
+            return Err(TabletClientError::ClusterNotReady);
+        };
+        if deployment.servers.is_empty() {
+            return Err(TabletClientError::ClusterNotDeployed);
+        }
+        Ok(deployment)
+    }
+
+    fn get_root_shard_deployment(&self) -> Result<ShardDeployment> {
+        let Some(deployment) = self.cluster.latest_deployment() else {
+            return Err(TabletClientError::ClusterNotReady);
+        };
+        if deployment.servers.is_empty() {
+            return Err(TabletClientError::ClusterNotDeployed);
+        }
+        Ok(ShardDeployment::new(self.root.clone(), deployment))
+    }
+
+    fn get_descriptor_shard_deployment(&self) -> Result<ShardDeployment> {
+        let deployment = self.get_root_tablet_deployment()?;
+        Ok(ShardDeployment::new(self.descriptor.clone(), deployment))
+    }
+
+    fn get_deployment_shard_deployment(&self) -> Result<ShardDeployment> {
+        let deployment = self.get_root_tablet_deployment()?;
+        Ok(ShardDeployment::new(self.deployment.clone(), deployment))
+    }
+
+    pub async fn get_tablet_descriptor(&self, id: TabletId) -> Result<(Timestamp, TabletDescriptor)> {
+        let deployment = self.get_descriptor_shard_deployment()?;
+        if id == TabletId::ROOT {
+            return self.get_cluster_descriptor();
+        }
+        let key = keys::descriptor_key(id);
+        let Some((ts, value)) = self.raw_get(&deployment, key).await? else {
+            return Err(TabletClientError::DeploymentNotFound { id });
+        };
+        let Value::Bytes(bytes) = value else {
+            return Err(TabletClientError::corrupted(format!(
+                "tablet {} expect descriptor bytes, but got {:?}",
+                id, value
+            )));
+        };
+        let descriptor =
+            TabletDescriptor::decode(bytes.as_slice()).map_err(|e| TabletClientError::corrupted(e.to_string()))?;
+        Ok((ts, descriptor))
+    }
+
+    pub async fn get_tablet_deployment(&self, id: TabletId) -> Result<Arc<TabletDeployment>> {
+        if id == TabletId::ROOT {
+            return self.get_root_tablet_deployment();
+        }
+        let deployment = self.get_deployment_shard_deployment()?;
+        let key = keys::deployment_key(id);
+        let Some((_ts, value)) = self.raw_get(&deployment, key).await? else {
+            return Err(TabletClientError::DeploymentNotFound { id });
+        };
+        let Value::Bytes(bytes) = value else {
+            return Err(TabletClientError::corrupted(format!(
+                "tablet {} expect deployment bytes, but got {:?}",
+                id, value
+            )));
+        };
+        let deployment =
+            TabletDeployment::decode(bytes.as_slice()).map_err(|e| TabletClientError::corrupted(e.to_string()))?;
+        Ok(Arc::new(deployment))
+    }
+
+    async fn get_shard(&self, deployment: &ShardDeployment, key: impl Into<Vec<u8>>) -> Result<Arc<ShardDescriptor>> {
+        let node = deployment.node_id();
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
-            return Err(Status::unavailable(format!("server {} is not available", node)));
+            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
+        };
+        let mut client = TabletServiceClient::connect(addr.to_string())
+            .await
+            .map_err(|e| TabletClientError::NodeNotConnectable { node: node.clone(), message: e.to_string() })?;
+        let key = key.into();
+        let batch = BatchRequest {
+            tablet_id: deployment.tablet_id().into(),
+            uncertainty: None,
+            atomic: true,
+            temporal: None,
+            shards: vec![deployment.shard_id().into()],
+            requests: vec![DataRequest::Find(FindRequest { key, sequence: 0 })],
+        };
+        let response = client.batch(batch).await?.into_inner();
+        let find = response
+            .into_find()
+            .map_err(|r| TabletClientError::unexpected(format!("unexpected find response: {:?}", r)))?;
+        let FindResponse { key: located_key, value: Some(value) } = find else {
+            return Err(TabletClientError::ShardNotFound {
+                tablet_id: deployment.tablet_id(),
+                shard_id: deployment.shard_id(),
+                key: find.key,
+            });
+        };
+        let bytes = value
+            .read_bytes(&located_key, "read shard descritpor bytes")
+            .map_err(|e| TabletClientError::corrupted(e.to_string()))?;
+        let descritpor = ShardDescriptor::decode(bytes).map_err(|e| TabletClientError::corrupted(e.to_string()))?;
+        Ok(Arc::new(descritpor))
+    }
+
+    async fn get_shard_deployment(
+        &self,
+        deployment: &ShardDeployment,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<ShardDeployment> {
+        let shard = self.get_shard(deployment, key).await?;
+        let tablet = self.get_tablet_deployment(shard.tablet_id.into()).await?;
+        Ok(ShardDeployment::new(shard, tablet))
+    }
+
+    pub async fn locate(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<ShardDeployment> {
+        let root = self.get_root_shard_deployment()?;
+
+        let key = key.into();
+        if key.is_empty() {
+            return Ok(root);
+        }
+
+        let (kind, _raw_key) = keys::identify_key(&key).map_err(|e| TabletClientError::unexpected(e.to_string()))?;
+        if kind.is_root() {
+            return Ok(root);
+        }
+
+        let shard_key = match kind.is_range() {
+            true => key,
+            false => Cow::Owned(keys::range_key(&key)),
+        };
+
+        let root_key = keys::root_key(&shard_key);
+        let shard = self.get_shard_deployment(&root, root_key).await?;
+        if kind.is_range() {
+            return Ok(shard);
+        }
+
+        self.get_shard_deployment(&shard, shard_key).await
+    }
+
+    async fn request(&self, deployment: &ShardDeployment, request: DataRequest) -> Result<DataResponse> {
+        let node = deployment.node_id();
+        let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
+            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
         let mut client =
             TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
-        let key = key.into();
+        let tablet_id = deployment.tablet_id().into();
+        let shard_id = deployment.shard_id().into();
         let batch = BatchRequest {
             tablet_id,
             uncertainty: None,
             atomic: true,
             temporal: None,
-            requests: vec![DataRequest::Find(FindRequest { key, sequence: 0 })],
+            shards: vec![shard_id],
+            requests: vec![request],
         };
         let response = client.batch(batch).await?.into_inner();
-        let find = response.into_find().map_err(|r| Status::internal(format!("unexpected find response: {:?}", r)))?;
-        let FindResponse { key: located_key, value: Some(value) } = find else {
-            return Err(Status::data_loss(format!("no deployment for key: {:?}", find.key)));
-        };
-        let bytes =
-            value.read_bytes(&located_key, "read deployment bytes").map_err(|e| Status::data_loss(e.to_string()))?;
-        let deployment = TabletDeployment::decode(bytes).map_err(|e| Status::data_loss(e.to_string()))?;
-        if deployment.servers.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(deployment))
-        }
-    }
-
-    pub async fn locate(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<TabletDeployment, Status> {
-        let Some(meta) = self.cluster.latest_deployment() else {
-            return Err(Status::unavailable("cluster not ready: no meta"));
-        };
-        if meta.servers.is_empty() {
-            return Err(Status::unavailable("cluster not ready: no deployment"));
-        }
-        let key = key.into();
-        if key.is_empty() {
-            return Ok(meta.as_ref().clone());
-        }
-
-        let (kind, _raw_key) = keys::identify_key(&key).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        if kind.is_root() {
-            return Ok(meta.as_ref().clone());
-        }
-
-        let range_key = match kind.is_range() {
-            true => key,
-            false => Cow::Owned(keys::range_key(&key)),
-        };
-
-        let root_key = keys::root_key(&range_key);
-        let Some(deployment1) = self.find_deployment(1, NodeId::new(&meta.servers[0]), root_key).await? else {
-            return Err(Status::not_found("no deployment found in root range tablet"));
-        };
-        if kind.is_range() {
-            return Ok(deployment1);
-        }
-        let Some(deployment) =
-            self.find_deployment(deployment1.tablet.id, NodeId::new(&deployment1.servers[0]), range_key).await?
-        else {
-            return Ok(deployment1);
-        };
-        Ok(deployment)
-    }
-
-    async fn request(&self, tablet_id: u64, node: &NodeId, request: DataRequest) -> Result<DataResponse> {
-        let Some(addr) = self.cluster.nodes().get_endpoint(node) else { bail!("server {} is not available", node) };
-        let mut client =
-            TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
-        let batch =
-            BatchRequest { tablet_id, uncertainty: None, atomic: true, temporal: None, requests: vec![request] };
-        let response = client.batch(batch).await?.into_inner();
-        let response = response.into_one().map_err(|r| anyhow!("expect one response, got {:?}", r))?;
+        let response = response
+            .into_one()
+            .map_err(|r| TabletClientError::unexpected(format!("expect one response, got {:?}", r)))?;
         Ok(response)
     }
 
-    async fn locate_key(&self, key: &[u8]) -> Result<TabletDeployment> {
-        let deployment = self.locate(key).await?;
-        if key < deployment.tablet.range.start.as_slice() || key >= deployment.tablet.range.end.as_slice() {
-            bail!("no deployment found")
-        }
-        Ok(deployment)
-    }
-
-    async fn relocate_one_request(&self, request: &mut DataRequest) -> Result<TabletDeployment> {
+    async fn relocate_one_request(&self, request: &mut DataRequest) -> Result<ShardDeployment> {
         let user_key = keys::user_key(request.key());
-        let deployment = self.locate_key(&user_key).await?;
+        let deployment = self.locate(&user_key).await?;
         request.set_key(user_key);
         Ok(deployment)
-    }
-
-    async fn relocate_deployment_request(
-        &self,
-        deployment: &TabletDeployment,
-        request: &mut DataRequest,
-    ) -> Result<()> {
-        let user_key = keys::user_key(request.key());
-        if !deployment.tablet.range.contains(&user_key) {
-            bail!(
-                "key {:?} does not resides in tablet {} with range {:?}",
-                request.key(),
-                deployment.tablet.id,
-                deployment.tablet.range
-            )
-        }
-        request.set_key(user_key);
-        Ok(())
     }
 
     fn relocate_user_responses(responses: &mut [DataResponse]) {
@@ -170,40 +355,66 @@ impl TabletClient {
 
     async fn request_batch(
         &self,
-        deployment: &TabletDeployment,
+        deployment: &ShardDeployment,
+        shards: Vec<ShardId>,
         requests: Vec<DataRequest>,
     ) -> Result<Vec<DataResponse>> {
-        let node = NodeId::new(&deployment.servers[0]);
-        let Some(addr) = self.cluster.nodes().get_endpoint(node) else { bail!("server {} is not available", node) };
+        let node = deployment.node_id();
+        let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
+            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
+        };
         let mut client =
             TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
         let n = requests.len();
-        let batch =
-            BatchRequest { tablet_id: deployment.tablet.id, uncertainty: None, atomic: true, temporal: None, requests };
+        let batch = BatchRequest {
+            tablet_id: deployment.tablet.id,
+            uncertainty: None,
+            atomic: true,
+            temporal: None,
+            requests,
+            shards: unsafe { std::mem::transmute(shards) },
+        };
         let response = client.batch(batch).await?.into_inner();
         if response.responses.len() != n {
-            bail!("unexpected responses: {:?}", response)
+            return Err(TabletClientError::unexpected(format!("unexpected responses: {:?}", response)));
         }
         Ok(response.responses)
     }
 
     pub async fn batch(&self, mut requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
-        let Some((first, remains)) = requests.split_first_mut() else { bail!("empty requests") };
+        let Some((first, remains)) = requests.split_first_mut() else {
+            return Err(TabletClientError::invalid_argument("empty requests"));
+        };
         let deployment = self.relocate_one_request(first).await?;
+        let mut shards = vec![deployment.shard_id()];
         for request in remains {
-            self.relocate_deployment_request(&deployment, request).await?;
+            let new_deployment = self.relocate_one_request(request).await?;
+            if deployment.tablet_id() != new_deployment.tablet_id() {
+                return Err(TabletClientError::invalid_argument(""));
+            }
+            shards.push(deployment.shard_id());
         }
-        let mut responses = self.request_batch(&deployment, requests).await?;
+        let mut responses = self.request_batch(&deployment, shards, requests).await?;
         Self::relocate_user_responses(&mut responses);
         Ok(responses)
     }
 
+    async fn raw_get(
+        &self,
+        deployment: &ShardDeployment,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<Option<(Timestamp, Value)>> {
+        let get = GetRequest { key: key.into(), sequence: 0 };
+        let response = self.request(deployment, DataRequest::Get(get)).await?;
+        let response = response.into_get().map_err(|r| anyhow!("expect get response, get {:?}", r))?;
+        Ok(response.value.map(|v| (v.timestamp, v.value)))
+    }
+
     pub async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
         let user_key = keys::user_key(key);
-        let deployment = self.locate_key(&user_key).await?;
+        let deployment = self.locate(&user_key).await?;
         let get = GetRequest { key: user_key, sequence: 0 };
-        let node_id = NodeId::new(&deployment.servers[0]);
-        let response = self.request(deployment.tablet.id, node_id, DataRequest::Get(get)).await?;
+        let response = self.request(&deployment, DataRequest::Get(get)).await?;
         let response = response.into_get().map_err(|r| anyhow!("expect get response, get {:?}", r))?;
         Ok(response.value.map(|v| (v.timestamp, v.value)))
     }
@@ -215,10 +426,9 @@ impl TabletClient {
         expect_ts: Option<Timestamp>,
     ) -> Result<Timestamp> {
         let user_key = keys::user_key(key);
-        let deployment = self.locate_key(&user_key).await?;
+        let deployment = self.locate(&user_key).await?;
         let put = PutRequest { key: user_key, value, sequence: 0, expect_ts };
-        let node_id = NodeId::new(&deployment.servers[0]);
-        let response = self.request(deployment.tablet.id, node_id, DataRequest::Put(put)).await?;
+        let response = self.request(&deployment, DataRequest::Put(put)).await?;
         let response = response.into_put().map_err(|r| anyhow!("expect put response, get {:?}", r))?;
         Ok(response.write_ts)
     }
@@ -234,20 +444,18 @@ impl TabletClient {
 
     pub async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
         let user_key = keys::user_key(key);
-        let deployment = self.locate_key(&user_key).await?;
+        let deployment = self.locate(&user_key).await?;
         let increment = IncrementRequest { key: user_key, increment, sequence: 0 };
-        let node_id = NodeId::new(&deployment.servers[0]);
-        let response = self.request(deployment.tablet.id, node_id, DataRequest::Increment(increment)).await?;
+        let response = self.request(&deployment, DataRequest::Increment(increment)).await?;
         let response = response.into_increment().map_err(|r| anyhow!("expect increment response, get {:?}", r))?;
         Ok(response.value)
     }
 
     pub async fn find(&self, key: &[u8]) -> Result<Option<(Timestamp, Vec<u8>, Value)>> {
         let user_key = keys::user_key(key);
-        let deployment = self.locate_key(&user_key).await?;
+        let deployment = self.locate(&user_key).await?;
         let find = FindRequest { key: user_key, sequence: 0 };
-        let node_id = NodeId::new(&deployment.servers[0]);
-        let response = self.request(deployment.tablet.id, node_id, DataRequest::Find(find)).await?;
+        let response = self.request(&deployment, DataRequest::Find(find)).await?;
         let response = response.into_find().map_err(|r| anyhow!("expect find response, get {:?}", r))?;
         match response.value {
             None => Ok(None),
@@ -300,8 +508,9 @@ mod tests {
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
         let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
-        let cluster_env = cluster_env.with_deployment(deployment_watcher.monitor());
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
         let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
         let client = TabletClient::new(cluster_env);
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -355,8 +564,9 @@ mod tests {
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
         let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
-        let cluster_env = cluster_env.with_deployment(deployment_watcher.monitor());
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
         let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
         let client = TabletClient::new(cluster_env);
         tokio::time::sleep(Duration::from_secs(20)).await;

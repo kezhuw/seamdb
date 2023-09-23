@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use hashbrown::hash_map::HashMap;
+use hashbrown::hash_map::{Entry as HashEntry, HashMap};
 use ignore_result::Ignore;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
@@ -29,24 +29,22 @@ use super::deployer::RangeTabletDeployer;
 use super::types::{TabletRequest, TabletServiceRequest};
 use crate::clock::Clock;
 use crate::cluster::{ClusterEnv, NodeId};
-use crate::keys::{self, KeyKind};
 use crate::protos::{
     self,
     BatchRequest,
     BatchResponse,
     DataMessage,
     DataOperation,
-    HeartbeatRequest,
-    HeartbeatResponse,
     LocateRequest,
     LocateResponse,
     ManifestMessage,
     TabletDeployRequest,
     TabletDeployResponse,
     TabletDeployment,
-    TabletListRequest,
-    TabletListResponse,
-    TabletRange,
+    TabletDescriptor,
+    TabletHeartbeatRequest,
+    TabletHeartbeatResponse,
+    TabletId,
     TabletService,
 };
 use crate::tablet::{
@@ -59,7 +57,7 @@ use crate::tablet::{
     TabletLoader,
     Temporal,
 };
-use crate::utils;
+use crate::utils::{self, DropOwner};
 
 pub struct TabletServiceState {
     node: NodeId,
@@ -97,10 +95,12 @@ impl TabletServiceState {
         self_requester: mpsc::WeakUnboundedSender<TabletRequest>,
         requester: &mut mpsc::UnboundedReceiver<TabletRequest>,
     ) -> Result<()> {
+        let client = TabletClient::new(self.cluster.clone());
+        let (_, descriptor) = client.get_tablet_descriptor(deployment.id.into()).await?;
         let mut tablet = match deployment.servers.iter().position(|s| *s == self.node.as_ref()) {
             None => return Ok(()),
-            Some(0) => ServingTablet::Leader(self.load_leading(deployment).await?),
-            Some(_) => ServingTablet::Follower(self.load_following(deployment).await?),
+            Some(0) => ServingTablet::Leader(self.load_leading(deployment, &descriptor).await?),
+            Some(_) => ServingTablet::Follower(self.load_following(&descriptor).await?),
         };
         loop {
             match tablet {
@@ -110,20 +110,42 @@ impl TabletServiceState {
                         Some(follower) => tablet = ServingTablet::Follower(follower),
                     }
                 },
-                ServingTablet::Follower(follower) => match self.follow(deployment, follower, requester).await? {
-                    None => return Ok(()),
-                    Some(leader) => tablet = ServingTablet::Leader(leader),
+                ServingTablet::Follower(follower) => {
+                    match self.follow(deployment, &descriptor, follower, requester).await? {
+                        None => return Ok(()),
+                        Some(leader) => tablet = ServingTablet::Leader(leader),
+                    }
                 },
             }
         }
     }
 
-    async fn load_leading(&self, deployment: &TabletDeployment) -> Result<LeadingTablet> {
-        self.loader.fence_load_tablet(deployment.epoch, deployment.tablet.log.as_str()).await
+    async fn load_leading(
+        &self,
+        deployment: &TabletDeployment,
+        descriptor: &TabletDescriptor,
+    ) -> Result<LeadingTablet> {
+        self.loader.fence_load_tablet(deployment.epoch, descriptor.manifest_log.as_str()).await
     }
 
-    async fn load_following(&self, deployment: &TabletDeployment) -> Result<FollowingTablet> {
-        self.loader.load_tablet(deployment.tablet.log.as_str()).await
+    async fn load_following(&self, descriptor: &TabletDescriptor) -> Result<FollowingTablet> {
+        self.loader.load_tablet(descriptor.manifest_log.as_str()).await
+    }
+
+    fn start_deployment(
+        &self,
+        tablet: &LeadingTablet,
+        requester: mpsc::WeakUnboundedSender<TabletRequest>,
+    ) -> Option<DropOwner> {
+        let Some(shard_id) = tablet.deployment_shard_id() else {
+            return None;
+        };
+        let Some(requester) = requester.upgrade() else {
+            return None;
+        };
+        let (drop_owner, drop_watcher) = utils::drop_watcher();
+        RangeTabletDeployer::start(tablet.id(), shard_id, self.cluster.clone(), requester, drop_watcher);
+        Some(drop_owner)
     }
 
     async fn lead(
@@ -141,17 +163,7 @@ impl TabletServiceState {
         tablet.publish_watermark(closed_timestamp, leader_expiration).await?;
         self.clock.update(closed_timestamp);
 
-        let _drop_owner = if let (KeyKind::Range { .. }, _) = keys::identify_key(&deployment.tablet.range.start)? {
-            if let Some(self_requester) = self_requester.upgrade() {
-                let (drop_owner, drop_watcher) = utils::drop_watcher();
-                RangeTabletDeployer::start(deployment.tablet.id, self.cluster.clone(), self_requester, drop_watcher);
-                Some(drop_owner)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let _drop_owner = self.start_deployment(&tablet, self_requester);
 
         let mut manifest_messages = VecDeque::with_capacity(5);
         let mut writing_batches = VecDeque::with_capacity(128);
@@ -209,7 +221,7 @@ impl TabletServiceState {
                         None => Temporal::from(self.clock.now()),
                         Some(temporal) => Temporal::try_from(temporal)?,
                     };
-                    let mut result = match tablet.process_batch(&mut temporal, batch.requests) {
+                    let mut result = match tablet.process_batch(&mut temporal, batch.shards, batch.requests) {
                         Err(err) => {
                             tracing::trace!("batch error: {:?}", err);
                             responser.send(Err(err)).ignore();
@@ -267,6 +279,7 @@ impl TabletServiceState {
     async fn follow(
         &self,
         deployment: &mut TabletDeployment,
+        descriptor: &TabletDescriptor,
         mut tablet: FollowingTablet,
         requester: &mut mpsc::UnboundedReceiver<TabletRequest>,
     ) -> Result<Option<LeadingTablet>> {
@@ -291,7 +304,7 @@ impl TabletServiceState {
                             match deployment.index(&self.node) {
                                 None => return Ok(None),
                                 Some(0) => {
-                                    return Ok(Some(self.loader.lead_tablet(epoch, deployment.tablet.log.as_str(), tablet).await?));
+                                    return Ok(Some(self.loader.lead_tablet(epoch, descriptor.manifest_log.as_str(), tablet).await?));
                                 },
                                 Some(_) => {},
                             }
@@ -305,30 +318,16 @@ impl TabletServiceState {
 
 pub struct TabletServiceManager {
     state: Arc<TabletServiceState>,
-    deployments: Vec<TabletDeployment>,
-    tablets: HashMap<u64, mpsc::UnboundedSender<TabletRequest>>,
+    tablets: HashMap<TabletId, (TabletDeployment, mpsc::UnboundedSender<TabletRequest>)>,
 }
 
 impl TabletServiceManager {
     fn new(state: Arc<TabletServiceState>) -> Self {
-        Self { state, deployments: Vec::with_capacity(128), tablets: HashMap::with_capacity(128) }
-    }
-
-    fn list_tablets(&self, range: &TabletRange) -> Vec<TabletDeployment> {
-        let i = self.deployments.partition_point(|x| x.tablet.range.end <= range.start);
-        self.deployments[i..].iter().take_while(|x| x.tablet.range.start < range.end).cloned().collect()
-    }
-
-    fn deploy(&mut self, deployment: TabletDeployment) {
-        let (requester, receiver) = mpsc::unbounded_channel();
-        let weak_requster = requester.downgrade();
-        let occupied = self.tablets.insert(deployment.tablet.id, requester);
-        assert!(occupied.is_none());
-        self.state.deploy(deployment, weak_requster, receiver);
+        Self { state, tablets: HashMap::with_capacity(128) }
     }
 
     fn apply_batch(&mut self, batch: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>>) {
-        if let Some(requester) = self.tablets.get(&batch.tablet_id) {
+        if let Some((_, requester)) = self.tablets.get(&batch.tablet_id) {
             let request = TabletRequest::Batch { batch, responser };
             if let Err(mpsc::error::SendError(TabletRequest::Batch { batch, responser })) = requester.send(request) {
                 responser.send(Err(anyhow!("tablet {} closed", batch.tablet_id))).ignore();
@@ -339,57 +338,38 @@ impl TabletServiceManager {
     }
 
     fn unload_tablet(&mut self, deployment: TabletDeployment) {
-        let range = &deployment.tablet.range;
-        let i = self.deployments.partition_point(|x| x.tablet.range.end <= range.start);
-        if i == self.deployments.len() || range.end <= self.deployments[i].tablet.range.start {
-            return;
-        }
-        let overlapping = &mut self.deployments[i];
-        assert!(deployment.tablet.id == overlapping.tablet.id);
-        self.deployments.remove(i);
-        self.tablets.remove(&deployment.tablet.id);
+        self.tablets.remove(&deployment.id);
     }
 
-    fn heartbeat_tablet(&mut self, tablet_id: u64, responser: oneshot::Sender<HeartbeatResponse>) {
-        if self.tablets.get(&tablet_id).is_some() {
-            responser.send(Default::default()).ignore();
-        }
+    fn heartbeat_tablet(&mut self, tablet_id: TabletId, responser: oneshot::Sender<TabletHeartbeatResponse>) {
+        let deployment = self.tablets.get(&tablet_id).map(|(deployment, _)| deployment.clone());
+        responser.send(TabletHeartbeatResponse { deployment }).ignore();
     }
 
     fn deploy_tablet(&mut self, deployment: TabletDeployment) -> Result<Vec<TabletDeployment>> {
-        let range = &deployment.tablet.range;
-        let i = self.deployments.partition_point(|x| x.tablet.range.end <= range.start);
-        if i == self.deployments.len() || range.end <= self.deployments[i].tablet.range.start {
-            // New deployment.
-            self.deployments.insert(i, deployment.clone());
-            self.deploy(deployment);
-            return Ok(Default::default());
-        }
-        let overlapping = &mut self.deployments[i];
-        if deployment.tablet.id != overlapping.tablet.id {
-            return Err(anyhow!("deployment {:?} is overlapping with {:?}", deployment, overlapping));
-        }
-        match deployment.order(overlapping) {
-            cmp::Ordering::Less => Err(anyhow!("regression deployment {:?} to {:?}", deployment, overlapping)),
-            cmp::Ordering::Equal => Ok(Default::default()),
-            cmp::Ordering::Greater => {
-                if let Some(requester) = self.tablets.get(&overlapping.tablet.id) {
-                    requester
+        match self.tablets.entry(deployment.id.into()) {
+            HashEntry::Occupied(mut occupied) => match deployment.order(&occupied.get().0) {
+                cmp::Ordering::Less => Err(anyhow!("regression deployment {:?} to {:?}", deployment, occupied.get().0)),
+                cmp::Ordering::Equal => Ok(Default::default()),
+                cmp::Ordering::Greater => {
+                    let deployed = occupied.get_mut();
+                    deployed
+                        .1
                         .send(TabletRequest::Deploy {
                             epoch: deployment.epoch,
                             generation: deployment.generation,
                             servers: deployment.servers.clone(),
                         })
                         .ignore();
-                }
-                if deployment.servers.iter().any(|x| x == self.state.node.as_ref()) {
-                    overlapping.epoch = deployment.epoch;
-                    overlapping.generation = deployment.generation;
-                    overlapping.servers = deployment.servers;
-                } else {
-                    self.deployments.remove(i);
-                    self.tablets.remove(&deployment.tablet.id);
-                }
+                    deployed.0 = deployment;
+                    Ok(Default::default())
+                },
+            },
+            HashEntry::Vacant(vacant) => {
+                let (requester, receiver) = mpsc::unbounded_channel();
+                let weak_requster = requester.downgrade();
+                vacant.insert((deployment.clone(), requester));
+                self.state.deploy(deployment, weak_requster, receiver);
                 Ok(Default::default())
             },
         }
@@ -398,10 +378,6 @@ impl TabletServiceManager {
     async fn serve(&mut self, mut requester: mpsc::Receiver<TabletServiceRequest>) {
         while let Some(request) = requester.recv().await {
             match request {
-                TabletServiceRequest::ListTablets { range, responser } => {
-                    let deployments = self.list_tablets(&range);
-                    responser.send(deployments).ignore();
-                },
                 TabletServiceRequest::DeployTablet { deployment, responser } => {
                     let result = self.deploy_tablet(deployment);
                     responser.send(result).ignore();
@@ -471,12 +447,15 @@ impl TabletService for TabletServiceImpl {
         Ok(Response::new(TabletDeployResponse { deployments }))
     }
 
-    async fn list_tablets(&self, request: Request<TabletListRequest>) -> Result<Response<TabletListResponse>, Status> {
-        let range = request.into_inner().range;
-        let (sender, responser) = oneshot::channel();
-        let deployments =
-            self.request(TabletServiceRequest::ListTablets { range, responser: sender }, responser).await?;
-        Ok(Response::new(TabletListResponse { deployments }))
+    async fn heartbeat_tablet(
+        &self,
+        request: Request<TabletHeartbeatRequest>,
+    ) -> Result<Response<TabletHeartbeatResponse>, Status> {
+        let (sender, receiver) = oneshot::channel();
+        let tablet_id = request.into_inner().tablet_id.into();
+        let response =
+            self.request(TabletServiceRequest::HeartbeatTablet { tablet_id, responser: sender }, receiver).await?;
+        Ok(Response::new(response))
     }
 
     async fn batch(&self, request: Request<BatchRequest>) -> Result<Response<BatchResponse>, Status> {
@@ -490,15 +469,7 @@ impl TabletService for TabletServiceImpl {
     async fn locate(&self, request: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
         let query = request.into_inner();
         let deployment = self.client.locate(query.key).await?;
-        let reply = LocateResponse { deployment };
+        let reply = LocateResponse { shard: deployment.shard().clone(), deployment: deployment.deployment().clone() };
         Ok(Response::new(reply))
-    }
-
-    async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<HeartbeatResponse>, Status> {
-        let (sender, receiver) = oneshot::channel();
-        let tablet_id = request.into_inner().tablet_id;
-        let response =
-            self.request(TabletServiceRequest::HeartbeatTablet { tablet_id, responser: sender }, receiver).await?;
-        Ok(Response::new(response))
     }
 }

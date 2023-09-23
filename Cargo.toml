@@ -54,6 +54,7 @@ either = "1.9.0"
 atomic = "0.6.0"
 bytemuck = { version = "1.13.1", features = ["derive"] }
 futures = "0.3.28"
+thiserror = "1.0.48"
 
 [dev-dependencies]
 assertor = "0.0.2"

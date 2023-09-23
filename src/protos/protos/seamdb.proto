@@ -22,47 +22,75 @@ message MessageId {
     uint64 sequence = 2;
 }
 
-message TabletRange {
+message KeyRange {
     bytes start = 1;
     bytes end = 2;
 }
 
-message TabletDepotSegment {
+message ShardSegment {
     string file = 1;
     string log = 2;
-    TabletRange range = 3;
+    KeyRange range = 3;
 }
 
-message TabletDepot {
-    repeated TabletDepotSegment segments = 1;
+message ShardDepot {
+    repeated ShardSegment segments = 1;
     string file = 2;
     // kafka://kafka-cluster-address/topic-name?start=1
     string log = 3;
-    TabletRange range = 4;
+    KeyRange range = 4;
 }
 
-enum TabletMergeBounds {
+enum ShardMergeBounds {
     All = 0;
     Left = 1;
     Right = 2;
     None = 3;
 }
 
-message TabletDescriptor {
+// range/range1_end_key ==> ShardDescriptor
+message ShardDescriptor {
     uint64 id = 1;
     // Increment on each split/merge.
+    //
+    // XXX: What if a query arrive after range split ?
     uint64 generation = 2;
-    TabletRange range = 3;
-    string log = 4;
+    KeyRange range = 3;
+    uint64 tablet_id = 4;
+}
+
+message ShardDescription {
+    uint64 id = 1;
+    uint64 generation = 2;
+    KeyRange range = 3;
+    repeated ShardSegment segments = 4;
 
     // Default to All.
-    TabletMergeBounds merge_bounds = 5;
+    ShardMergeBounds merge_bounds = 5;
+}
+
+// system/tablets/deployments/id1 ==> deployment1
+message TabletDeployment {
+    uint64 id = 1;
+    // Increment on leader change.
+    uint64 epoch = 2;
+    // Increment on not-leader change and reset on leader change.
+    uint64 generation = 3;
+    repeated string servers = 4;
+}
+
+message TabletDescriptor {
+    uint64 id = 1;
+    uint64 generation = 2;
+    string manifest_log = 4;
 }
 
 message TabletDescription {
     uint64 id = 1;
     uint64 generation = 2;
-    TabletDepot depot = 4;
+    // sort by range
+    repeated ShardDescription shards = 3;
+    string data_log = 4;
 }
 
 message TabletManifest {
@@ -181,7 +209,7 @@ message Transaction {
     TxnStatus status = 7;
 
     // Write set to resolve in txn commitment.
-    repeated Span write_set = 8;
+    repeated WriteSpan write_set = 8;
 
     // Milliseconds that transaction read will fence write.
     uint32 fence_duration = 10;
@@ -215,7 +243,7 @@ message TxnRecord {
 
     TxnStatus status = 7;
 
-    repeated Span write_set = 8;
+    repeated WriteSpan write_set = 8;
 
     Timestamp heartbeat_ts = 9;
 }
@@ -265,15 +293,6 @@ message TxnIntent {
     repeated Intent history = 4;
 }
 
-message TabletDeployment {
-    TabletDescriptor tablet = 1;
-    // Increment on leader change.
-    uint64 epoch = 2;
-    // Increment on not-leader change and reset on leader change.
-    uint64 generation = 3;
-    repeated string servers = 4;
-}
-
 message TabletDeployRequest {
     TabletDeployment deployment = 1;
 }
@@ -288,22 +307,17 @@ message TabletWatermark {
     Timestamp leader_expiration = 4;
 }
 
-message TabletListRequest {
-    TabletRange range = 1;
-}
-
 message TabletListResponse {
     repeated TabletDeployment deployments = 1;
 }
 
-message ClusterMeta {
+// cluster/descriptor
+message ClusterDescriptor {
     string name = 1;
 
-    uint64 epoch = 2;
-    uint64 generation = 3;
-    repeated string servers = 4;
-
-    string log = 5;
+    uint64 generation = 2;
+    Timestamp timestamp = 3;
+    string manifest_log = 5;
 
     repeated string bootstrap_logs = 6;
     repeated string obsoleted_logs = 7;
@@ -327,7 +341,7 @@ message DataResponse {
     }
 }
 
-message Span {
+message WriteSpan {
     bytes key = 1;
     bytes end_key = 2;
 }
@@ -349,6 +363,7 @@ message BatchRequest {
 
     Temporal temporal = 3;
 
+    repeated uint64 shards = 4;
     repeated DataRequest requests = 5;
 }
 
@@ -367,7 +382,8 @@ message LocateRequest {
 }
 
 message LocateResponse {
-    TabletDeployment deployment = 1;
+    ShardDescriptor shard = 1;
+    TabletDeployment deployment = 2;
 }
 
 message GetRequest {
@@ -414,20 +430,20 @@ message IncrementResponse {
     int64 value = 1;
 }
 
-message HeartbeatRequest {
+message TabletHeartbeatRequest {
     uint64 tablet_id = 1;
 }
 
-message HeartbeatResponse {}
+message TabletHeartbeatResponse {
+    TabletDeployment deployment = 1;
+}
 
 service TabletService {
-    rpc ListTablets(TabletListRequest) returns (TabletListResponse);
-
     rpc DeployTablet(TabletDeployRequest) returns (TabletDeployResponse);
+
+    rpc HeartbeatTablet(TabletHeartbeatRequest) returns (TabletHeartbeatResponse);
 
     rpc Batch(BatchRequest) returns (BatchResponse);
 
     rpc Locate(LocateRequest) returns (LocateResponse);
-
-    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
