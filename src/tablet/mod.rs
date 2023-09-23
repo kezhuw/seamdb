@@ -18,6 +18,7 @@ mod loader;
 mod memory;
 mod node;
 mod service;
+mod store;
 mod types;
 
 pub use self::client::TabletClient;
@@ -34,11 +35,11 @@ pub use self::loader::{
 };
 pub use self::node::TabletNode;
 pub use self::service::TabletServiceImpl;
-pub use self::types::{BatchResult, ReplicationStage, Temporal, Timestamp, TimestampedValue};
+pub use self::store::BatchResult;
+pub use self::types::{ReplicationStage, Temporal, Timestamp, TimestampedValue};
 pub use crate::protos::{
     MessageId,
     TabletDeployment,
-    TabletDepot,
     TabletDescription,
     TabletDescriptor,
     TabletManifest,

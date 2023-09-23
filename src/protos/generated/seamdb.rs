@@ -10,7 +10,7 @@ pub struct MessageId {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletRange {
+pub struct KeyRange {
     #[prost(bytes = "vec", tag = "1")]
     pub start: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
@@ -18,42 +18,82 @@ pub struct TabletRange {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletDepotSegment {
+pub struct ShardSegment {
     #[prost(string, tag = "1")]
     pub file: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub log: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
-    pub range: ::core::option::Option<TabletRange>,
+    pub range: ::core::option::Option<KeyRange>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletDepot {
+pub struct ShardDepot {
     #[prost(message, repeated, tag = "1")]
-    pub segments: ::prost::alloc::vec::Vec<TabletDepotSegment>,
+    pub segments: ::prost::alloc::vec::Vec<ShardSegment>,
     #[prost(string, tag = "2")]
     pub file: ::prost::alloc::string::String,
     /// kafka://kafka-cluster-address/topic-name?start=1
     #[prost(string, tag = "3")]
     pub log: ::prost::alloc::string::String,
-    #[prost(message, required, tag = "4")]
-    pub range: TabletRange,
+    #[prost(message, optional, tag = "4")]
+    pub range: ::core::option::Option<KeyRange>,
+}
+/// range/range1_end_key ==> ShardDescriptor
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardDescriptor {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    /// Increment on each split/merge.
+    ///
+    /// XXX: What if a query arrive after range split ?
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(message, required, tag = "3")]
+    pub range: KeyRange,
+    #[prost(uint64, tag = "4")]
+    pub tablet_id: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardDescription {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(message, required, tag = "3")]
+    pub range: KeyRange,
+    #[prost(message, repeated, tag = "4")]
+    pub segments: ::prost::alloc::vec::Vec<ShardSegment>,
+    /// Default to All.
+    #[prost(enumeration = "!ShardMergeBounds", tag = "5")]
+    pub merge_bounds: ShardMergeBounds,
+}
+/// system/tablets/deployments/id1 ==> deployment1
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TabletDeployment {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    /// Increment on leader change.
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    /// Increment on not-leader change and reset on leader change.
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+    #[prost(string, repeated, tag = "4")]
+    pub servers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletDescriptor {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    /// Increment on each split/merge.
     #[prost(uint64, tag = "2")]
     pub generation: u64,
-    #[prost(message, required, tag = "3")]
-    pub range: TabletRange,
     #[prost(string, tag = "4")]
-    pub log: ::prost::alloc::string::String,
-    /// Default to All.
-    #[prost(enumeration = "!TabletMergeBounds", tag = "5")]
-    pub merge_bounds: TabletMergeBounds,
+    pub manifest_log: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -62,8 +102,11 @@ pub struct TabletDescription {
     pub id: u64,
     #[prost(uint64, tag = "2")]
     pub generation: u64,
-    #[prost(message, required, tag = "4")]
-    pub depot: TabletDepot,
+    /// sort by range
+    #[prost(message, repeated, tag = "3")]
+    pub shards: ::prost::alloc::vec::Vec<ShardDescription>,
+    #[prost(string, tag = "4")]
+    pub data_log: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -226,7 +269,7 @@ pub struct Transaction {
     pub status: TxnStatus,
     /// Write set to resolve in txn commitment.
     #[prost(message, repeated, tag = "8")]
-    pub write_set: ::prost::alloc::vec::Vec<Span>,
+    pub write_set: ::prost::alloc::vec::Vec<WriteSpan>,
     /// Milliseconds that transaction read will fence write.
     #[prost(uint32, tag = "10")]
     pub fence_duration: u32,
@@ -262,7 +305,7 @@ pub struct TxnRecord {
     #[prost(enumeration = "!TxnStatus", tag = "7")]
     pub status: TxnStatus,
     #[prost(message, repeated, tag = "8")]
-    pub write_set: ::prost::alloc::vec::Vec<Span>,
+    pub write_set: ::prost::alloc::vec::Vec<WriteSpan>,
     #[prost(message, optional, tag = "9")]
     pub heartbeat_ts: ::core::option::Option<Timestamp>,
 }
@@ -322,20 +365,6 @@ pub mod txn_intent {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletDeployment {
-    #[prost(message, required, tag = "1")]
-    pub tablet: TabletDescriptor,
-    /// Increment on leader change.
-    #[prost(uint64, tag = "2")]
-    pub epoch: u64,
-    /// Increment on not-leader change and reset on leader change.
-    #[prost(uint64, tag = "3")]
-    pub generation: u64,
-    #[prost(string, repeated, tag = "4")]
-    pub servers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletDeployRequest {
     #[prost(message, required, tag = "1")]
     pub deployment: TabletDeployment,
@@ -359,29 +388,22 @@ pub struct TabletWatermark {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabletListRequest {
-    #[prost(message, required, tag = "1")]
-    pub range: TabletRange,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletListResponse {
     #[prost(message, repeated, tag = "1")]
     pub deployments: ::prost::alloc::vec::Vec<TabletDeployment>,
 }
+/// cluster/descriptor
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ClusterMeta {
+pub struct ClusterDescriptor {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
-    pub epoch: u64,
-    #[prost(uint64, tag = "3")]
     pub generation: u64,
-    #[prost(string, repeated, tag = "4")]
-    pub servers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, required, tag = "3")]
+    pub timestamp: Timestamp,
     #[prost(string, tag = "5")]
-    pub log: ::prost::alloc::string::String,
+    pub manifest_log: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "6")]
     pub bootstrap_logs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "7")]
@@ -413,7 +435,7 @@ pub enum DataResponse {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Span {
+pub struct WriteSpan {
     #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
@@ -432,6 +454,8 @@ pub struct BatchRequest {
     pub atomic: bool,
     #[prost(message, optional, tag = "3")]
     pub temporal: ::core::option::Option<Temporal>,
+    #[prost(uint64, repeated, tag = "4")]
+    pub shards: ::prost::alloc::vec::Vec<u64>,
     #[prost(message, repeated, tag = "5")]
     pub requests: ::prost::alloc::vec::Vec<DataRequest>,
 }
@@ -457,6 +481,8 @@ pub struct LocateRequest {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LocateResponse {
     #[prost(message, required, tag = "1")]
+    pub shard: ShardDescriptor,
+    #[prost(message, required, tag = "2")]
     pub deployment: TabletDeployment,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -528,32 +554,35 @@ pub struct IncrementResponse {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HeartbeatRequest {
+pub struct TabletHeartbeatRequest {
     #[prost(uint64, tag = "1")]
     pub tablet_id: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HeartbeatResponse {}
+pub struct TabletHeartbeatResponse {
+    #[prost(message, optional, tag = "1")]
+    pub deployment: ::core::option::Option<TabletDeployment>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
-pub enum TabletMergeBounds {
+pub enum ShardMergeBounds {
     All = 0,
     Left = 1,
     Right = 2,
     None = 3,
 }
-impl TabletMergeBounds {
+impl ShardMergeBounds {
     /// String value of the enum field names used in the ProtoBuf definition.
     ///
     /// The values are not transformed in any way and thus are considered stable
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            TabletMergeBounds::All => "All",
-            TabletMergeBounds::Left => "Left",
-            TabletMergeBounds::Right => "Right",
-            TabletMergeBounds::None => "None",
+            ShardMergeBounds::All => "All",
+            ShardMergeBounds::Left => "Left",
+            ShardMergeBounds::Right => "Right",
+            ShardMergeBounds::None => "None",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -682,31 +711,6 @@ pub mod tablet_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        pub async fn list_tablets(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TabletListRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TabletListResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::new(
-                        tonic::Code::Unknown,
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/seamdb.TabletService/ListTablets",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("seamdb.TabletService", "ListTablets"));
-            self.inner.unary(req, path, codec).await
-        }
         pub async fn deploy_tablet(
             &mut self,
             request: impl tonic::IntoRequest<super::TabletDeployRequest>,
@@ -730,6 +734,31 @@ pub mod tablet_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("seamdb.TabletService", "DeployTablet"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn heartbeat_tablet(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TabletHeartbeatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TabletHeartbeatResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/seamdb.TabletService/HeartbeatTablet",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("seamdb.TabletService", "HeartbeatTablet"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn batch(
@@ -776,31 +805,6 @@ pub mod tablet_service_client {
                 .insert(GrpcMethod::new("seamdb.TabletService", "Locate"));
             self.inner.unary(req, path, codec).await
         }
-        pub async fn heartbeat(
-            &mut self,
-            request: impl tonic::IntoRequest<super::HeartbeatRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::HeartbeatResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::new(
-                        tonic::Code::Unknown,
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/seamdb.TabletService/Heartbeat",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("seamdb.TabletService", "Heartbeat"));
-            self.inner.unary(req, path, codec).await
-        }
     }
 }
 /// Generated server implementations.
@@ -810,18 +814,18 @@ pub mod tablet_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with TabletServiceServer.
     #[async_trait]
     pub trait TabletService: Send + Sync + 'static {
-        async fn list_tablets(
-            &self,
-            request: tonic::Request<super::TabletListRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TabletListResponse>,
-            tonic::Status,
-        >;
         async fn deploy_tablet(
             &self,
             request: tonic::Request<super::TabletDeployRequest>,
         ) -> std::result::Result<
             tonic::Response<super::TabletDeployResponse>,
+            tonic::Status,
+        >;
+        async fn heartbeat_tablet(
+            &self,
+            request: tonic::Request<super::TabletHeartbeatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TabletHeartbeatResponse>,
             tonic::Status,
         >;
         async fn batch(
@@ -832,13 +836,6 @@ pub mod tablet_service_server {
             &self,
             request: tonic::Request<super::LocateRequest>,
         ) -> std::result::Result<tonic::Response<super::LocateResponse>, tonic::Status>;
-        async fn heartbeat(
-            &self,
-            request: tonic::Request<super::HeartbeatRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::HeartbeatResponse>,
-            tonic::Status,
-        >;
     }
     #[derive(Debug)]
     pub struct TabletServiceServer<T: TabletService> {
@@ -919,52 +916,6 @@ pub mod tablet_service_server {
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             let inner = self.inner.clone();
             match req.uri().path() {
-                "/seamdb.TabletService/ListTablets" => {
-                    #[allow(non_camel_case_types)]
-                    struct ListTabletsSvc<T: TabletService>(pub Arc<T>);
-                    impl<
-                        T: TabletService,
-                    > tonic::server::UnaryService<super::TabletListRequest>
-                    for ListTabletsSvc<T> {
-                        type Response = super::TabletListResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::TabletListRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                (*inner).list_tablets(request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let inner = inner.0;
-                        let method = ListTabletsSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/seamdb.TabletService/DeployTablet" => {
                     #[allow(non_camel_case_types)]
                     struct DeployTabletSvc<T: TabletService>(pub Arc<T>);
@@ -996,6 +947,52 @@ pub mod tablet_service_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = DeployTabletSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/seamdb.TabletService/HeartbeatTablet" => {
+                    #[allow(non_camel_case_types)]
+                    struct HeartbeatTabletSvc<T: TabletService>(pub Arc<T>);
+                    impl<
+                        T: TabletService,
+                    > tonic::server::UnaryService<super::TabletHeartbeatRequest>
+                    for HeartbeatTabletSvc<T> {
+                        type Response = super::TabletHeartbeatResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TabletHeartbeatRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                (*inner).heartbeat_tablet(request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = HeartbeatTabletSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -1083,50 +1080,6 @@ pub mod tablet_service_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = LocateSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/seamdb.TabletService/Heartbeat" => {
-                    #[allow(non_camel_case_types)]
-                    struct HeartbeatSvc<T: TabletService>(pub Arc<T>);
-                    impl<
-                        T: TabletService,
-                    > tonic::server::UnaryService<super::HeartbeatRequest>
-                    for HeartbeatSvc<T> {
-                        type Response = super::HeartbeatResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::HeartbeatRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move { (*inner).heartbeat(request).await };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let inner = inner.0;
-                        let method = HeartbeatSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

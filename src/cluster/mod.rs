@@ -18,9 +18,15 @@ mod meta;
 mod node;
 
 pub use self::env::ClusterEnv;
-pub use self::meta::{ClusterDeploymentMonitor, ClusterDeploymentWatcher, ClusterMetaHandle, EtcdClusterMetaDaemon};
+pub use self::meta::{
+    ClusterDeploymentMonitor,
+    ClusterDeploymentWatcher,
+    ClusterDescriptorWatcher,
+    ClusterMetaHandle,
+    EtcdClusterMetaDaemon,
+};
 pub use self::node::{EtcdNodeRegistry, NodeId, NodeLease, NodeRegistry, NodeStatistics, NodeStatisticsWatcher};
-pub use crate::protos::ClusterMeta;
+pub use crate::protos::ClusterDescriptor;
 
 #[cfg(test)]
 pub mod tests {

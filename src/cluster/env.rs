@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use super::{ClusterDeploymentMonitor, NodeRegistry};
+use super::{ClusterDeploymentMonitor, ClusterDescriptorWatcher, NodeRegistry};
 use crate::clock::Clock;
 use crate::log::LogManager;
-use crate::protos::TabletDeployment;
+use crate::protos::{ClusterDescriptor, TabletDeployment};
 
 #[derive(Clone)]
 pub struct ClusterEnv {
@@ -25,16 +25,21 @@ pub struct ClusterEnv {
     clock: Clock,
     nodes: Arc<dyn NodeRegistry>,
     replicas: usize,
+    descriptor: Option<ClusterDescriptorWatcher>,
     deployment: Option<ClusterDeploymentMonitor>,
 }
 
 impl ClusterEnv {
     pub fn new(log: Arc<LogManager>, nodes: Arc<dyn NodeRegistry>) -> Self {
-        Self { log, nodes, replicas: 3, clock: Clock::new(), deployment: None }
+        Self { log, nodes, replicas: 3, clock: Clock::new(), descriptor: None, deployment: None }
     }
 
     pub fn with_replicas(self, replicas: usize) -> Self {
         Self { replicas: replicas.max(1), ..self }
+    }
+
+    pub fn with_descriptor(self, descriptor: ClusterDescriptorWatcher) -> Self {
+        Self { descriptor: Some(descriptor), ..self }
     }
 
     pub fn with_deployment(self, deployment: ClusterDeploymentMonitor) -> Self {
@@ -59,6 +64,10 @@ impl ClusterEnv {
     #[inline]
     pub fn replicas(&self) -> usize {
         self.replicas
+    }
+
+    pub fn latest_descriptor(&self) -> Option<Arc<ClusterDescriptor>> {
+        self.descriptor.as_ref().and_then(|d| d.latest())
     }
 
     pub fn latest_deployment(&self) -> Option<Arc<TabletDeployment>> {

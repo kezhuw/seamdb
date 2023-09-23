@@ -28,20 +28,18 @@ use tracing::{span, Instrument, Level};
 use super::types::TabletRequest;
 use crate::cluster::{ClusterEnv, NodeId, NodeRegistry};
 use crate::endpoint::{Endpoint, OwnedEndpoint};
-use crate::keys;
 use crate::protos::{
     self,
     BatchRequest,
     DataRequest,
-    Deployment,
     FindRequest,
     FindResponse,
-    HeartbeatRequest,
     PutRequest,
+    ShardId,
     TabletDeployRequest,
     TabletDeployment,
-    TabletListRequest,
-    TabletRange,
+    TabletHeartbeatRequest,
+    TabletId,
     TabletServiceClient,
     Timestamp,
 };
@@ -53,7 +51,6 @@ const HEARTBEAT_EXPIRATION: Duration = HEARTBEAT_DURATION.saturating_mul(4);
 #[async_trait]
 pub trait TabletDeployer {
     type Version: Send + Sync;
-    type Deployment: Deployment + Send + Sync;
 
     fn nodes(&self) -> &Arc<dyn NodeRegistry>;
 
@@ -63,18 +60,18 @@ pub trait TabletDeployer {
         &self,
         key: &[u8],
         version: Self::Version,
-        deployment: &Self::Deployment,
+        deployment: &TabletDeployment,
     ) -> Result<Self::Version>;
 
     async fn publish_deployment(
         &self,
         key: &[u8],
         version: Self::Version,
-        deployment: &Self::Deployment,
+        deployment: &TabletDeployment,
         channel: &watch::Sender<TabletDeployment>,
     ) -> Result<Self::Version> {
         let version = self.put_deployment(key, version, deployment).await?;
-        channel.send(deployment.to_deployment()).ignore();
+        channel.send(deployment.clone()).ignore();
         Ok(version)
     }
 
@@ -82,12 +79,12 @@ pub trait TabletDeployer {
         &self,
         key: Vec<u8>,
         mut version: Self::Version,
-        mut deployment: Self::Deployment,
+        mut deployment: TabletDeployment,
     ) -> Result<()> {
-        let tablet_id = deployment.tablet_id();
+        let tablet_id = deployment.id;
         let (crash_reporter, mut crash_watcher) = mpsc::unbounded_channel();
-        let (deployment_sender, deployment_watcher) = watch::channel(deployment.to_deployment());
-        for node in deployment.servers().iter().cloned() {
+        let (deployment_sender, deployment_watcher) = watch::channel(deployment.clone());
+        for node in deployment.servers.iter().cloned() {
             let node = NodeId(node);
             let nodes = self.nodes().clone();
             let deployment_receiver = deployment_watcher.clone();
@@ -109,10 +106,10 @@ pub trait TabletDeployer {
         loop {
             select! {
                 biased;
-                _ = tokio::time::sleep(backoff), if changed || deployment.servers().len() < min_servers => {
-                    if deployment.servers().len() >= min_servers {
+                _ = tokio::time::sleep(backoff), if changed || deployment.servers.len() < min_servers => {
+                    if deployment.servers.len() >= min_servers {
                         changed = false;
-                        deployment.enter_next_generation();
+                        deployment.generation += 1;
                         version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
                         continue;
                     }
@@ -120,13 +117,13 @@ pub trait TabletDeployer {
                     let Some((node, addr)) = self.nodes().select_node() else {
                         continue;
                     };
-                    if !deployment.servers().iter().any(|s| *s == node.0) {
-                        if deployment.servers().is_empty() {
-                            deployment.enter_next_epoch();
+                    if !deployment.servers.iter().any(|s| *s == node.0) {
+                        if deployment.servers.is_empty() {
+                            deployment.epoch += 1;
                         } else {
-                            deployment.enter_next_generation();
+                            deployment.generation += 1;
                         }
-                        deployment.servers_mut().push(node.0.clone());
+                        deployment.servers.push(node.0.clone());
                         version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
                         let nodes = self.nodes().clone();
                         let deployment_receiver = deployment_watcher.clone();
@@ -140,21 +137,21 @@ pub trait TabletDeployer {
                         }.instrument(deployment_span));
                         continue;
                     } else if changed {
-                        deployment.enter_next_generation();
+                        deployment.generation += 1;
                         version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
                         continue;
                     }
                     backoff += backoff / 2 + Duration::from_secs(1);
                 },
                 Some(node) = crash_watcher.recv() => {
-                    let Some(position) = deployment.servers().iter().position(|s| *s == node.0) else {
+                    let Some(position) = deployment.servers.iter().position(|s| *s == node.0) else {
                         continue;
                     };
-                    deployment.servers_mut().remove(position);
-                    if deployment.servers().is_empty() {
+                    deployment.servers.remove(position);
+                    if deployment.servers.is_empty() {
                         backoff = Duration::ZERO;
                     } else if position == 0 {
-                        deployment.enter_next_epoch();
+                        deployment.epoch += 1;
                         version = self.publish_deployment(&key, version, &deployment, &deployment_sender).await?;
                         continue;
                     }
@@ -202,6 +199,7 @@ pub trait TabletDeployServant {
     async fn serve_deployment(
         &self,
         node: &NodeId,
+        mut deployed: TabletDeployment,
         mut receiver: watch::Receiver<TabletDeployment>,
         mut client: TabletServiceClient<Channel>,
     ) -> Result<()> {
@@ -212,46 +210,54 @@ pub trait TabletDeployServant {
                 _ = receiver.changed() => {
                     let deployment = receiver.consume();
                     let is_member = deployment.servers.iter().any(|s| *s == node.0);
-                    let request = TabletDeployRequest { deployment };
+                    let request = TabletDeployRequest { deployment: deployment.clone() };
                     client.deploy_tablet(request).await?;
                     if !is_member {
                         break;
                     }
+                    deployed = deployment;
                 },
                 _ = interval.tick() => {
-                    client.heartbeat(HeartbeatRequest{ tablet_id: 1 }).await?;
+                    self.heartbeat_deployment(&mut client, node, &deployed).await?;
                 },
             }
         }
         Ok(())
     }
 
+    async fn heartbeat_deployment(
+        &self,
+        client: &mut TabletServiceClient<Channel>,
+        node: &NodeId,
+        deployment: &TabletDeployment,
+    ) -> Result<TabletDeployment> {
+        let request = TabletHeartbeatRequest { tablet_id: deployment.id };
+        let response = client.heartbeat_tablet(request).await?.into_inner();
+        let Some(deployed) = response.deployment else {
+            bail!("node {} has no deployment for tablet {}", node, deployment.id)
+        };
+        ensure!(
+            deployment.generation() >= deployed.generation(),
+            "try to deploy tablet with epoch {} to node {} with deployment epoch {}",
+            deployment.epoch,
+            node,
+            deployed.epoch
+        );
+        Ok(deployed)
+    }
+
     async fn reestablish_deployment(
         &self,
         node: &NodeId,
         receiver: &mut watch::Receiver<TabletDeployment>,
-    ) -> Result<TabletServiceClient<Channel>> {
-        let range = TabletRange { start: keys::ROOT_KEY_PREFIX.to_owned(), end: keys::RANGE_KEY_PREFIX.to_owned() };
-        let request = TabletListRequest { range };
+    ) -> Result<(TabletServiceClient<Channel>, TabletDeployment)> {
         let mut client = self.connect_node(node).await?;
-        let mut response = client.list_tablets(request).await?.into_inner();
-        match response.deployments.len() {
-            0 => bail!("no deployments on node {:?}", node),
-            1 => {},
-            n => bail!("{} meta deployments on node {:?}", n, node),
-        };
-        let deployed = response.deployments.remove(0);
         let deployment = receiver.consume();
-        ensure!(
-            deployment.epoch >= deployed.epoch,
-            "cluster meta epoch {} is smaller than deployment epoch {}",
-            deployment.epoch,
-            deployed.epoch
-        );
+        let deployed = self.heartbeat_deployment(&mut client, node, &deployment).await?;
         if deployment.epoch != deployed.epoch || deployment.generation != deployed.generation {
-            client.deploy_tablet(TabletDeployRequest { deployment }).await?;
+            client.deploy_tablet(TabletDeployRequest { deployment: deployment.clone() }).await?;
         }
-        Ok(client)
+        Ok((client, deployment))
     }
 
     async fn start_deployment(
@@ -261,19 +267,19 @@ pub trait TabletDeployServant {
         mut receiver: watch::Receiver<TabletDeployment>,
     ) -> Result<()> {
         let mut client = self.connect_node_with_addr(node, addr.as_ref()).await?;
-        client.deploy_tablet(TabletDeployRequest { deployment: receiver.consume() }).await?;
-        self.serve_deployment(node, receiver, client).await
+        let deployment = receiver.consume();
+        client.deploy_tablet(TabletDeployRequest { deployment: deployment.clone() }).await?;
+        self.serve_deployment(node, deployment, receiver, client).await
     }
 
     async fn recover_deployment(&self, node: &NodeId, mut receiver: watch::Receiver<TabletDeployment>) -> Result<()> {
-        let client = self.reestablish_deployment(node, &mut receiver).await?;
-        self.serve_deployment(node, receiver, client).await
+        let (client, deployment) = self.reestablish_deployment(node, &mut receiver).await?;
+        self.serve_deployment(node, deployment, receiver, client).await
     }
 }
 
 #[async_trait]
 impl TabletDeployer for RangeTabletDeployer {
-    type Deployment = TabletDeployment;
     type Version = Timestamp;
 
     fn nodes(&self) -> &Arc<dyn NodeRegistry> {
@@ -297,10 +303,11 @@ impl TabletDeployer for RangeTabletDeployer {
             expect_ts: Some(timestamp),
         };
         let batch = BatchRequest {
-            tablet_id: self.tablet_id,
+            tablet_id: self.tablet_id.into(),
             uncertainty: None,
             atomic: true,
             temporal: None,
+            shards: vec![self.shard_id.into()],
             requests: vec![DataRequest::Put(put)],
         };
         let (sender, receiver) = oneshot::channel();
@@ -314,7 +321,8 @@ impl TabletDeployer for RangeTabletDeployer {
 
 #[derive(Clone)]
 pub struct RangeTabletDeployer {
-    tablet_id: u64,
+    shard_id: ShardId,
+    tablet_id: TabletId,
     requester: mpsc::UnboundedSender<TabletRequest>,
     cluster: ClusterEnv,
 }
@@ -322,10 +330,11 @@ pub struct RangeTabletDeployer {
 impl RangeTabletDeployer {
     async fn find_deployment(&self, key: Vec<u8>) -> Result<Option<(Vec<u8>, Timestamp, TabletDeployment)>> {
         let batch = BatchRequest {
-            tablet_id: self.tablet_id,
+            tablet_id: self.tablet_id.into(),
             uncertainty: None,
             atomic: true,
             temporal: None,
+            shards: vec![self.shard_id.into()],
             requests: vec![DataRequest::Find(FindRequest { key, sequence: 0 })],
         };
         let (sender, receiver) = oneshot::channel();
@@ -398,12 +407,13 @@ impl RangeTabletDeployer {
     }
 
     pub fn start(
-        tablet_id: u64,
+        tablet_id: TabletId,
+        shard_id: ShardId,
         cluster: ClusterEnv,
         requester: mpsc::UnboundedSender<TabletRequest>,
         mut drop_watcher: DropWatcher,
     ) {
-        let deployer = RangeTabletDeployer { tablet_id, requester, cluster };
+        let deployer = RangeTabletDeployer { tablet_id, shard_id, requester, cluster };
         tokio::spawn(async move {
             select! {
                 _ = drop_watcher.dropped() => {},

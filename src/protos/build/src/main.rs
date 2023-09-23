@@ -52,15 +52,14 @@ fn main() {
         .require_field("TimestampedValue.value")
         .require_field("TimestampedValue.timestamp")
         .require_field("PutResponse.write_ts")
+        .require_field("LocateResponse.shard")
         .require_field("LocateResponse.deployment")
-        .require_field("TabletDepot.range")
+        .require_field("ClusterDescriptor.timestamp")
+        .require_field("ShardDescriptor.range")
+        .require_field("ShardDescription.range")
         .require_field("TabletManifest.tablet")
         .require_field("TabletManifest.watermark")
-        .require_field("TabletDescriptor.range")
-        .require_field("TabletDeployment.tablet")
-        .require_field("TabletListRequest.range")
-        .require_field("TabletDeployRequest.deployment")
-        .require_field("TabletDescription.depot");
+        .require_field("TabletDeployRequest.deployment");
 
     tonic_build::configure().out_dir(&outdir).compile_with_config(config, &protos, &[protos_dir]).unwrap();
 

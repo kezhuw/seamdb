@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::Write;
+
 use anyhow::{bail, Result};
 
+use crate::protos::{KeyRange, TabletId};
+
+pub const TABLET_DESCRIPTOR_KEY_PREFIX: &[u8] = &[b'T', b'D'];
+pub const TABLET_DEPLOYMENT_KEY_PREFIX: &[u8] = &[b'T', b'T'];
 pub const ROOT_KEY_PREFIX: &[u8] = &[b'a', b'1'];
 pub const RANGE_KEY_PREFIX: &[u8] = &[b'a', b'2'];
 pub const DATA_KEY_PREFIX: &[u8] = &[b'd'];
@@ -60,6 +66,36 @@ pub fn root_key(key: &[u8]) -> Vec<u8> {
     rooted_key.extend(ROOT_KEY_PREFIX.iter());
     rooted_key.extend(key.iter());
     rooted_key
+}
+
+pub fn descriptor_key(id: TabletId) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(TABLET_DESCRIPTOR_KEY_PREFIX);
+    write!(&mut buf, "{}", id).unwrap();
+    buf
+}
+
+pub fn deployment_key(id: TabletId) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(TABLET_DEPLOYMENT_KEY_PREFIX);
+    write!(&mut buf, "{}", id).unwrap();
+    buf
+}
+
+pub fn descriptor_range() -> KeyRange {
+    let start = TABLET_DESCRIPTOR_KEY_PREFIX.to_owned();
+    let mut end = Vec::with_capacity(TABLET_DESCRIPTOR_KEY_PREFIX.len() + 1);
+    end.extend_from_slice(TABLET_DESCRIPTOR_KEY_PREFIX);
+    end.push(b'z');
+    KeyRange { start, end }
+}
+
+pub fn deployment_range() -> KeyRange {
+    let start = TABLET_DEPLOYMENT_KEY_PREFIX.to_owned();
+    let mut end = Vec::with_capacity(TABLET_DEPLOYMENT_KEY_PREFIX.len() + 1);
+    end.extend_from_slice(TABLET_DEPLOYMENT_KEY_PREFIX);
+    end.push(b'z');
+    KeyRange { start, end }
 }
 
 pub fn range_key(key: &[u8]) -> Vec<u8> {

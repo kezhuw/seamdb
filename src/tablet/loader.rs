@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use derivative::Derivative;
 use tokio::select;
 
-use super::memory::MemoryTabletStore;
-use super::types::{BatchResult, MessageId, TabletStore, TabletWatermark, Temporal};
+use super::store::{BatchResult, TabletStore};
+use super::types::{MessageId, TabletWatermark, Temporal};
 use crate::clock::Timestamp;
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogManager, LogOffset, LogPosition};
 use crate::protos::{
@@ -33,8 +33,10 @@ use crate::protos::{
     DataResponse,
     GetResponse,
     ManifestMessage,
+    ShardId,
     TabletDeployment,
-    TabletDepot,
+    TabletDescription,
+    TabletId,
     TabletManifest,
 };
 
@@ -334,13 +336,13 @@ impl<T: LogMessage> MessageProducer<T> {
 
 pub struct FollowingTabletStore {
     pub cursor: MessageId,
-    pub store: Box<dyn TabletStore>,
+    pub store: TabletStore,
     pub consumer: MessageConsumer<DataMessage>,
 }
 
 pub struct LeadingTabletStore {
     pub cursor: MessageId,
-    pub store: Box<dyn TabletStore>,
+    pub store: TabletStore,
     pub producer: MessageProducer<DataMessage>,
 }
 
@@ -399,6 +401,17 @@ pub struct LeadingTablet {
 }
 
 impl LeadingTablet {
+    pub fn id(&self) -> TabletId {
+        self.manifest.manifest.tablet.id.into()
+    }
+
+    pub fn deployment_shard_id(&self) -> Option<ShardId> {
+        if self.manifest.manifest.tablet.id == TabletId::ROOT.into_raw() {
+            return Some(ShardId::DEPLOYMENT);
+        }
+        None
+    }
+
     pub fn new_data_message(&mut self) -> DataMessage {
         DataMessage {
             closed_timestamp: Some(self.closed_timestamp()),
@@ -443,7 +456,12 @@ impl LeadingTablet {
         self.manifest.publish().await
     }
 
-    pub fn process_batch(&mut self, temporal: &mut Temporal, writes: Vec<DataRequest>) -> Result<BatchResult> {
+    pub fn process_batch(
+        &mut self,
+        temporal: &mut Temporal,
+        shards: Vec<u64>,
+        writes: Vec<DataRequest>,
+    ) -> Result<BatchResult> {
         let ts = temporal.timestamp();
         let readonly = writes.iter().all(|r| r.is_read());
         if !readonly {
@@ -453,7 +471,7 @@ impl LeadingTablet {
                 bail!("write above leader expiration")
             }
         }
-        self.store.store.batch(temporal, writes)
+        self.store.store.batch(temporal, shards, writes)
     }
 }
 
@@ -491,13 +509,13 @@ impl FollowingTablet {
         }
     }
 
-    fn query(&self, ts: Timestamp, requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
+    fn query(&self, ts: Timestamp, shards: Vec<u64>, requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
         let mut responses = Vec::with_capacity(requests.len());
-        for request in requests {
+        for (i, request) in requests.into_iter().enumerate() {
             let DataRequest::Get(get) = request else {
                 unreachable!();
             };
-            let value = self.store.store.get(&Temporal::from(ts), &get.key)?;
+            let value = self.store.store.get(shards[i].into(), &Temporal::from(ts), &get.key)?;
             let response = GetResponse { value: value.into() };
             responses.push(DataResponse::Get(response));
         }
@@ -507,7 +525,7 @@ impl FollowingTablet {
     pub fn query_batch(&self, deployment: &TabletDeployment, batch: BatchRequest) -> Result<BatchResponse> {
         let mut response = BatchResponse::default();
         if let Some(ts) = self.extract_read_timestamp(&batch) {
-            response.responses = self.query(ts, batch.requests)?;
+            response.responses = self.query(ts, batch.shards, batch.requests)?;
         } else {
             response.deployments.push(deployment.clone());
         }
@@ -602,7 +620,7 @@ impl TabletLoader {
     ) -> Result<LeadingTablet> {
         let uri = uri.try_into()?;
         let manifest = self.fence_load_manifest(epoch, &uri).await?;
-        let mut store = self.fence_load_store(epoch, &manifest.manifest.tablet.depot).await?;
+        let mut store = self.fence_load_store(epoch, &manifest.manifest.tablet).await?;
         store.store.update_watermark(manifest.manifest.watermark);
         Ok(LeadingTablet { manifest, store })
     }
@@ -613,7 +631,7 @@ impl TabletLoader {
     ) -> Result<FollowingTablet> {
         let uri = uri.try_into()?;
         let manifest = self.load_manifest(&uri, None).await?;
-        let mut store = self.load_store(&manifest.manifest.tablet.depot, None).await?;
+        let mut store = self.load_store(&manifest.manifest.tablet, None).await?;
         store.store.update_watermark(manifest.manifest.watermark);
         Ok(FollowingTablet { manifest, store })
     }
@@ -645,7 +663,7 @@ impl TabletLoader {
         assert!(epoch > tablet.store.cursor.epoch);
         let uri = uri.try_into()?;
         let manifest = self.lead_manifest(epoch, &uri, tablet.manifest).await?;
-        let store_uri = manifest.manifest.tablet.depot.log.as_str().try_into()?;
+        let store_uri = manifest.manifest.tablet.data_log.as_str().try_into()?;
         let store = self.lead_store(epoch, &store_uri, tablet.store).await?;
         Ok(LeadingTablet { manifest, store })
     }
@@ -653,7 +671,7 @@ impl TabletLoader {
     async fn read_store(
         &self,
         cursor: &mut MessageId,
-        store: &mut dyn TabletStore,
+        store: &mut TabletStore,
         consumer: &mut dyn LogMessageConsumer<DataMessage>,
         limit: Option<LogPosition>,
     ) -> Result<()> {
@@ -670,11 +688,11 @@ impl TabletLoader {
         Ok(())
     }
 
-    async fn load_store(&self, depot: &TabletDepot, limit: Option<LogPosition>) -> Result<FollowingTabletStore> {
-        if !depot.file.is_empty() || !depot.segments.is_empty() {
-            return Err(anyhow!("do not support file compaction for now"));
+    async fn load_store(&self, tablet: &TabletDescription, limit: Option<LogPosition>) -> Result<FollowingTabletStore> {
+        if tablet.shards.iter().any(|r| !r.segments.is_empty()) {
+            return Err(anyhow!("do not support file compaction and transaction rotation for now"));
         }
-        let uri = depot.log.as_str().try_into()?;
+        let uri = tablet.data_log.as_str().try_into()?;
         let mut consumer: Box<dyn ByteLogSubscriber> = self.log.subscribe_log(&uri, LogOffset::Earliest).await?;
         let limit = match limit {
             None => consumer.latest().await?,
@@ -683,7 +701,7 @@ impl TabletLoader {
         let mut typed_consumer: TypedLogConsumer<DataMessage> = TypedLogConsumer::new(consumer.as_mut());
         let mut subscriber = LimitedLogConsumer::new(&mut typed_consumer, limit.clone());
         let mut cursor = MessageId::default();
-        let mut store: Box<dyn TabletStore> = Box::<MemoryTabletStore>::default();
+        let mut store = TabletStore::new(tablet.id.into(), &tablet.shards);
         while let Some(message) = subscriber.read().await? {
             if cursor.advance(MessageId::new(message.epoch, message.sequence))? {
                 store.apply(message)?;
@@ -707,7 +725,7 @@ impl TabletLoader {
     ) -> Result<LeadingTabletStore> {
         let mut producer = BufMessageProducer::new(self.log.produce_log(uri).await?);
         let position = producer.send_message(&DataMessage::new_fenced(epoch)).await?;
-        self.read_store(&mut store.cursor, store.store.as_mut(), &mut store.consumer, Some(position)).await?;
+        self.read_store(&mut store.cursor, &mut store.store, &mut store.consumer, Some(position)).await?;
         Ok(LeadingTabletStore {
             cursor: store.cursor,
             store: store.store,
@@ -715,11 +733,11 @@ impl TabletLoader {
         })
     }
 
-    async fn fence_load_store(&self, epoch: u64, depot: &TabletDepot) -> Result<LeadingTabletStore> {
-        let uri = depot.log.as_str().try_into()?;
+    async fn fence_load_store(&self, epoch: u64, tablet: &TabletDescription) -> Result<LeadingTabletStore> {
+        let uri = tablet.data_log.as_str().try_into()?;
         let mut producer = BufMessageProducer::new(self.log.produce_log(&uri).await?);
         let position = producer.send_message(&DataMessage::new_fenced(epoch)).await?;
-        let store = self.load_store(depot, Some(position)).await?;
+        let store = self.load_store(tablet, Some(position)).await?;
         if store.cursor != MessageId::new_fenced(epoch) {
             bail!("fence@{} load store stop at {:?}", epoch, store.cursor)
         }

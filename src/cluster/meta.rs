@@ -46,22 +46,25 @@ use crate::keys;
 use crate::log::OwnedLogAddress;
 use crate::protos::{
     self,
-    ClusterMeta,
+    ClusterDescriptor,
     DataMessage,
     DataOperation,
+    KeyRange,
     ManifestMessage,
+    ShardDescription,
+    ShardDescriptor,
+    ShardId,
+    ShardMergeBounds,
     TabletDeployment,
-    TabletDepot,
     TabletDescription,
     TabletDescriptor,
+    TabletId,
     TabletManifest,
-    TabletMergeBounds,
-    TabletRange,
     Temporal,
     Timestamp,
 };
 use crate::tablet::TabletDeployer;
-use crate::utils::{self, DropOwner, WatchConsumer as _};
+use crate::utils::{self, DropOwner, DropWatcher, WatchConsumer as _};
 
 type Revision = i64;
 
@@ -69,17 +72,22 @@ const CLUSTER_BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const BOOTSTRAP_LOGS_NUMBER: usize = 8;
 
-fn parse_meta(name: &str, response: WatchResponse) -> Result<ClusterMeta> {
+const RANGE_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x010000);
+const SYSTEM_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x030000);
+const DATA_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x030000);
+
+const RANGE_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x010000);
+const SYSTEM_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x010000);
+const DATA_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x020000);
+
+fn parse_deployment(response: WatchResponse) -> Result<TabletDeployment> {
     let event = response.events().last().ok_or_else(|| anyhow!("cluster meta watch receives no event"))?;
     match event.event_type() {
         EventType::Delete => bail!("cluster meta got deleted"),
         EventType::Put => {
             let kv = event.kv().ok_or_else(|| anyhow!("cluster meta watch receives no kv"))?;
-            let meta = ClusterMeta::decode(kv.value())?;
-            if meta.name != name {
-                bail!("cluster meta name mismatch: expect {}, got {}", name, meta.name)
-            }
-            Ok(meta)
+            let deployment = TabletDeployment::decode(kv.value())?;
+            Ok(deployment)
         },
     }
 }
@@ -104,7 +112,6 @@ struct EtcdClusterMetaHandle {
 
 #[async_trait]
 impl TabletDeployer for EtcdClusterMetaDaemon {
-    type Deployment = ClusterMeta;
     type Version = Revision;
 
     fn nodes(&self) -> &Arc<dyn NodeRegistry> {
@@ -119,9 +126,9 @@ impl TabletDeployer for EtcdClusterMetaDaemon {
         &self,
         key: &[u8],
         version: Self::Version,
-        deployment: &Self::Deployment,
+        deployment: &TabletDeployment,
     ) -> Result<Self::Version> {
-        self.put_meta(key, deployment, Some(version)).await
+        ClusterMetaClient::put_deployment(self, key, deployment, Some(version)).await
     }
 }
 
@@ -137,18 +144,17 @@ impl EtcdClusterMetaDaemon {
         (names, uris)
     }
 
-    async fn create_meta(&mut self, lock: &[u8]) -> Result<(Revision, Vec<String>, ClusterMeta)> {
+    async fn create_descriptor(&mut self, lock: &[u8]) -> Result<(Revision, Vec<String>, ClusterDescriptor)> {
         let (log_names, log_uris) = self.random_bootstrap_logs();
-        let meta = ClusterMeta {
+        let meta = ClusterDescriptor {
             name: self.client.name.to_string(),
-            epoch: 0,
             generation: 0,
-            servers: Default::default(),
-            log: Default::default(),
+            manifest_log: Default::default(),
+            timestamp: Default::default(),
             bootstrap_logs: log_uris,
             obsoleted_logs: Default::default(),
         };
-        let revision = self.put_meta(lock, &meta, None).await?;
+        let revision = self.put_descriptor(lock, &meta, None).await?;
         Ok((revision, log_names, meta))
     }
 
@@ -176,139 +182,175 @@ impl EtcdClusterMetaDaemon {
         &mut self,
         log_name: String,
         data_log_uri: OwnedLogAddress,
-        id: u64,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<OwnedLogAddress> {
+        tablet_id: TabletId,
+        mut shards: Vec<(ShardId, KeyRange)>,
+    ) -> Result<(OwnedLogAddress, Vec<ShardDescriptor>)> {
+        shards.sort_by(|a, b| a.1.start.cmp(&b.1.start));
+        let shards: Vec<_> = shards
+            .into_iter()
+            .map(|(id, range)| ShardDescriptor { id: id.into(), generation: 0, range, tablet_id: tablet_id.into() })
+            .collect();
         let tablet = TabletDescription {
-            id,
+            id: tablet_id.into(),
             generation: 0,
-            depot: TabletDepot {
-                segments: Default::default(),
-                log: data_log_uri.into(),
-                file: Default::default(),
-                range: TabletRange { start: start.to_owned(), end: end.to_owned() },
-            },
+            data_log: data_log_uri.into(),
+            shards: shards
+                .iter()
+                .map(|shard| ShardDescription {
+                    id: shard.id,
+                    generation: 0,
+                    range: shard.range.clone(),
+                    segments: vec![],
+                    merge_bounds: ShardMergeBounds::None,
+                })
+                .collect(),
         };
         let manifest = TabletManifest { tablet, ..TabletManifest::default() };
         let message = ManifestMessage { epoch: 0, sequence: 1, manifest: Some(manifest) };
         let log_address = self.env.log().create_log(&log_name, ByteSize::mib(10)).await?;
         let mut log_producer = self.env.log().produce_log(&log_address).await?;
         log_producer.send(&message.encode_to_vec()).await?;
-        Ok(log_address)
+        Ok((log_address, shards))
     }
 
     async fn bootstrap_tablet_manifest(
         &mut self,
         log_name: String,
         data_log_uri: OwnedLogAddress,
-        id: u64,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<TabletDescriptor> {
-        let log_uri = self.bootstrap_tablet_manifest_log(log_name, data_log_uri, id, start, end).await?;
-        let descriptor = TabletDescriptor {
-            id,
-            generation: 0,
-            range: TabletRange { start: start.to_owned(), end: end.to_owned() },
-            log: log_uri.into(),
-            merge_bounds: TabletMergeBounds::None,
-        };
-        Ok(descriptor)
+        id: TabletId,
+        shards: Vec<(ShardId, KeyRange)>,
+    ) -> Result<(TabletDescriptor, Vec<ShardDescriptor>)> {
+        let (log_uri, shards) = self.bootstrap_tablet_manifest_log(log_name, data_log_uri, id, shards).await?;
+        let descriptor = TabletDescriptor { id: id.into(), generation: 0, manifest_log: log_uri.into() };
+        Ok((descriptor, shards))
     }
 
     async fn bootstrap_system_tablet(
         &mut self,
         log_names: &mut Vec<String>,
         ts: Timestamp,
-    ) -> Result<TabletDescriptor> {
+    ) -> Result<(TabletDescriptor, Vec<ShardDescriptor>)> {
         let key = keys::system_key("tablet-id-counter".as_bytes());
         let value = protos::Value::Int(4);
         let write = protos::Write { key, value: Some(value), sequence: 0 };
         let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), [write], ts).await?;
-        self.bootstrap_tablet_manifest(
-            log_names.pop().unwrap(),
-            data_log_uri,
-            3,
-            keys::SYSTEM_KEY_PREFIX,
-            keys::USER_KEY_PREFIX,
-        )
+        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, SYSTEM_TABLET_INITIAL_ID, vec![(
+            SYSTEM_SHARD_INITAL_ID,
+            KeyRange::new(keys::SYSTEM_KEY_PREFIX, keys::USER_KEY_PREFIX),
+        )])
         .await
     }
 
-    async fn bootstrap_user_tablet(&mut self, log_names: &mut Vec<String>, ts: Timestamp) -> Result<TabletDescriptor> {
+    async fn bootstrap_user_tablet(
+        &mut self,
+        log_names: &mut Vec<String>,
+        ts: Timestamp,
+    ) -> Result<(TabletDescriptor, Vec<ShardDescriptor>)> {
         let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), vec![], ts).await?;
-        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, 4, keys::USER_KEY_PREFIX, keys::MAX_KEY)
-            .await
+        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, DATA_TABLET_INITIAL_ID, vec![(
+            DATA_SHARD_INITAL_ID,
+            KeyRange::new(keys::USER_KEY_PREFIX, keys::MAX_KEY),
+        )])
+        .await
     }
 
     async fn bootstrap_range_tablet(
         &mut self,
         log_names: &mut Vec<String>,
-        descriptors: Vec<TabletDescriptor>,
+        descriptors: Vec<ShardDescriptor>,
         ts: Timestamp,
-    ) -> Result<TabletDescriptor> {
+    ) -> Result<(TabletDescriptor, Vec<ShardDescriptor>)> {
         let mut writes = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
             let key = keys::range_key(&descriptor.range.end);
-            let deployment =
-                TabletDeployment { tablet: descriptor, epoch: 0, generation: 0, servers: Default::default() };
-            let value = protos::Value::Bytes(deployment.encode_to_vec());
+            let value = protos::Value::Bytes(descriptor.encode_to_vec());
             let write = protos::Write { key, value: Some(value), sequence: 0 };
             writes.push(write);
         }
-        let key = writes.last().unwrap().key.clone();
+        let mut key = writes.last().unwrap().key.clone();
+        key.push(0);
         let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), writes, ts).await?;
-        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, 2, keys::RANGE_KEY_PREFIX, &key).await
+        self.bootstrap_tablet_manifest(log_names.pop().unwrap(), data_log_uri, RANGE_TABLET_INITIAL_ID, vec![(
+            RANGE_SHARD_INITAL_ID,
+            KeyRange::new(keys::RANGE_KEY_PREFIX, key),
+        )])
+        .await
     }
 
     async fn bootstrap_root_tablet(
         &mut self,
         log_names: &mut Vec<String>,
-        range_tablet_descriptor: TabletDescriptor,
+        tablets: Vec<TabletDescriptor>,
+        shards: Vec<ShardDescriptor>,
         ts: Timestamp,
     ) -> Result<OwnedLogAddress> {
-        let key = keys::root_key(&range_tablet_descriptor.range.end);
-        let deployment =
-            TabletDeployment { tablet: range_tablet_descriptor, epoch: 0, generation: 0, servers: Default::default() };
-        let value = protos::Value::Bytes(deployment.encode_to_vec());
-        let write = protos::Write { key: key.clone(), value: Some(value), sequence: 0 };
-        let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), [write], ts).await?;
-        self.bootstrap_tablet_manifest_log(log_names.pop().unwrap(), data_log_uri, 1, keys::ROOT_KEY_PREFIX, &key).await
+        let mut writes = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let key = keys::root_key(&shard.range.end);
+            let value = protos::Value::Bytes(shard.encode_to_vec());
+            let write = protos::Write { key, value: Some(value), sequence: 0 };
+            writes.push(write);
+        }
+        let mut key = writes.last().unwrap().key.clone();
+        key.push(0);
+        for tablet in tablets.iter() {
+            let key = keys::deployment_key(tablet.id.into());
+            let deployment = TabletDeployment { id: tablet.id, ..Default::default() };
+            let value = protos::Value::Bytes(deployment.encode_to_vec());
+            let write = protos::Write { key, value: Some(value), sequence: 0 };
+            writes.push(write);
+        }
+        for tablet in tablets {
+            let key = keys::descriptor_key(tablet.id.into());
+            let value = protos::Value::Bytes(tablet.encode_to_vec());
+            let write = protos::Write { key, value: Some(value), sequence: 0 };
+            writes.push(write);
+        }
+        let data_log_uri = self.bootstrap_tablet_data(log_names.pop().unwrap(), writes, ts).await?;
+        let (log_address, _) = self
+            .bootstrap_tablet_manifest_log(log_names.pop().unwrap(), data_log_uri, TabletId::ROOT, vec![
+                (ShardId::ROOT, KeyRange::new(keys::ROOT_KEY_PREFIX, key)),
+                (ShardId::DESCRIPTOR, keys::descriptor_range()),
+                (ShardId::DEPLOYMENT, keys::deployment_range()),
+            ])
+            .await?;
+        Ok(log_address)
     }
 
-    async fn bootstrap_meta(
+    async fn bootstrap_descriptor(
         &mut self,
         lock: &[u8],
         revision: Revision,
         mut log_names: Vec<String>,
-        mut meta: ClusterMeta,
-    ) -> Result<(Revision, ClusterMeta)> {
+        mut descriptor: ClusterDescriptor,
+    ) -> Result<(Revision, ClusterDescriptor)> {
         let now = self.env.clock().now();
-        let system_tablet_descriptor = self.bootstrap_system_tablet(&mut log_names, now).await?;
-        let user_tablet_descriptor = self.bootstrap_user_tablet(&mut log_names, now).await?;
-        let range_tablet_descriptor = self
-            .bootstrap_range_tablet(&mut log_names, vec![system_tablet_descriptor, user_tablet_descriptor], now)
+        let (system_tablet, system_shards) = self.bootstrap_system_tablet(&mut log_names, now).await?;
+        let (user_tablet, user_shards) = self.bootstrap_user_tablet(&mut log_names, now).await?;
+        let (range_tablet, range_shards) =
+            self.bootstrap_range_tablet(&mut log_names, [system_shards, user_shards].concat(), now).await?;
+        let root_tablet_log_uri = self
+            .bootstrap_root_tablet(&mut log_names, vec![range_tablet, system_tablet, user_tablet], range_shards, now)
             .await?;
-        let root_tablet_log_uri = self.bootstrap_root_tablet(&mut log_names, range_tablet_descriptor, now).await?;
-        meta.generation += 1;
-        meta.log = root_tablet_log_uri.into();
-        meta.bootstrap_logs.clear();
-        let revision = self.put_meta(lock, &meta, Some(revision)).await?;
-        Ok((revision, meta))
+        descriptor.timestamp = self.env.clock().now();
+        descriptor.generation += 1;
+        descriptor.manifest_log = root_tablet_log_uri.into();
+        descriptor.bootstrap_logs.clear();
+        let revision = self.put_descriptor(lock, &descriptor, Some(revision)).await?;
+        Ok((revision, descriptor))
     }
 
-    async fn init_meta(&mut self, lock: &[u8]) -> Result<(Revision, ClusterMeta)> {
-        let (revision, log_names, meta) = self.create_meta(lock).await?;
-        self.bootstrap_meta(lock, revision, log_names, meta).await
+    async fn init_descriptor(&mut self, lock: &[u8]) -> Result<(Revision, ClusterDescriptor)> {
+        let (revision, log_names, meta) = self.create_descriptor(lock).await?;
+        self.bootstrap_descriptor(lock, revision, log_names, meta).await
     }
 
-    async fn restore_meta(
+    async fn restore_descriptor(
         &mut self,
         lock: &[u8],
         mut revision: i64,
-        mut meta: ClusterMeta,
-    ) -> Result<(Revision, ClusterMeta)> {
+        mut meta: ClusterDescriptor,
+    ) -> Result<(Revision, ClusterDescriptor)> {
         if meta.name != self.client.name {
             return Err(anyhow!("unexpected cluster name: expect {}, got {}", self.client.name, meta.name));
         }
@@ -316,8 +358,8 @@ impl EtcdClusterMetaDaemon {
             meta.obsoleted_logs.append(&mut meta.bootstrap_logs);
             let (log_names, log_uris) = self.random_bootstrap_logs();
             meta.bootstrap_logs = log_uris;
-            revision = self.put_meta(lock, &meta, Some(revision)).await?;
-            self.bootstrap_meta(lock, revision, log_names, meta).await
+            revision = self.put_descriptor(lock, &meta, Some(revision)).await?;
+            self.bootstrap_descriptor(lock, revision, log_names, meta).await
         } else {
             Ok((revision, meta))
         }
@@ -326,11 +368,15 @@ impl EtcdClusterMetaDaemon {
     async fn serve(&mut self) -> Result<()> {
         let lease = EtcdHelper::grant_lease(&mut self.client.etcd, None).await?;
         let lock = self.lock(lease.id()).await?;
-        let (revision, meta) = match self.get_meta().await? {
-            (_, None) => self.init_meta(&lock).await?,
-            (revision, Some(meta)) => self.restore_meta(&lock, revision, meta).await?,
+        match self.get_descriptor().await? {
+            (_, None) => self.init_descriptor(&lock).await?,
+            (revision, Some(meta)) => self.restore_descriptor(&lock, revision, meta).await?,
         };
-        self.serve_deployment(lock, revision, meta).await
+        let (revision, deployment) = match self.get_deployment().await? {
+            (_, None) => (0, TabletDeployment { id: TabletId::ROOT.into(), ..Default::default() }),
+            (revision, Some(deployment)) => (revision, deployment),
+        };
+        self.serve_deployment(lock, revision, deployment).await
     }
 
     pub async fn start(
@@ -363,8 +409,12 @@ trait ClusterMetaClient: Send + Sync + 'static {
 
     fn etcd_mut(&mut self) -> &mut Client;
 
-    fn meta_key(&self) -> String {
-        format!("{}/meta/data", self.root())
+    fn descriptor_key(&self) -> String {
+        format!("{}/meta/descriptor", self.root())
+    }
+
+    fn deployment_key(&self) -> String {
+        format!("{}/meta/deployment", self.root())
     }
 
     fn lock_key(&self) -> String {
@@ -376,16 +426,32 @@ trait ClusterMetaClient: Send + Sync + 'static {
         EtcdHelper::lock(self.etcd_mut(), path, lease_id).await
     }
 
-    async fn get_meta(&mut self) -> Result<(Revision, Option<ClusterMeta>)> {
-        let path = self.meta_key();
-        let mut response = self.etcd_mut().get(path, None).await?.0;
+    async fn get_descriptor(&mut self) -> Result<(Revision, Option<ClusterDescriptor>)> {
+        let (revision, data) = self.get_key(self.descriptor_key()).await?;
+        let Some(data) = data else {
+            return Ok((revision, None));
+        };
+        let descriptor = ClusterDescriptor::decode(data.as_slice())?;
+        if descriptor.name != self.name() {
+            bail!("cluster descriptor name mismatch: expect {}, got {}", self.name(), descriptor.name)
+        }
+        Ok((revision, Some(descriptor)))
+    }
+
+    async fn get_deployment(&mut self) -> Result<(Revision, Option<TabletDeployment>)> {
+        let (revision, data) = self.get_key(self.deployment_key()).await?;
+        let Some(data) = data else {
+            return Ok((revision, None));
+        };
+        let deployment = TabletDeployment::decode(data.as_slice())?;
+        Ok((revision, Some(deployment)))
+    }
+
+    async fn get_key(&mut self, key: String) -> Result<(Revision, Option<Vec<u8>>)> {
+        let mut response = self.etcd_mut().get(key, None).await?.0;
         if let Some(kv) = response.kvs.pop() {
             let revision = kv.mod_revision;
-            let meta = ClusterMeta::decode(kv.value.as_slice())?;
-            if meta.name != self.name() {
-                bail!("cluster meta name mismatch: expect {}, got {}", self.name(), meta.name)
-            }
-            Ok((revision, Some(meta)))
+            Ok((revision, Some(kv.value)))
         } else if let Some(header) = response.header {
             Ok((header.revision, None))
         } else {
@@ -393,47 +459,86 @@ trait ClusterMetaClient: Send + Sync + 'static {
         }
     }
 
-    async fn put_meta(&self, lock: &[u8], meta: &ClusterMeta, revision: Option<Revision>) -> Result<Revision> {
-        let key = self.meta_key().into_bytes();
-        let revision_cmp = if let Some(revision) = revision {
-            Compare::mod_revision(key.clone(), CompareOp::Equal, revision)
-        } else {
-            Compare::create_revision(key.clone(), CompareOp::Equal, 0)
+    async fn put_key(
+        &self,
+        lock: &[u8],
+        key: Vec<u8>,
+        data: Vec<u8>,
+        revision: Option<Revision>,
+    ) -> Result<Option<Revision>> {
+        let revision_cmp = match revision {
+            None | Some(0) => Compare::create_revision(key.clone(), CompareOp::Equal, 0),
+            Some(revision) => Compare::mod_revision(key.clone(), CompareOp::Equal, revision),
         };
         let lock_cmp = Compare::create_revision(lock, CompareOp::NotEqual, 0);
-        let put = TxnOp::put(key, meta.encode_to_vec(), None);
+        let put = TxnOp::put(key, data, None);
         let txn = Txn::new().when([revision_cmp, lock_cmp]).and_then([put]);
         let response = self.etcd().kv_client().txn(txn).await?;
         if !response.succeeded() {
-            return Err(anyhow!("cluster meta changed or lock expired"));
+            Ok(None)
+        } else {
+            Ok(Some(response.header().unwrap().revision()))
         }
-        Ok(response.header().unwrap().revision())
     }
 
-    async fn poll_meta(&self, stream: &mut WatchStream) -> Result<ClusterMeta> {
-        match stream.message().await? {
-            None => bail!("cluster meta stream got closed"),
-            Some(message) => parse_meta(self.name(), message),
+    async fn put_deployment(
+        &self,
+        lock: &[u8],
+        deployment: &TabletDeployment,
+        revision: Option<Revision>,
+    ) -> Result<Revision> {
+        let key = self.deployment_key().into_bytes();
+        match self.put_key(lock, key, deployment.encode_to_vec(), revision).await? {
+            None => Err(anyhow!("cluster deployment changed or lock expired")),
+            Some(revision) => Ok(revision),
         }
+    }
+
+    async fn put_descriptor(
+        &self,
+        lock: &[u8],
+        descriptor: &ClusterDescriptor,
+        revision: Option<Revision>,
+    ) -> Result<Revision> {
+        let key = self.descriptor_key().into_bytes();
+        match self.put_key(lock, key, descriptor.encode_to_vec(), revision).await? {
+            None => Err(anyhow!("cluster descriptor changed or lock expired")),
+            Some(revision) => Ok(revision),
+        }
+    }
+
+    async fn poll_deployment(&self, stream: &mut WatchStream) -> Result<TabletDeployment> {
+        match stream.message().await? {
+            None => bail!("cluster deployment stream got closed"),
+            Some(message) => parse_deployment(message),
+        }
+    }
+
+    async fn watch_descriptor(&mut self, timeout: Option<Duration>) -> Result<ClusterDescriptorWatcher> {
+        let (revision, descriptor) = self.get_descriptor().await?;
+        let key = self.descriptor_key();
+        let options = WatchOptions::new().with_start_revision(revision + 1);
+        let (watcher, stream) = self.etcd_mut().watch(key, Some(options)).await?;
+        ClusterDescriptorWatcher::watch(descriptor, watcher, stream, timeout).await
     }
 
     async fn watch_deployment(&mut self, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
-        let (revision, meta) = self.get_meta().await?;
-        let key = self.meta_key();
+        let (revision, deployment) = self.get_deployment().await?;
+        let key = self.deployment_key();
         let options = WatchOptions::new().with_start_revision(revision + 1);
         let (watcher, mut stream) = self.etcd_mut().watch(key, Some(options)).await?;
-        let meta = if let Some(meta) = meta {
-            meta
+        let deployment = if let Some(deployment) = deployment {
+            deployment
         } else {
             select! {
-                _ = tokio::time::sleep(timeout.unwrap_or(CLUSTER_BOOT_TIMEOUT)) => bail!("cluster meta not found"),
-                r = self.poll_meta(&mut stream) => match r {
+                _ = tokio::time::sleep(timeout.unwrap_or(CLUSTER_BOOT_TIMEOUT)) => bail!("cluster deployment not found"),
+                r = self.poll_deployment(&mut stream) => match r {
                     Err(err) => return Err(err),
-                    Ok(meta) => meta,
+                    Ok(deployment) => deployment,
                 },
             }
         };
-        Ok(ClusterDeploymentWatcher::watch(watcher, stream, meta).await)
+        Ok(ClusterDeploymentWatcher::watch(watcher, stream, deployment).await)
     }
 }
 
@@ -524,6 +629,80 @@ impl ClusterDeploymentMonitor {
 }
 
 #[derive(Clone)]
+pub struct ClusterDescriptorWatcher {
+    _dropper: Arc<DropOwner>,
+    descriptor: Arc<ArcSwapOption<ClusterDescriptor>>,
+}
+
+impl ClusterDescriptorWatcher {
+    async fn watch(
+        descriptor: Option<ClusterDescriptor>,
+        watcher: Watcher,
+        mut stream: WatchStream,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let descriptor = match descriptor {
+            Some(descriptor) => descriptor,
+            None => select! {
+                _ = tokio::time::sleep(timeout.unwrap_or(CLUSTER_BOOT_TIMEOUT)) => bail!("cluster descriptor not found"),
+                r = Self::poll_descriptor(&mut stream) => match r {
+                    Err(err) => return Err(err),
+                    Ok(descriptor) => descriptor,
+                }
+            },
+        };
+        let descriptor = Arc::new(ArcSwapOption::from_pointee(Some(descriptor)));
+        let (drop_owner, drop_watcher) = utils::drop_watcher();
+        tokio::spawn(Self::poll(watcher, stream, drop_watcher, descriptor.clone()));
+        Ok(Self { _dropper: drop_owner.into(), descriptor })
+    }
+
+    async fn poll(
+        _watcher: Watcher,
+        mut stream: WatchStream,
+        mut drop_watcher: DropWatcher,
+        descriptor: Arc<ArcSwapOption<ClusterDescriptor>>,
+    ) -> Result<()> {
+        loop {
+            select! {
+                _ = drop_watcher.dropped() => break,
+                Ok(message) = stream.message() => {
+                    let Some(response) = message else {
+                        break;
+                    };
+                    let new = Self::parse_descriptor(response)?;
+                    descriptor.swap(Some(Arc::new(new)));
+                },
+            }
+        }
+        Ok(())
+    }
+
+    async fn poll_descriptor(stream: &mut WatchStream) -> Result<ClusterDescriptor> {
+        match stream.message().await? {
+            None => bail!("cluster descriptor stream got closed"),
+            Some(message) => Self::parse_descriptor(message),
+        }
+    }
+
+    fn parse_descriptor(response: WatchResponse) -> Result<ClusterDescriptor> {
+        let event = response.events().last().ok_or_else(|| anyhow!("cluster descriptor watch receives no event"))?;
+        match event.event_type() {
+            EventType::Delete => bail!("cluster descriptor got deleted"),
+            EventType::Put => {
+                let kv = event.kv().ok_or_else(|| anyhow!("cluster descriptor watch receives no kv"))?;
+                let descriptor = ClusterDescriptor::decode(kv.value())?;
+                Ok(descriptor)
+            },
+        }
+    }
+
+    pub fn latest(&self) -> Option<Arc<ClusterDescriptor>> {
+        self.descriptor.load_full()
+    }
+}
+
+#[derive(Clone)]
 pub struct ClusterDeploymentWatcher {
     monitor: ClusterDeploymentMonitor,
     receiver: watch::Receiver<Arc<TabletDeployment>>,
@@ -531,11 +710,11 @@ pub struct ClusterDeploymentWatcher {
 }
 
 impl ClusterDeploymentWatcher {
-    pub async fn new(name: &str, uri: ServiceUri<'_>, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
+    pub async fn new(uri: ServiceUri<'_>, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
         let (resource_id, params) = uri.parts();
         let etcd = EtcdHelper::connect(resource_id.endpoint(), params).await?;
         let mut client =
-            EtcdClusterClient { name: name.to_compact_string(), root: resource_id.path().to_compact_string(), etcd };
+            EtcdClusterClient { name: Default::default(), root: resource_id.path().to_compact_string(), etcd };
         client.watch_deployment(timeout).await
     }
 
@@ -590,7 +769,6 @@ impl ClusterDeploymentWatcher {
     }
 
     async fn poll(
-        name: String,
         _watcher: Watcher,
         mut stream: WatchStream,
         sender: watch::Sender<Arc<TabletDeployment>>,
@@ -602,8 +780,8 @@ impl ClusterDeploymentWatcher {
                     let Some(response) = message else {
                         break;
                     };
-                    let meta = parse_meta(&name, response)?;
-                    if sender.send(Arc::new(meta.into())).is_err() {
+                    let meta = parse_deployment(response)?;
+                    if sender.send(Arc::new(meta)).is_err() {
                         break;
                     }
                 },
@@ -612,11 +790,10 @@ impl ClusterDeploymentWatcher {
         Ok(())
     }
 
-    async fn watch(watcher: Watcher, stream: WatchStream, mut meta: ClusterMeta) -> Self {
-        let name = std::mem::take(&mut meta.name);
-        let deployment = Arc::new(TabletDeployment::from(meta));
+    async fn watch(watcher: Watcher, stream: WatchStream, deployment: TabletDeployment) -> Self {
+        let deployment = Arc::new(deployment);
         let (sender, receiver) = watch::channel(deployment.clone());
-        tokio::spawn(async move { Self::poll(name, watcher, stream, sender).await });
+        tokio::spawn(async move { Self::poll(watcher, stream, sender).await });
         let monitor = ClusterDeploymentMonitor::new(receiver.clone(), deployment.clone()).await;
         ClusterDeploymentWatcher { monitor, receiver, deployment }
     }
@@ -624,6 +801,8 @@ impl ClusterDeploymentWatcher {
 
 #[async_trait]
 pub trait ClusterMetaHandle: Send {
+    async fn watch_descriptor(&mut self, timeout: Option<Duration>) -> Result<ClusterDescriptorWatcher>;
+
     async fn watch_deployment(&mut self, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher>;
 
     async fn join(self) -> Result<()>;
@@ -631,9 +810,12 @@ pub trait ClusterMetaHandle: Send {
 
 #[async_trait]
 impl ClusterMetaHandle for EtcdClusterMetaHandle {
+    async fn watch_descriptor(&mut self, timeout: Option<Duration>) -> Result<ClusterDescriptorWatcher> {
+        ClusterMetaClient::watch_descriptor(self, timeout).await
+    }
+
     async fn watch_deployment(&mut self, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
-        let client = self as &mut dyn ClusterMetaClient;
-        client.watch_deployment(timeout).await
+        ClusterMetaClient::watch_deployment(self, timeout).await
     }
 
     async fn join(self) -> Result<()> {
@@ -659,22 +841,18 @@ mod tests {
     use crate::cluster::etcd::EtcdHelper;
     use crate::cluster::{EtcdNodeRegistry, *};
     use crate::endpoint::{Endpoint, ServiceUri};
-    use crate::keys;
     use crate::log::tests::*;
     use crate::log::LogRegistry;
     use crate::protos::{
         BatchRequest,
         BatchResponse,
-        HeartbeatRequest,
-        HeartbeatResponse,
         LocateRequest,
         LocateResponse,
         TabletDeployRequest,
         TabletDeployResponse,
         TabletDeployment,
-        TabletListRequest,
-        TabletListResponse,
-        TabletRange,
+        TabletHeartbeatRequest,
+        TabletHeartbeatResponse,
         TabletService,
         TabletServiceServer,
     };
@@ -682,75 +860,59 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     #[tracing_test::traced_test]
-    #[should_panic(expected = "cluster meta not found")]
-    async fn test_cluster_meta_watcher_not_found() {
+    #[should_panic(expected = "cluster deployment not found")]
+    async fn test_cluster_deployment_watcher_not_found() {
         let etcd = etcd_container();
-        ClusterDeploymentWatcher::new("cluster1", etcd.uri(), Some(Duration::from_secs(2))).await.unwrap();
+        ClusterDeploymentWatcher::new(etcd.uri(), Some(Duration::from_secs(2))).await.unwrap();
     }
 
     #[test_log::test(tokio::test)]
     #[tracing_test::traced_test]
-    #[should_panic(expected = "cluster meta name mismatch")]
-    async fn test_cluster_meta_watcher_mismatch_name() {
+    async fn test_cluster_deployment_watcher_update() {
         let etcd = etcd_container();
         let etcd_uri = etcd.uri();
         let mut client = EtcdHelper::connect(etcd_uri.endpoint(), etcd_uri.params()).await.unwrap();
-        let meta = ClusterMeta { name: "cluster2".to_string(), ..ClusterMeta::default() };
-        client.put(r"/meta/data", meta.encode_to_vec(), None).await.unwrap();
+        let mut deployment = TabletDeployment::default();
+        client.put(r"/meta/deployment", deployment.encode_to_vec(), None).await.unwrap();
 
-        ClusterDeploymentWatcher::new("cluster1", etcd_uri, Some(Duration::from_secs(2))).await.unwrap();
-    }
-
-    #[test_log::test(tokio::test)]
-    #[tracing_test::traced_test]
-    async fn test_cluster_meta_watcher_update() {
-        let etcd = etcd_container();
-        let etcd_uri = etcd.uri();
-        let mut client = EtcdHelper::connect(etcd_uri.endpoint(), etcd_uri.params()).await.unwrap();
-        let mut meta = ClusterMeta { name: "cluster1".to_string(), ..ClusterMeta::default() };
-        client.put(r"/meta/data", meta.encode_to_vec(), None).await.unwrap();
-
-        let mut watcher =
-            ClusterDeploymentWatcher::new("cluster1", etcd_uri, Some(Duration::from_secs(2))).await.unwrap();
-        assert_that!(watcher.latest()).is_equal_to(&TabletDeployment::from(meta.clone()));
+        let mut watcher = ClusterDeploymentWatcher::new(etcd_uri, Some(Duration::from_secs(2))).await.unwrap();
+        assert_that!(watcher.latest()).is_equal_to(&deployment);
 
         for _ in 0..5 {
-            meta = ClusterMeta { epoch: meta.epoch + 1, generation: meta.generation + 1, ..meta };
-            client.put(r"/meta/data", meta.encode_to_vec(), None).await.unwrap();
+            deployment =
+                TabletDeployment { epoch: deployment.epoch + 1, generation: deployment.generation + 1, ..deployment };
+            client.put(r"/meta/deployment", deployment.encode_to_vec(), None).await.unwrap();
             let deployment = watcher.changed().await.unwrap().clone();
-            assert_that!(deployment).is_equal_to(&TabletDeployment::from(meta.clone()));
+            assert_that!(deployment).is_equal_to(&deployment);
             assert_that!(watcher.latest()).is_equal_to(&deployment);
         }
     }
 
     #[test_log::test(tokio::test)]
     #[tracing_test::traced_test]
-    async fn test_cluster_meta_watcher_deleted() {
+    async fn test_cluster_deployment_watcher_deleted() {
         let etcd = etcd_container();
         let etcd_uri = etcd.uri();
         let mut client = EtcdHelper::connect(etcd_uri.endpoint(), etcd_uri.params()).await.unwrap();
-        let meta = ClusterMeta { name: "cluster1".to_string(), ..ClusterMeta::default() };
-        client.put(r"/meta/data", meta.encode_to_vec(), None).await.unwrap();
+        let deployment = TabletDeployment::default();
+        client.put(r"/meta/deployment", deployment.encode_to_vec(), None).await.unwrap();
 
-        let mut watcher =
-            ClusterDeploymentWatcher::new("cluster1", etcd_uri, Some(Duration::from_secs(2))).await.unwrap();
+        let mut watcher = ClusterDeploymentWatcher::new(etcd_uri, Some(Duration::from_secs(2))).await.unwrap();
 
-        client.delete(r"/meta/data", None).await.unwrap();
+        client.delete(r"/meta/deployment", None).await.unwrap();
         assert!(watcher.changed().await.is_none());
     }
 
     struct TestTabletServiceInner {
-        list: (watch::Sender<TabletRange>, watch::Receiver<TabletRange>),
-        heartbeat: (watch::Sender<HeartbeatRequest>, watch::Receiver<HeartbeatRequest>),
+        heartbeat: (watch::Sender<TabletHeartbeatRequest>, watch::Receiver<TabletHeartbeatRequest>),
         deployment: (watch::Sender<TabletDeployment>, watch::Receiver<TabletDeployment>),
     }
 
     impl Default for TestTabletServiceInner {
         fn default() -> Self {
-            let list = watch::channel(Default::default());
             let heartbeat = watch::channel(Default::default());
             let deployment = watch::channel(Default::default());
-            Self { list, heartbeat, deployment }
+            Self { heartbeat, deployment }
         }
     }
 
@@ -760,32 +922,17 @@ mod tests {
     }
 
     impl TestTabletService {
-        pub fn subscribe_list(&self) -> watch::Receiver<TabletRange> {
-            self.inner.lock().unwrap().list.1.clone()
-        }
-
         pub fn subscribe_deployment(&self) -> watch::Receiver<TabletDeployment> {
             self.inner.lock().unwrap().deployment.1.clone()
         }
 
-        pub fn subscribe_heartbeat(&self) -> watch::Receiver<HeartbeatRequest> {
+        pub fn subscribe_heartbeat(&self) -> watch::Receiver<TabletHeartbeatRequest> {
             self.inner.lock().unwrap().heartbeat.1.clone()
         }
     }
 
     #[async_trait]
     impl TabletService for TestTabletService {
-        async fn list_tablets(
-            &self,
-            request: tonic::Request<TabletListRequest>,
-        ) -> Result<tonic::Response<TabletListResponse>, tonic::Status> {
-            let mut inner = self.inner.lock().unwrap();
-            inner.list.0.send_replace(request.into_inner().range);
-            let deployment = inner.deployment.0.consume();
-            let response = TabletListResponse { deployments: vec![deployment] };
-            Ok(tonic::Response::new(response))
-        }
-
         async fn deploy_tablet(
             &self,
             request: tonic::Request<TabletDeployRequest>,
@@ -796,12 +943,15 @@ mod tests {
             Ok(tonic::Response::new(response))
         }
 
-        async fn heartbeat(
+        async fn heartbeat_tablet(
             &self,
-            request: tonic::Request<HeartbeatRequest>,
-        ) -> Result<tonic::Response<HeartbeatResponse>, tonic::Status> {
-            self.inner.lock().unwrap().heartbeat.0.send_replace(request.into_inner());
-            Ok(tonic::Response::new(HeartbeatResponse::default()))
+            request: tonic::Request<TabletHeartbeatRequest>,
+        ) -> Result<tonic::Response<TabletHeartbeatResponse>, tonic::Status> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.heartbeat.0.send_replace(request.into_inner());
+            let deployment = inner.deployment.1.consume();
+            let response = TabletHeartbeatResponse { deployment: Some(deployment) };
+            Ok(tonic::Response::new(response))
         }
 
         async fn batch(
@@ -890,7 +1040,8 @@ mod tests {
         let mut heartbeat_receiver = node1.service.subscribe_heartbeat();
 
         heartbeat_receiver.changed().await.unwrap();
-        assert_that!(heartbeat_receiver.borrow_and_update().clone()).is_equal_to(HeartbeatRequest { tablet_id: 1 });
+        assert_that!(heartbeat_receiver.borrow_and_update().clone())
+            .is_equal_to(TabletHeartbeatRequest { tablet_id: 1 });
 
         let node2 = TestNode::start(cluster_uri.clone()).await;
         let cluster_deployment = deployment_watcher.changed().await.unwrap().clone();
@@ -938,20 +1089,7 @@ mod tests {
         let mut cluster_meta_handle2 =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env2).await.unwrap();
 
-        let mut list_receiver = node3.service.subscribe_list();
-        select! {
-            _ = list_receiver.changed() => panic!("expect no deployment list"),
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {},
-        }
-
         drop(cluster_meta_handle);
-
-        list_receiver.changed().await.unwrap();
-        let range = list_receiver.consume();
-        assert_that!(range).is_equal_to(TabletRange {
-            start: keys::ROOT_KEY_PREFIX.to_owned(),
-            end: keys::RANGE_KEY_PREFIX.to_owned(),
-        });
 
         let mut deployment_watcher2 = cluster_meta_handle2.watch_deployment(None).await.unwrap();
         let cluster_deployment2 =
