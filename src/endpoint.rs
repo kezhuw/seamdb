@@ -61,9 +61,7 @@ impl<'a> Endpoint<'a> {
 
     pub fn split_once(self) -> Option<(Endpoint<'a>, Endpoint<'a>)> {
         let address = self.address;
-        let Some((server, remainings)) = address.split_once(',') else {
-            return None;
-        };
+        let (server, remainings) = address.split_once(',')?;
         let scheme = self.scheme;
         Some((Self { scheme, address: server }, Self { scheme, address: remainings }))
     }
@@ -665,9 +663,7 @@ fn parse_params(s: &str) -> Option<OwnedParams> {
             Some((_, "")) => return None,
             Some(pair) => pair,
         };
-        let Some((key, value)) = split_param(param) else {
-            return None;
-        };
+        let (key, value) = split_param(param)?;
         if params.insert(CompactString::new(key), CompactString::new(value)).is_some() {
             return None;
         }
@@ -857,8 +853,8 @@ mod tests {
     }
 
     #[test_case("a://host/%"; "")]
-    #[test_case("a://host/a/";)]
-    #[test_case("a://host/a//b";)]
+    #[test_case("a://host/a/"; "trailing separator")]
+    #[test_case("a://host/a//b"; "double separator")]
     #[should_panic(expected = "invalid path")]
     fn test_path_invalid(uri: &str) {
         ServiceUri::parse(uri).unwrap();

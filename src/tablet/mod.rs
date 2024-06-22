@@ -13,15 +13,19 @@
 // limitations under the License.
 
 mod client;
+mod concurrency;
 mod deployer;
 mod loader;
 mod memory;
 mod node;
+mod provision;
+mod server;
 mod service;
 mod store;
 mod types;
 
 pub use self::client::TabletClient;
+pub use self::concurrency::{LockTable, Request, TxnTable};
 pub use self::deployer::{TabletDeployServant, TabletDeployer};
 pub use self::loader::{
     FollowingTablet,
@@ -34,9 +38,9 @@ pub use self::loader::{
     TabletLoader,
 };
 pub use self::node::TabletNode;
-pub use self::service::TabletServiceImpl;
+pub use self::provision::{ReplicationStage, ReplicationTracker, TimestampedValue};
+pub use self::server::TabletServiceImpl;
 pub use self::store::BatchResult;
-pub use self::types::{ReplicationStage, Temporal, Timestamp, TimestampedValue};
 pub use crate::protos::{
     MessageId,
     TabletDeployment,

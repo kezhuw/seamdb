@@ -14,11 +14,15 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use prost::Message as _;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+use tracing::debug;
 
 use crate::cluster::{ClusterEnv, NodeId};
 use crate::keys;
@@ -30,14 +34,21 @@ use crate::protos::{
     FindResponse,
     GetRequest,
     IncrementRequest,
+    ParticipateTxnRequest,
+    ParticipateTxnResponse,
     PutRequest,
     ShardDescriptor,
     ShardId,
+    ShardRequest,
     TabletDeployment,
     TabletDescriptor,
     TabletId,
     TabletServiceClient,
+    Temporal,
     Timestamp,
+    Transaction,
+    TxnMeta,
+    Uuid,
     Value,
 };
 
@@ -58,6 +69,8 @@ pub enum TabletClientError {
     ClusterNotDeployed,
     #[error("tablet {id} deployment not found")]
     DeploymentNotFound { id: TabletId },
+    #[error("tablet {id} not deployed")]
+    TabletNotDeployed { id: TabletId },
     #[error("node {node} not available")]
     NodeNotAvailable { node: NodeId },
     #[error("node {node} not connectable: {message}")]
@@ -85,9 +98,9 @@ impl From<tonic::Status> for TabletClientError {
 impl From<TabletClientError> for tonic::Status {
     fn from(err: TabletClientError) -> Self {
         match err {
-            TabletClientError::ClusterNotReady | TabletClientError::ClusterNotDeployed => {
-                Status::unavailable(err.to_string())
-            },
+            TabletClientError::ClusterNotReady
+            | TabletClientError::ClusterNotDeployed
+            | TabletClientError::TabletNotDeployed { .. } => Status::unavailable(err.to_string()),
             TabletClientError::DeploymentNotFound { .. }
             | TabletClientError::DataCorruption { .. }
             | TabletClientError::ShardNotFound { .. } => Status::data_loss(err.to_string()),
@@ -142,8 +155,8 @@ impl ShardDeployment {
         self.tablet.id.into()
     }
 
-    pub fn node_id(&self) -> &NodeId {
-        NodeId::new(&self.tablet.servers[0])
+    pub fn node_id(&self) -> Option<&NodeId> {
+        self.tablet.servers.first().map(NodeId::new)
     }
 
     pub fn shard(&self) -> &ShardDescriptor {
@@ -163,6 +176,15 @@ impl TabletClient {
             descriptor: Arc::new(ShardDescriptor::descriptor()),
             deployment: Arc::new(ShardDescriptor::deployment()),
         }
+    }
+
+    pub fn now(&self) -> Timestamp {
+        self.cluster.clock().now()
+    }
+
+    pub fn new_transaction(&self, key: Vec<u8>) -> Transaction {
+        let meta = TxnMeta { id: Uuid::new_random(), key, epoch: 0, start_ts: self.cluster.clock().now(), priority: 0 };
+        Transaction { meta, ..Default::default() }
     }
 
     fn get_cluster_descriptor(&self) -> Result<(Timestamp, TabletDescriptor)> {
@@ -243,7 +265,9 @@ impl TabletClient {
     }
 
     async fn get_shard(&self, deployment: &ShardDeployment, key: impl Into<Vec<u8>>) -> Result<Arc<ShardDescriptor>> {
-        let node = deployment.node_id();
+        let Some(node) = deployment.node_id() else {
+            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
+        };
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
             return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
@@ -254,10 +278,11 @@ impl TabletClient {
         let batch = BatchRequest {
             tablet_id: deployment.tablet_id().into(),
             uncertainty: None,
-            atomic: true,
-            temporal: None,
-            shards: vec![deployment.shard_id().into()],
-            requests: vec![DataRequest::Find(FindRequest { key, sequence: 0 })],
+            temporal: Temporal::default(),
+            requests: vec![ShardRequest {
+                shard_id: deployment.shard_id().into(),
+                request: DataRequest::Find(FindRequest { key, sequence: 0 }),
+            }],
         };
         let response = client.batch(batch).await?.into_inner();
         let find = response
@@ -314,8 +339,26 @@ impl TabletClient {
         self.get_shard_deployment(&shard, shard_key).await
     }
 
+    pub async fn tablet_client(
+        &self,
+        key: &[u8],
+    ) -> Result<(TabletId, TabletServiceClient<tonic::transport::Channel>)> {
+        let deployment = self.locate(key).await?;
+        let Some(node) = deployment.node_id() else {
+            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
+        };
+        let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
+            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
+        };
+        let client =
+            TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
+        Ok((deployment.tablet_id(), client))
+    }
+
     async fn request(&self, deployment: &ShardDeployment, request: DataRequest) -> Result<DataResponse> {
-        let node = deployment.node_id();
+        let Some(node) = deployment.node_id() else {
+            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
+        };
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
             return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
@@ -326,16 +369,14 @@ impl TabletClient {
         let batch = BatchRequest {
             tablet_id,
             uncertainty: None,
-            atomic: true,
-            temporal: None,
-            shards: vec![shard_id],
-            requests: vec![request],
+            temporal: Temporal::default(),
+            requests: vec![ShardRequest { shard_id, request }],
         };
         let response = client.batch(batch).await?.into_inner();
         let response = response
             .into_one()
             .map_err(|r| TabletClientError::unexpected(format!("expect one response, got {:?}", r)))?;
-        Ok(response)
+        Ok(response.response)
     }
 
     async fn relocate_one_request(&self, request: &mut DataRequest) -> Result<ShardDeployment> {
@@ -356,10 +397,11 @@ impl TabletClient {
     async fn request_batch(
         &self,
         deployment: &ShardDeployment,
-        shards: Vec<ShardId>,
-        requests: Vec<DataRequest>,
+        requests: Vec<ShardRequest>,
     ) -> Result<Vec<DataResponse>> {
-        let node = deployment.node_id();
+        let Some(node) = deployment.node_id() else {
+            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
+        };
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
             return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
@@ -369,16 +411,14 @@ impl TabletClient {
         let batch = BatchRequest {
             tablet_id: deployment.tablet.id,
             uncertainty: None,
-            atomic: true,
-            temporal: None,
+            temporal: Temporal::default(),
             requests,
-            shards: unsafe { std::mem::transmute(shards) },
         };
         let response = client.batch(batch).await?.into_inner();
         if response.responses.len() != n {
             return Err(TabletClientError::unexpected(format!("unexpected responses: {:?}", response)));
         }
-        Ok(response.responses)
+        Ok(response.responses.into_iter().map(|response| response.response).collect())
     }
 
     pub async fn batch(&self, mut requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
@@ -394,7 +434,12 @@ impl TabletClient {
             }
             shards.push(deployment.shard_id());
         }
-        let mut responses = self.request_batch(&deployment, shards, requests).await?;
+        let requests = shards
+            .into_iter()
+            .zip(requests.into_iter())
+            .map(|(shard_id, request)| ShardRequest { shard_id: shard_id.into(), request })
+            .collect();
+        let mut responses = self.request_batch(&deployment, requests).await?;
         Self::relocate_user_responses(&mut responses);
         Ok(responses)
     }
@@ -410,13 +455,17 @@ impl TabletClient {
         Ok(response.value.map(|v| (v.timestamp, v.value)))
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
-        let user_key = keys::user_key(key);
-        let deployment = self.locate(&user_key).await?;
-        let get = GetRequest { key: user_key, sequence: 0 };
+    pub async fn get_key(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
+        let key = key.into().into_owned();
+        let deployment = self.locate(&key).await?;
+        let get = GetRequest { key, sequence: 0 };
         let response = self.request(&deployment, DataRequest::Get(get)).await?;
         let response = response.into_get().map_err(|r| anyhow!("expect get response, get {:?}", r))?;
         Ok(response.value.map(|v| (v.timestamp, v.value)))
+    }
+
+    pub async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
+        self.get_key(Cow::Owned(keys::user_key(key))).await
     }
 
     async fn put_internally(
@@ -466,27 +515,74 @@ impl TabletClient {
             },
         }
     }
+
+    pub async fn open_participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        coordinator: bool,
+    ) -> (mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>) {
+        let mut timeout = Duration::from_millis(5);
+        loop {
+            match self.participate_txn(request.clone(), coordinator).await {
+                Err(err) => {
+                    debug!("fail to open participate txn stream: {err:?}");
+                    tokio::time::sleep(timeout).await;
+                    timeout += Duration::from_millis(timeout.as_millis() as u64 / 2);
+                    continue;
+                },
+                Ok(result) => return result,
+            }
+        }
+    }
+
+    pub async fn participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        coordinator: bool,
+    ) -> Result<(mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>)> {
+        let (_tablet_id, mut client) = self.tablet_client(&request.txn.meta.key).await?;
+        let (sender, receiver) = mpsc::channel(128);
+        sender.send(request).await.unwrap();
+        let mut request = tonic::Request::new(ReceiverStream::new(receiver));
+        let metadata = request.metadata_mut();
+        metadata.insert("seamdb-txn-coordinator", coordinator.to_string().parse().unwrap());
+        let responses = client.participate_txn(request).await?.into_inner();
+        Ok((sender, responses))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
     use std::time::Duration;
 
     use assertor::*;
+    use asyncs::select;
     use tokio::net::TcpListener;
 
     use crate::cluster::tests::etcd_container;
     use crate::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
     use crate::endpoint::{Endpoint, Params};
+    use crate::keys;
     use crate::log::{LogManager, MemoryLogFactory};
     use crate::protos::{
+        BatchRequest,
         DataRequest,
         FindRequest,
         GetRequest,
+        HasTxnMeta,
         IncrementRequest,
+        KeySpan,
         PutRequest,
+        RefreshReadRequest,
+        SequenceRange,
+        ShardRequest,
+        Temporal,
         Timestamp,
         TimestampedValue,
+        Transaction,
+        TxnMeta,
+        TxnStatus,
         Value,
     };
     use crate::tablet::{TabletClient, TabletNode};
@@ -512,8 +608,10 @@ mod tests {
         let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
         let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
         let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
-        let client = TabletClient::new(cluster_env);
+
         tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let client = TabletClient::new(cluster_env);
 
         let count = client.increment(b"count", 5).await.unwrap();
         assert_eq!(count, 5);
@@ -594,7 +692,7 @@ mod tests {
             DataRequest::Put(PutRequest {
                 key: b"k1".to_vec(),
                 value: Some(Value::String("v1_1".to_owned())),
-                expect_ts: Some(Timestamp::zero()),
+                expect_ts: Some(Timestamp::ZERO),
                 sequence: 0,
             }),
         ];
@@ -627,5 +725,684 @@ mod tests {
 
         let get = responses.pop().unwrap().into_get().unwrap();
         assert_that!(get.value.unwrap()).is_equal_to(&expect_value);
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_once() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let locating_key = keys::user_key(b"count");
+        let deployment = client.locate(&locating_key).await.unwrap();
+        let (tablet_id, mut tablet_client) = client.tablet_client(&locating_key).await.unwrap();
+        let mut requests = vec![
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 1 }),
+            DataRequest::Get(GetRequest { key: b"count".to_vec(), sequence: 1 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 2 }),
+            DataRequest::Put(PutRequest {
+                key: b"k1".to_vec(),
+                value: Some(Value::String("v1_1".to_owned())),
+                expect_ts: None,
+                sequence: 2,
+            }),
+        ];
+        requests.iter_mut().for_each(|r| {
+            let key = keys::user_key(r.key());
+            r.set_key(key);
+        });
+        let mut txn = client.new_transaction(locating_key);
+        txn.status = TxnStatus::Committed;
+        let batch_request = BatchRequest {
+            tablet_id: tablet_id.into(),
+            temporal: Temporal::Transaction(txn),
+            requests: requests
+                .into_iter()
+                .map(|request| ShardRequest { shard_id: deployment.shard_id().into(), request })
+                .collect(),
+            ..Default::default()
+        };
+        tablet_client.batch(batch_request).await.unwrap().into_inner();
+
+        let incremented = client.increment(b"count", 100).await.unwrap();
+        assert_eq!(incremented, 110);
+
+        let (_ts, value) = client.get(b"k1").await.unwrap().unwrap();
+        assert_eq!(value, Value::String("v1_1".to_owned()));
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_stepped() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let locating_key = keys::user_key(b"count");
+        let deployment = client.locate(&locating_key).await.unwrap();
+        let (tablet_id, mut tablet_client) = client.tablet_client(&locating_key).await.unwrap();
+        let mut requests = vec![
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 1 }),
+            DataRequest::Get(GetRequest { key: b"count".to_vec(), sequence: 1 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 2 }),
+            DataRequest::Put(PutRequest {
+                key: b"k1".to_vec(),
+                value: Some(Value::String("v1_1".to_owned())),
+                expect_ts: None,
+                sequence: 3,
+            }),
+        ];
+        requests.iter_mut().for_each(|r| {
+            let key = keys::user_key(r.key());
+            r.set_key(key);
+        });
+        let mut txn = client.new_transaction(locating_key);
+        let batch_request = BatchRequest {
+            tablet_id: tablet_id.into(),
+            temporal: Temporal::Transaction(txn.clone()),
+            requests: requests
+                .into_iter()
+                .map(|request| ShardRequest { shard_id: deployment.shard_id().into(), request })
+                .collect(),
+            ..Default::default()
+        };
+        tablet_client.batch(batch_request).await.unwrap().into_inner();
+
+        let incremented_future = client.increment(b"count", 100);
+        let get_future = client.get(b"k1");
+        let mut incremented_future = pin!(incremented_future);
+        let mut get_future = pin!(get_future);
+
+        for _ in 0..10 {
+            select! {
+                r = incremented_future.as_mut() => unreachable!("{r:?}"),
+                r = get_future.as_mut() => unreachable!("{r:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+            }
+            tablet_client
+                .batch(BatchRequest {
+                    tablet_id: tablet_id.into(),
+                    temporal: Temporal::Transaction(txn.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        txn.status = TxnStatus::Committed;
+        txn.rollbacked_sequences.push(SequenceRange { start: 2, end: 3 });
+        let response = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(txn),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let txn = response.temporal.into_transaction();
+        assert_eq!(txn.status, TxnStatus::Committed);
+
+        let mut get_done = false;
+        let mut incremented_done = false;
+        loop {
+            select! {
+                r = incremented_future.as_mut(), if !incremented_done => {
+                    let incremented = r.unwrap();
+                    assert_eq!(incremented, 105);
+                    incremented_done = true;
+                }
+                r = get_future.as_mut(), if !get_done => {
+                    let (_ts, value) = r.unwrap().unwrap();
+                    assert_eq!(value, Value::String("v1_1".to_owned()));
+                    get_done = true;
+                },
+                complete => break,
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_resolve_committed() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
+        let tablet_id_counter = client
+            .get_key(tablet_id_counter_key.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .read_int(b"tablet-id-counter", "read")
+            .unwrap();
+
+        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+
+        let user_tablet_key = keys::user_key(b"counter");
+        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+
+        let mut txn = client.new_transaction(tablet_id_counter_key.clone());
+
+        system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: tablet_id_counter_key.clone(),
+                        increment: 100,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        user_tablet_client
+            .batch(BatchRequest {
+                tablet_id: user_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: user_tablet_key.clone(),
+                        increment: 100,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let user_tablet_get_future = client.get_key(user_tablet_key.clone());
+        let system_tablet_get_future = client.get_key(tablet_id_counter_key.clone());
+
+        let mut user_tablet_get_future = pin!(user_tablet_get_future);
+        let mut system_tablet_get_future = pin!(system_tablet_get_future);
+
+        for _ in 0..10 {
+            select! {
+                r = user_tablet_get_future.as_mut() => unreachable!("{r:?}"),
+                r = system_tablet_get_future.as_mut() => unreachable!("{r:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+            }
+            system_tablet_client
+                .batch(BatchRequest {
+                    tablet_id: system_tablet_id.into(),
+                    temporal: Temporal::Transaction(txn.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        txn.status = TxnStatus::Committed;
+        system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(Transaction {
+                    commit_set: vec![KeySpan { key: keys::user_key(b"counter"), end: vec![] }, KeySpan {
+                        key: keys::system_key(b"tablet-id-counter"),
+                        end: vec![],
+                    }],
+                    ..txn.clone()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut user_tablet_get_done = false;
+        let mut system_tablet_get_done = false;
+        loop {
+            select! {
+                r = user_tablet_get_future.as_mut(), if !user_tablet_get_done => {
+                    let (_ts, value) = r.unwrap().unwrap();
+                    assert_eq!(value, Value::Int(100));
+                    user_tablet_get_done = true;
+                }
+                r = system_tablet_get_future.as_mut(), if !system_tablet_get_done => {
+                    let (_ts, value) = r.unwrap().unwrap();
+                    assert_eq!(value, Value::Int(tablet_id_counter + 100));
+                    system_tablet_get_done = true;
+                },
+                complete => break,
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_resolve_aborted() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
+        let tablet_id_counter = client
+            .get_key(tablet_id_counter_key.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .read_int(b"tablet-id-counter", "read")
+            .unwrap();
+
+        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+
+        let user_tablet_key = keys::user_key(b"counter");
+        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+
+        let mut txn = client.new_transaction(tablet_id_counter_key.clone());
+
+        system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: tablet_id_counter_key.clone(),
+                        increment: 100,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        user_tablet_client
+            .batch(BatchRequest {
+                tablet_id: user_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: user_tablet_key.clone(),
+                        increment: 100,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let user_tablet_get_future = client.get_key(user_tablet_key.clone());
+        let system_tablet_get_future = client.get_key(tablet_id_counter_key.clone());
+
+        let mut user_tablet_get_future = pin!(user_tablet_get_future);
+        let mut system_tablet_get_future = pin!(system_tablet_get_future);
+
+        for _ in 0..10 {
+            select! {
+                r = user_tablet_get_future.as_mut() => unreachable!("{r:?}"),
+                r = system_tablet_get_future.as_mut() => unreachable!("{r:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+            }
+            system_tablet_client
+                .batch(BatchRequest {
+                    tablet_id: system_tablet_id.into(),
+                    temporal: Temporal::Transaction(txn.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        txn.status = TxnStatus::Aborted;
+        system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(Transaction {
+                    commit_set: vec![KeySpan { key: keys::user_key(b"counter"), end: vec![] }, KeySpan {
+                        key: keys::system_key(b"tablet-id-counter"),
+                        end: vec![],
+                    }],
+                    ..txn.clone()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut user_tablet_get_done = false;
+        let mut system_tablet_get_done = false;
+        loop {
+            select! {
+                r = user_tablet_get_future.as_mut(), if !user_tablet_get_done => {
+                    assert!(r.unwrap().is_none());
+                    user_tablet_get_done = true;
+                }
+                r = system_tablet_get_future.as_mut(), if !system_tablet_get_done => {
+                    let (_ts, value) = r.unwrap().unwrap();
+                    assert_eq!(value, Value::Int(tablet_id_counter));
+                    system_tablet_get_done = true;
+                },
+                complete => break,
+            }
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_timeout_aborted() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
+        let tablet_id_counter = client
+            .get_key(tablet_id_counter_key.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .read_int(b"tablet-id-counter", "read")
+            .unwrap();
+
+        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+
+        let user_tablet_key = keys::user_key(b"counter");
+        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+
+        let txn = client.new_transaction(tablet_id_counter_key.clone());
+
+        system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: tablet_id_counter_key.clone(),
+                        increment: 100,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        user_tablet_client
+            .batch(BatchRequest {
+                tablet_id: user_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: user_tablet_key.clone(),
+                        increment: 100,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            client.get_key(tablet_id_counter_key.clone()).await.unwrap().unwrap().1,
+            Value::Int(tablet_id_counter)
+        );
+        assert!(client.get_key(user_tablet_key.clone()).await.unwrap().is_none());
+    }
+
+    async fn heartbeat_txn(client: TabletClient, txn: TxnMeta) {
+        let mut txn = Transaction { meta: txn, ..Default::default() };
+        let (tablet_id, mut tablet_client) = client.tablet_client(txn.key()).await.unwrap();
+        loop {
+            txn = tablet_client
+                .batch(BatchRequest {
+                    tablet_id: tablet_id.into(),
+                    temporal: Temporal::Transaction(txn),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .temporal
+                .into_transaction();
+
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_refresh_read() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
+
+        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+
+        let user_tablet_key = keys::user_key(b"counter");
+        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+
+        let mut txn = client.new_transaction(tablet_id_counter_key.clone());
+
+        let tablet_id_counter = system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Get(GetRequest { key: tablet_id_counter_key.clone(), sequence: 0 }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .into_get()
+            .unwrap()
+            .value
+            .unwrap()
+            .value
+            .read_int(&tablet_id_counter_key, "read tablet id")
+            .unwrap();
+
+        let heartbeat = heartbeat_txn(client.clone(), txn.meta.clone());
+        let mut heartbeat = pin!(heartbeat);
+
+        select! {
+            _ = heartbeat.as_mut() => unreachable!(""),
+            Ok(_) = user_tablet_client
+                .batch(BatchRequest {
+                    tablet_id: user_tablet_id.into(),
+                    temporal: Temporal::Transaction(txn.clone()),
+                    requests: vec![ShardRequest {
+                        shard_id: 0,
+                        request: DataRequest::Increment(IncrementRequest {
+                            key: user_tablet_key.clone(),
+                            increment: tablet_id_counter,
+                            sequence: 1,
+                        }),
+                    }],
+                    ..Default::default()
+                }) => {},
+        }
+
+        let last_read_ts = txn.commit_ts();
+        select! {
+            _ = heartbeat.as_mut() => unreachable!(""),
+            _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+        }
+        txn.commit_ts = client.now();
+
+        system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::RefreshRead(RefreshReadRequest {
+                        span: KeySpan { key: tablet_id_counter_key.clone(), end: vec![] },
+                        from: last_read_ts,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        select! {
+            _ = heartbeat.as_mut() => unreachable!(""),
+            _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+        }
+
+        select! {
+            _ = heartbeat.as_mut() => unreachable!(""),
+            Ok(_) = system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Timestamp(client.now()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: tablet_id_counter_key.clone(),
+                        increment: 1,
+                        sequence: 0,
+                    }),
+                }],
+                ..Default::default()
+            }) => {},
+        }
+
+        let last_read_ts = txn.commit_ts();
+        select! {
+            _ = heartbeat.as_mut() => unreachable!(""),
+            _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+        }
+        txn.commit_ts = client.now();
+
+        let status = system_tablet_client
+            .batch(BatchRequest {
+                tablet_id: system_tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::RefreshRead(RefreshReadRequest {
+                        span: KeySpan { key: tablet_id_counter_key.clone(), end: vec![] },
+                        from: last_read_ts,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert_that!(status.message()).contains("fail to refresh key");
     }
 }

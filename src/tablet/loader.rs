@@ -20,25 +20,26 @@ use async_trait::async_trait;
 use derivative::Derivative;
 use tokio::select;
 
-use super::store::{BatchResult, TabletStore};
-use super::types::{MessageId, TabletWatermark, Temporal};
-use crate::clock::Timestamp;
+use super::store::{BatchContext, BatchResult, TabletStore, TxnTabletStore};
+use super::types::{MessageId, TabletWatermark};
+use crate::clock::{Clock, Timestamp};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogManager, LogOffset, LogPosition};
 use crate::protos::{
-    self,
     BatchRequest,
     BatchResponse,
     DataMessage,
-    DataRequest,
-    DataResponse,
-    GetResponse,
     ManifestMessage,
+    ShardDescription,
     ShardId,
+    ShardRequest,
+    ShardResponse,
     TabletDeployment,
     TabletDescription,
     TabletId,
     TabletManifest,
+    Temporal,
 };
+use crate::tablet::{Request, TabletClient};
 
 pub trait LogMessage: prost::Message + Sync + Default + 'static {
     fn epoch(&self) -> u64;
@@ -342,17 +343,18 @@ pub struct FollowingTabletStore {
 
 pub struct LeadingTabletStore {
     pub cursor: MessageId,
-    pub store: TabletStore,
+    pub store: TxnTabletStore,
     pub producer: MessageProducer<DataMessage>,
 }
 
 impl LeadingTabletStore {
     pub fn new_message(&mut self) -> DataMessage {
+        self.store.step();
         self.cursor.sequence += 1;
         DataMessage {
             epoch: self.cursor.epoch,
             sequence: self.cursor.sequence,
-            temporal: None,
+            temporal: Temporal::default(),
             closed_timestamp: None,
             leader_expiration: None,
             operation: None,
@@ -403,6 +405,10 @@ pub struct LeadingTablet {
 impl LeadingTablet {
     pub fn id(&self) -> TabletId {
         self.manifest.manifest.tablet.id.into()
+    }
+
+    pub fn shards(&self) -> &[ShardDescription] {
+        self.store.store.shards()
     }
 
     pub fn deployment_shard_id(&self) -> Option<ShardId> {
@@ -456,22 +462,23 @@ impl LeadingTablet {
         self.manifest.publish().await
     }
 
-    pub fn process_batch(
-        &mut self,
-        temporal: &mut Temporal,
-        shards: Vec<u64>,
-        writes: Vec<DataRequest>,
-    ) -> Result<BatchResult> {
-        let ts = temporal.timestamp();
-        let readonly = writes.iter().all(|r| r.is_read());
-        if !readonly {
-            if ts < self.manifest.manifest.watermark.closed_timestamp {
-                bail!("write beneath closed timestamp")
-            } else if ts > self.manifest.manifest.watermark.leader_expiration {
-                bail!("write above leader expiration")
+    pub fn process_request(&mut self, request: Request) -> Result<Option<BatchResult>> {
+        if !request.request.is_readonly() {
+            let ts = request.request.temporal.timestamp();
+            let watermark = &self.manifest.manifest.watermark;
+            if ts < watermark.closed_timestamp {
+                return Ok(Some(BatchResult::Error {
+                    error: anyhow!("write beneath closed timestamp"),
+                    responser: request.responser,
+                }));
+            } else if ts > watermark.leader_expiration {
+                return Ok(Some(BatchResult::Error {
+                    error: anyhow!("write above leader expiration"),
+                    responser: request.responser,
+                }));
             }
         }
-        self.store.store.batch(temporal, shards, writes)
+        self.store.store.process_request(request)
     }
 }
 
@@ -481,6 +488,14 @@ pub struct FollowingTablet {
 }
 
 impl FollowingTablet {
+    pub fn id(&self) -> TabletId {
+        self.manifest.manifest.tablet.id.into()
+    }
+
+    pub fn shards(&self) -> &[ShardDescription] {
+        self.store.store.shards()
+    }
+
     pub fn apply_manifest_message(&mut self, message: ManifestMessage) -> Result<()> {
         self.manifest.cursor = MessageId::new(message.epoch, message.sequence);
         self.manifest.manifest.update(message.manifest);
@@ -498,7 +513,7 @@ impl FollowingTablet {
             return None;
         }
         match batch.temporal {
-            Some(protos::Temporal::Timestamp(timestamp)) => {
+            Temporal::Timestamp(timestamp) => {
                 let closed_timestamp = self.closed_timestamp();
                 if timestamp > closed_timestamp {
                     return None;
@@ -509,23 +524,15 @@ impl FollowingTablet {
         }
     }
 
-    fn query(&self, ts: Timestamp, shards: Vec<u64>, requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
-        let mut responses = Vec::with_capacity(requests.len());
-        for (i, request) in requests.into_iter().enumerate() {
-            let DataRequest::Get(get) = request else {
-                unreachable!();
-            };
-            let value = self.store.store.get(shards[i].into(), &Temporal::from(ts), &get.key)?;
-            let response = GetResponse { value: value.into() };
-            responses.push(DataResponse::Get(response));
-        }
-        Ok(responses)
+    fn query(&mut self, ts: Timestamp, requests: Vec<ShardRequest>) -> Result<Vec<ShardResponse>> {
+        let mut context = BatchContext::default();
+        self.store.store.batch_timestamped(&mut context, ts, requests)
     }
 
-    pub fn query_batch(&self, deployment: &TabletDeployment, batch: BatchRequest) -> Result<BatchResponse> {
+    pub fn query_batch(&mut self, deployment: &TabletDeployment, batch: BatchRequest) -> Result<BatchResponse> {
         let mut response = BatchResponse::default();
         if let Some(ts) = self.extract_read_timestamp(&batch) {
-            response.responses = self.query(ts, batch.shards, batch.requests)?;
+            response.responses = self.query(ts, batch.requests)?;
         } else {
             response.deployments.push(deployment.clone());
         }
@@ -615,12 +622,14 @@ impl TabletLoader {
 
     pub async fn fence_load_tablet(
         &self,
+        clock: Clock,
+        client: TabletClient,
         epoch: u64,
         uri: impl TryInto<LogAddress<'_>, Error = anyhow::Error>,
     ) -> Result<LeadingTablet> {
         let uri = uri.try_into()?;
         let manifest = self.fence_load_manifest(epoch, &uri).await?;
-        let mut store = self.fence_load_store(epoch, &manifest.manifest.tablet).await?;
+        let mut store = self.fence_load_store(clock, client, epoch, &manifest.manifest.tablet).await?;
         store.store.update_watermark(manifest.manifest.watermark);
         Ok(LeadingTablet { manifest, store })
     }
@@ -655,6 +664,8 @@ impl TabletLoader {
 
     pub async fn lead_tablet(
         &self,
+        clock: Clock,
+        client: TabletClient,
         epoch: u64,
         uri: impl TryInto<LogAddress<'_>, Error = anyhow::Error>,
         tablet: FollowingTablet,
@@ -664,7 +675,7 @@ impl TabletLoader {
         let uri = uri.try_into()?;
         let manifest = self.lead_manifest(epoch, &uri, tablet.manifest).await?;
         let store_uri = manifest.manifest.tablet.data_log.as_str().try_into()?;
-        let store = self.lead_store(epoch, &store_uri, tablet.store).await?;
+        let store = self.lead_store(clock, client, epoch, &store_uri, tablet.store).await?;
         Ok(LeadingTablet { manifest, store })
     }
 
@@ -719,6 +730,8 @@ impl TabletLoader {
 
     async fn lead_store(
         &self,
+        clock: Clock,
+        client: TabletClient,
         epoch: u64,
         uri: &LogAddress<'_>,
         mut store: FollowingTabletStore,
@@ -728,12 +741,18 @@ impl TabletLoader {
         self.read_store(&mut store.cursor, &mut store.store, &mut store.consumer, Some(position)).await?;
         Ok(LeadingTabletStore {
             cursor: store.cursor,
-            store: store.store,
+            store: TxnTabletStore::new(store.store, clock, client),
             producer: store.consumer.into_producer(producer),
         })
     }
 
-    async fn fence_load_store(&self, epoch: u64, tablet: &TabletDescription) -> Result<LeadingTabletStore> {
+    async fn fence_load_store(
+        &self,
+        clock: Clock,
+        client: TabletClient,
+        epoch: u64,
+        tablet: &TabletDescription,
+    ) -> Result<LeadingTabletStore> {
         let uri = tablet.data_log.as_str().try_into()?;
         let mut producer = BufMessageProducer::new(self.log.produce_log(&uri).await?);
         let position = producer.send_message(&DataMessage::new_fenced(epoch)).await?;
@@ -743,7 +762,7 @@ impl TabletLoader {
         }
         Ok(LeadingTabletStore {
             cursor: store.cursor,
-            store: store.store,
+            store: TxnTabletStore::new(store.store, clock, client),
             producer: store.consumer.into_producer(producer),
         })
     }

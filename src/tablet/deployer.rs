@@ -23,7 +23,7 @@ use prost::Message as _;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
-use tracing::{span, Instrument, Level};
+use tracing::{debug, instrument, span, trace, Instrument, Level};
 
 use super::types::TabletRequest;
 use crate::cluster::{ClusterEnv, NodeId, NodeRegistry};
@@ -36,11 +36,13 @@ use crate::protos::{
     FindResponse,
     PutRequest,
     ShardId,
+    ShardRequest,
     TabletDeployRequest,
     TabletDeployment,
     TabletHeartbeatRequest,
     TabletId,
     TabletServiceClient,
+    Temporal,
     Timestamp,
 };
 use crate::utils::{DropWatcher, WatchConsumer as _};
@@ -305,10 +307,8 @@ impl TabletDeployer for RangeTabletDeployer {
         let batch = BatchRequest {
             tablet_id: self.tablet_id.into(),
             uncertainty: None,
-            atomic: true,
-            temporal: None,
-            shards: vec![self.shard_id.into()],
-            requests: vec![DataRequest::Put(put)],
+            temporal: Temporal::default(),
+            requests: vec![ShardRequest { shard_id: self.shard_id.into(), request: DataRequest::Put(put) }],
         };
         let (sender, receiver) = oneshot::channel();
         let request = TabletRequest::Batch { batch, responser: sender };
@@ -332,10 +332,11 @@ impl RangeTabletDeployer {
         let batch = BatchRequest {
             tablet_id: self.tablet_id.into(),
             uncertainty: None,
-            atomic: true,
-            temporal: None,
-            shards: vec![self.shard_id.into()],
-            requests: vec![DataRequest::Find(FindRequest { key, sequence: 0 })],
+            temporal: Temporal::default(),
+            requests: vec![ShardRequest {
+                shard_id: self.shard_id.into(),
+                request: DataRequest::Find(FindRequest { key, sequence: 0 }),
+            }],
         };
         let (sender, receiver) = oneshot::channel();
         let request = TabletRequest::Batch { batch, responser: sender };
@@ -346,14 +347,8 @@ impl RangeTabletDeployer {
             return Ok(None);
         };
         let bytes = value.read_bytes(&located_key, "read deployment bytes")?;
-        let deployment =
-            TabletDeployment::decode(bytes).map_err(|e| anyhow!("fail to decode TabletDeployment: {}", e))?;
-        tracing::trace!(
-            "found deployment: key {:?}, ts {:?}, deployment {:?}",
-            located_key,
-            value.timestamp,
-            deployment
-        );
+        let deployment = TabletDeployment::decode(bytes)?;
+        trace!("found deployment: key {:?}, ts {:?}, deployment {:?}", located_key, value.timestamp, deployment);
         Ok(Some((located_key, value.timestamp, deployment)))
     }
 
@@ -389,7 +384,8 @@ impl RangeTabletDeployer {
         receiver
     }
 
-    async fn serve(&self) -> Result<()> {
+    #[instrument(skip(self), fields(self.shard = %self.shard_id, self.tablet = %self.tablet_id))]
+    async fn serve_internally(&self) -> Result<()> {
         let mut deployments = self.load_deployments();
         let mut load_completed = false;
         let mut serve_futures = FuturesUnordered::new();
@@ -404,6 +400,13 @@ impl RangeTabletDeployer {
             }
         }
         Ok(())
+    }
+
+    #[instrument(skip(self), fields(self.shard = %self.shard_id, self.tablet = %self.tablet_id))]
+    async fn serve(&self) {
+        if let Err(err) = self.serve_internally().await {
+            debug!("fail to serve range tablet deployer: {err}");
+        }
     }
 
     pub fn start(

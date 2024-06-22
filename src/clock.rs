@@ -93,20 +93,26 @@ impl std::fmt::Display for Timestamp {
 }
 
 impl Timestamp {
+    pub const EPSILON: Timestamp = Self { seconds: 0, nanoseconds: 0, logical: 1 };
+    pub const MAX: Timestamp = Self { seconds: u64::MAX, nanoseconds: u32::MAX, logical: u32::MAX };
+    pub const ZERO: Timestamp = Self { seconds: 0, nanoseconds: 0, logical: 0 };
+
     pub const fn is_zero(&self) -> bool {
         self.seconds == 0 && self.nanoseconds == 0 && self.logical == 0
     }
 
-    pub const fn zero() -> Self {
-        Self { seconds: 0, nanoseconds: 0, logical: 0 }
+    pub const fn txn_sequence(sequence: u32) -> Self {
+        Self { seconds: 0x8000000000000000 + sequence as u64, nanoseconds: 0, logical: 0 }
     }
 
-    pub const fn epsilon() -> Self {
-        Self { seconds: 0, nanoseconds: 0, logical: 1 }
+    pub fn forward(&mut self, ts: Timestamp) {
+        if *self < ts {
+            *self = ts;
+        }
     }
 
-    pub const fn infinite() -> Self {
-        Self { seconds: u64::MAX, nanoseconds: u32::MAX, logical: u32::MAX }
+    pub fn into_physical(self) -> Self {
+        Self { logical: 0, ..self }
     }
 }
 
@@ -128,6 +134,14 @@ impl Sub<Duration> for Timestamp {
     }
 }
 
+impl Sub<Timestamp> for Timestamp {
+    type Output = Duration;
+
+    fn sub(self, rhs: Timestamp) -> Self::Output {
+        Duration::new(self.seconds, self.nanoseconds).saturating_sub(Duration::new(rhs.seconds, rhs.nanoseconds))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use assertor::*;
@@ -136,14 +150,14 @@ mod tests {
 
     #[test]
     fn test_timestamp() {
-        assert_that!(Timestamp::zero().is_zero()).is_equal_to(true);
-        assert_that!(Timestamp::epsilon().is_zero()).is_equal_to(false);
-        assert_that!(Timestamp::infinite().is_zero()).is_equal_to(false);
+        assert_that!(Timestamp::ZERO.is_zero()).is_equal_to(true);
+        assert_that!(Timestamp::EPSILON.is_zero()).is_equal_to(false);
+        assert_that!(Timestamp::MAX.is_zero()).is_equal_to(false);
 
-        assert_that!(Timestamp::zero()).is_less_than(Timestamp::epsilon());
-        assert_that!(Timestamp::epsilon()).is_less_than(Timestamp::infinite());
+        assert_that!(Timestamp::ZERO).is_less_than(Timestamp::EPSILON);
+        assert_that!(Timestamp::EPSILON).is_less_than(Timestamp::MAX);
 
-        let ts0 = Timestamp::zero() + Duration::from_secs(50);
+        let ts0 = Timestamp::ZERO + Duration::from_secs(50);
         let ts1 = ts0 + Duration::from_nanos(51);
         assert_that!(ts1 - Duration::from_nanos(51)).is_equal_to(ts0);
     }

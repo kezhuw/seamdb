@@ -16,15 +16,20 @@
 
 #[rustfmt::skip]
 mod generated;
+mod span;
+mod temporal;
+mod uuid;
 
 use std::cmp;
 use std::fmt::{Display, Error, Formatter};
 
 use anyhow::{anyhow, bail, Result};
 use hashbrown::Equivalent;
+pub use temporal::{HasTxnMeta, HasTxnStatus};
 
 pub use self::data_message::Operation as DataOperation;
 pub use self::generated::*;
+pub use self::span::*;
 pub use self::tablet_service_client::TabletServiceClient;
 pub use self::tablet_service_server::{TabletService, TabletServiceServer};
 pub use crate::keys;
@@ -71,7 +76,7 @@ impl TabletId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct ShardId(u64);
+pub struct ShardId(pub(crate) u64);
 
 impl Display for ShardId {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
@@ -107,25 +112,19 @@ impl ShardId {
 
 impl ShardDescriptor {
     pub fn root() -> Self {
-        Self { id: ShardId::ROOT.into(), generation: 0, range: KeyRange::root(), tablet_id: TabletId::ROOT.into() }
+        Self { id: ShardId::ROOT.into(), range: KeyRange::root(), tablet_id: TabletId::ROOT.into() }
     }
 
     pub fn descriptor() -> Self {
-        Self {
-            id: ShardId::DESCRIPTOR.into(),
-            generation: 0,
-            range: keys::descriptor_range(),
-            tablet_id: TabletId::ROOT.into(),
-        }
+        Self { id: ShardId::DESCRIPTOR.into(), range: keys::descriptor_range(), tablet_id: TabletId::ROOT.into() }
     }
 
     pub fn deployment() -> Self {
-        Self {
-            id: ShardId::DEPLOYMENT.into(),
-            generation: 0,
-            range: keys::deployment_range(),
-            tablet_id: TabletId::ROOT.into(),
-        }
+        Self { id: ShardId::DEPLOYMENT.into(), range: keys::deployment_range(), tablet_id: TabletId::ROOT.into() }
+    }
+
+    pub fn is_predecessor_of(&self, other: &ShardDescriptor) -> bool {
+        self.id < other.id && self.range.is_intersect_with(&other.range)
     }
 }
 
@@ -224,9 +223,31 @@ impl TabletDeployment {
     }
 }
 
+impl ShardRequest {
+    pub fn is_read(&self) -> bool {
+        self.request.is_read()
+    }
+
+    pub fn key(&self) -> &[u8] {
+        self.request.key()
+    }
+}
+
 impl DataRequest {
     pub fn is_read(&self) -> bool {
-        matches!(self, DataRequest::Get(_) | DataRequest::Find(_))
+        !self.is_write()
+    }
+
+    pub fn is_write(&self) -> bool {
+        matches!(self, DataRequest::Put(_) | DataRequest::Increment(_))
+    }
+
+    pub fn write_key(&self) -> Option<&[u8]> {
+        match self {
+            Self::Put(request) => Some(&request.key),
+            Self::Increment(request) => Some(&request.key),
+            _ => None,
+        }
     }
 
     pub fn key(&self) -> &[u8] {
@@ -235,6 +256,7 @@ impl DataRequest {
             Self::Find(request) => &request.key,
             Self::Put(request) => &request.key,
             Self::Increment(request) => &request.key,
+            Self::RefreshRead(request) => &request.span.key,
         }
     }
 
@@ -244,6 +266,7 @@ impl DataRequest {
             Self::Find(request) => request.key = key,
             Self::Put(request) => request.key = key,
             Self::Increment(request) => request.key = key,
+            Self::RefreshRead(request) => request.span.key = key,
         }
     }
 }
@@ -278,7 +301,14 @@ impl ManifestMessage {
 
 impl DataMessage {
     pub fn new_fenced(epoch: u64) -> Self {
-        Self { epoch, sequence: 0, temporal: None, closed_timestamp: None, leader_expiration: None, operation: None }
+        Self {
+            epoch,
+            sequence: 0,
+            temporal: Temporal::default(),
+            closed_timestamp: None,
+            leader_expiration: None,
+            operation: None,
+        }
     }
 
     pub fn take_writes(&mut self) -> Vec<Write> {
@@ -336,19 +366,36 @@ impl TimestampedValue {
 }
 
 impl BatchResponse {
-    pub fn into_one(mut self) -> Result<DataResponse, BatchResponse> {
+    #[allow(clippy::result_large_err)]
+    pub fn into_one(mut self) -> Result<ShardResponse, Self> {
         if self.responses.len() != 1 {
             return Err(self);
         }
         Ok(self.responses.remove(0))
     }
 
-    pub fn into_find(mut self) -> Result<FindResponse, BatchResponse> {
+    #[allow(clippy::result_large_err)]
+    pub fn into_get(mut self) -> Result<GetResponse, Self> {
+        if self.responses.len() != 1 {
+            return Err(self);
+        }
+        let ShardResponse { shard, response } = self.responses.remove(0);
+        match response.into_get() {
+            Ok(get) => Ok(get),
+            Err(response) => {
+                self.responses.push(ShardResponse { shard, response });
+                Err(self)
+            },
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_find(mut self) -> Result<FindResponse, Self> {
         if self.responses.len() != 1 {
             return Err(self);
         }
         match self.responses.remove(0) {
-            DataResponse::Find(find) => Ok(find),
+            ShardResponse { response: DataResponse::Find(find), .. } => Ok(find),
             response => {
                 self.responses.push(response);
                 Err(self)
@@ -356,12 +403,13 @@ impl BatchResponse {
         }
     }
 
-    pub fn into_put(mut self) -> Result<PutResponse, BatchResponse> {
+    #[allow(clippy::result_large_err)]
+    pub fn into_put(mut self) -> Result<PutResponse, Self> {
         if self.responses.len() != 1 {
             return Err(self);
         }
         match self.responses.remove(0) {
-            DataResponse::Put(put) => Ok(put),
+            ShardResponse { response: DataResponse::Put(put), .. } => Ok(put),
             response => {
                 self.responses.push(response);
                 Err(self)

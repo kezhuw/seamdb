@@ -73,12 +73,12 @@ const CLUSTER_BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_LOGS_NUMBER: usize = 8;
 
 const RANGE_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x010000);
-const SYSTEM_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x030000);
+const SYSTEM_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x020000);
 const DATA_TABLET_INITIAL_ID: TabletId = TabletId::from_raw(0x030000);
 
 const RANGE_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x010000);
-const SYSTEM_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x010000);
-const DATA_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x020000);
+const SYSTEM_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x020000);
+const DATA_SHARD_INITAL_ID: ShardId = ShardId::from_raw(0x030000);
 
 fn parse_deployment(response: WatchResponse) -> Result<TabletDeployment> {
     let event = response.events().last().ok_or_else(|| anyhow!("cluster meta watch receives no event"))?;
@@ -169,7 +169,7 @@ impl EtcdClusterMetaDaemon {
         let message = DataMessage {
             epoch: 0,
             sequence: 1,
-            temporal: Some(Temporal::Timestamp(ts)),
+            temporal: Temporal::Timestamp(ts),
             operation: Some(DataOperation::Batch(protos::Batch { writes: writes.into() })),
             closed_timestamp: Some(ts),
             leader_expiration: Some(ts),
@@ -188,7 +188,7 @@ impl EtcdClusterMetaDaemon {
         shards.sort_by(|a, b| a.1.start.cmp(&b.1.start));
         let shards: Vec<_> = shards
             .into_iter()
-            .map(|(id, range)| ShardDescriptor { id: id.into(), generation: 0, range, tablet_id: tablet_id.into() })
+            .map(|(id, range)| ShardDescriptor { id: id.into(), range, tablet_id: tablet_id.into() })
             .collect();
         let tablet = TabletDescription {
             id: tablet_id.into(),
@@ -198,7 +198,6 @@ impl EtcdClusterMetaDaemon {
                 .iter()
                 .map(|shard| ShardDescription {
                     id: shard.id,
-                    generation: 0,
                     range: shard.range.clone(),
                     segments: vec![],
                     merge_bounds: ShardMergeBounds::None,
@@ -848,6 +847,8 @@ mod tests {
         BatchResponse,
         LocateRequest,
         LocateResponse,
+        ParticipateTxnRequest,
+        ParticipateTxnResponse,
         TabletDeployRequest,
         TabletDeployResponse,
         TabletDeployment,
@@ -933,6 +934,9 @@ mod tests {
 
     #[async_trait]
     impl TabletService for TestTabletService {
+        type ParticipateTxnStream =
+            tokio_stream::wrappers::UnboundedReceiverStream<Result<ParticipateTxnResponse, tonic::Status>>;
+
         async fn deploy_tablet(
             &self,
             request: tonic::Request<TabletDeployRequest>,
@@ -958,14 +962,21 @@ mod tests {
             &self,
             _request: tonic::Request<BatchRequest>,
         ) -> Result<tonic::Response<BatchResponse>, tonic::Status> {
-            todo!()
+            unimplemented!()
+        }
+
+        async fn participate_txn(
+            &self,
+            _request: tonic::Request<tonic::Streaming<ParticipateTxnRequest>>,
+        ) -> Result<tonic::Response<Self::ParticipateTxnStream>, tonic::Status> {
+            unimplemented!()
         }
 
         async fn locate(
             &self,
             _request: tonic::Request<LocateRequest>,
         ) -> Result<tonic::Response<LocateResponse>, tonic::Status> {
-            todo!()
+            unimplemented!()
         }
     }
 

@@ -12,13 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::missing_transmute_annotations)]
+use std::fmt::{self, Display, Formatter};
 
-pub mod clock;
-pub mod cluster;
-pub mod endpoint;
-pub mod keys;
-pub mod log;
-pub mod protos;
-pub mod tablet;
-pub mod utils;
+use super::Uuid;
+
+impl Uuid {
+    pub fn new_random() -> Self {
+        let id = uuid::Uuid::new_v4();
+        id.into()
+    }
+}
+
+impl From<uuid::Uuid> for Uuid {
+    fn from(id: uuid::Uuid) -> Self {
+        let (msb, lsb) = id.as_u64_pair();
+        Self { msb, lsb }
+    }
+}
+
+impl From<Uuid> for uuid::Uuid {
+    fn from(id: Uuid) -> Self {
+        uuid::Uuid::from_u64_pair(id.msb, id.lsb)
+    }
+}
+
+impl Display for Uuid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        uuid::Uuid::from(*self).fmt(f)
+    }
+}

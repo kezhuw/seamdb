@@ -27,6 +27,8 @@ pub const SYSTEM_KEY_PREFIX: &[u8] = &[b'd', b's'];
 pub const USER_KEY_PREFIX: &[u8] = &[b'd', b'u'];
 pub const MAX_KEY: &[u8] = &[0xffu8];
 
+pub type Key = Vec<u8>;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum KeyKind {
     Range { root: bool },
