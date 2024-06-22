@@ -16,6 +16,11 @@ syntax = "proto3";
 
 package seamdb;
 
+message Uuid {
+    fixed64 msb = 1;
+    fixed64 lsb = 2;
+}
+
 message MessageId {
     uint64 epoch = 1;
     // Sequence for deduplication.
@@ -24,6 +29,13 @@ message MessageId {
 
 message KeyRange {
     bytes start = 1;
+    bytes end = 2;
+}
+
+message KeySpan {
+    bytes key = 1;
+
+    // Empty if this is a single key span.
     bytes end = 2;
 }
 
@@ -51,17 +63,12 @@ enum ShardMergeBounds {
 // range/range1_end_key ==> ShardDescriptor
 message ShardDescriptor {
     uint64 id = 1;
-    // Increment on each split/merge.
-    //
-    // XXX: What if a query arrive after range split ?
-    uint64 generation = 2;
     KeyRange range = 3;
     uint64 tablet_id = 4;
 }
 
 message ShardDescription {
     uint64 id = 1;
-    uint64 generation = 2;
     KeyRange range = 3;
     repeated ShardSegment segments = 4;
 
@@ -189,76 +196,24 @@ message DataMessage {
     Timestamp leader_expiration = 7;
 }
 
-message Transaction {
-    bytes id = 1;
-
-    // Tablet locating key where this txn record resides in.
-    bytes key = 2;
-
-    // Increase on restart.
-    uint32 epoch = 3;
-
-    // Increase on write.
-    uint32 sequence = 4;
-
-    Timestamp create_ts = 5;
-
-    // Default to create_ts if not pushed forward.
-    Timestamp commit_ts = 6;
-
-    TxnStatus status = 7;
-
-    // Write set to resolve in txn commitment.
-    repeated WriteSpan write_set = 8;
-
-    // Milliseconds that transaction read will fence write.
-    uint32 fence_duration = 10;
+message SequenceRange {
+    uint32 start = 1;
+    uint32 end = 2;
 }
 
-message TxnRecord {
-    bytes id = 1;
-
-    // Tablet locating key where this txn record resides in.
-    bytes key = 2;
-
-    // Increment on transaction restart.
-    uint32 epoch = 3;
-
-    // Timestamp at which point this transaction was created and got timestamp assigned.
-    //
-    // This is required as writes of transaction record and data records are parallel.
-    // In transaction query, it is agnostic whether transaction record has been written.
-    //
-    // * In query, node use this timestamp to decide whether this transaction is aborted or
-    //   has not been created yet.
-    // * In creation, node use this timestamp to decide whether this transaction is able to create.
-    //
-    // This field should never be changed after assigned.
-    Timestamp create_ts = 5;
-
-    // Timestamp at which point this transaction was considered as committed or aborted.
-    //
-    // Fallback to create_ts if None.
-    Timestamp commit_ts = 6;
-
-    TxnStatus status = 7;
-
-    repeated WriteSpan write_set = 8;
-
-    Timestamp heartbeat_ts = 9;
-}
-
+// Unique priority: priority, start_ts, id
 message TxnMeta {
-    bytes id = 1;
+    Uuid id = 1;
 
     // Tablet locating key where this txn record resides in.
     bytes key = 2;
 
     // Increment on transaction restart.
+    //
+    // Changes:
+    // 1. Increments on client initiating transaction restart.
+    // 2. Increments on server transaction restart due to priority/deadlock reason.
     uint32 epoch = 3;
-
-    // Increase on write.
-    uint32 sequence = 4;
 
     // Timestamp at which point this transaction was created and got timestamp assigned.
     //
@@ -269,28 +224,46 @@ message TxnMeta {
     //   has not been created yet.
     // * In creation, node use this timestamp to decide whether this transaction is able to create.
     //
-    // This field should never be changed after assigned.
-    Timestamp create_ts = 5;
+    // This field must never be changed after assigned.
+    Timestamp start_ts = 5;
 
-    // Timestamp at which point this transaction was considered as committed or aborted.
-    //
-    // Fallback to create_ts if None.
-    Timestamp commit_ts = 6;
+    int32 priority = 6;
 }
 
-message TxnIntent {
-    TxnMeta txn = 1;
+message Transaction {
+    TxnMeta meta = 1;
 
-    Value value = 2;
+    TxnStatus status = 3;
 
-    message Intent {
-        Value value = 1;
+    // Timestamp at which point this transaction is trying to read and write.
+    //
+    // Fallback to start_ts if zero.
+    Timestamp commit_ts = 6;
 
-        // Sequence of this intent.
-        uint32 sequence = 2;
-    }
+    // Only set and piggybacked from locating tablet.
+    Timestamp heartbeat_ts = 7;
 
-    repeated Intent history = 4;
+    // Assistant field for local usage.
+    repeated KeySpan write_set = 8;
+
+    // Commit set to resolve in txn abortion and commitment.
+    //
+    // Changes:
+    // 1. Sets in client initiating abortion or commitment, must contain all changes in latest epoch.
+    // 2. Cleared after all write set resolved so replayer knowns that.
+    // 3. Piggybacked resolved ranges.
+    repeated KeySpan commit_set = 9;
+
+    // Piggybacked resolved set for txn abortion and commitment.
+    repeated KeySpan resolved_set = 10;
+
+    // Rollbacked sequences due to savepoint and partial restart/retry.
+    //
+    // Changes:
+    // 1. Appends new sequence range.
+    // 2. Extends last sequence range's `end`.
+    // 3. Clears on epoch bump.
+    repeated SequenceRange rollbacked_sequences = 11;
 }
 
 message TabletDeployRequest {
@@ -329,7 +302,18 @@ message DataRequest {
         PutRequest put = 2;
         IncrementRequest increment = 3;
         FindRequest find = 4;
+        RefreshReadRequest refresh_read = 5;
     }
+}
+
+message ShardRequest {
+    uint64 shard_id = 1;
+    DataRequest request = 2;
+}
+
+message ShardResponse {
+    ShardDescriptor shard = 1;
+    DataResponse response = 2;
 }
 
 message DataResponse {
@@ -338,18 +322,29 @@ message DataResponse {
         PutResponse put = 2;
         IncrementResponse increment = 3;
         FindResponse find = 4;
+        RefreshReadResponse refresh_read = 5;
     }
-}
-
-message WriteSpan {
-    bytes key = 1;
-    bytes end_key = 2;
 }
 
 enum TxnStatus {
     Pending = 0;
-    Committed = 1;
-    Aborted = 2;
+
+    // Terminal status.
+    //
+    // Changes:
+    // 1. Client aborts manually.
+    // 2. Locating server eagerly aborts it if not hear within heartbeat interval.
+    Aborted = 1;
+
+    // Terminal status.
+    //
+    // Changes:
+    // 1. Client proposes commitment to locating tablet.
+    // 2. Locating tablet accepts client commitment proposal.
+    //
+    // Invariants:
+    // 1. Never changed after accepted.
+    Committed = 2;
 }
 
 message BatchRequest {
@@ -357,21 +352,18 @@ message BatchRequest {
 
     Timestamp uncertainty = 2;
 
-    // An atomic transactional batch request could be committed in one phase.
-    // This means that all writes resides in one tablet.
-    bool atomic = 6;
-
     Temporal temporal = 3;
 
-    repeated uint64 shards = 4;
-    repeated DataRequest requests = 5;
+    repeated ShardRequest requests = 5;
 }
 
 message BatchResponse {
-    // Pushed timestamp.
-    Timestamp timestamp = 1;
+    // Updated temporal.
+    Temporal temporal = 1;
 
-    repeated DataResponse responses = 2;
+    // 1. Responses to above requests.
+    // 2. No responses due to txn restart or abortion. Check piggybacked temporal for sure.
+    repeated ShardResponse responses = 2;
 
     repeated TabletDeployment deployments = 3;
 }
@@ -430,6 +422,25 @@ message IncrementResponse {
     int64 value = 1;
 }
 
+// Bump read timestamp.
+message RefreshReadRequest {
+    KeySpan span = 1;
+    Timestamp from = 2;
+}
+
+message RefreshReadResponse {
+}
+
+message ParticipateTxnRequest {
+    Transaction txn = 1;
+    repeated TxnMeta dependents = 2;
+}
+
+message ParticipateTxnResponse {
+    Transaction txn = 1;
+    repeated TxnMeta dependents = 2;
+}
+
 message TabletHeartbeatRequest {
     uint64 tablet_id = 1;
 }
@@ -444,6 +455,8 @@ service TabletService {
     rpc HeartbeatTablet(TabletHeartbeatRequest) returns (TabletHeartbeatResponse);
 
     rpc Batch(BatchRequest) returns (BatchResponse);
+
+    rpc ParticipateTxn(stream ParticipateTxnRequest) returns (stream ParticipateTxnResponse);
 
     rpc Locate(LocateRequest) returns (LocateResponse);
 }

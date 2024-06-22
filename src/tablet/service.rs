@@ -18,15 +18,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 use hashbrown::hash_map::{Entry as HashEntry, HashMap};
 use ignore_result::Ignore;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
-use tonic::{Request, Response, Status};
+use tracing::{debug, trace, warn};
 
 use super::deployer::RangeTabletDeployer;
-use super::types::{TabletRequest, TabletServiceRequest};
+use super::types::{StreamingChannel, TabletRequest, TabletServiceRequest};
 use crate::clock::Clock;
 use crate::cluster::{ClusterEnv, NodeId};
 use crate::protos::{
@@ -35,17 +34,17 @@ use crate::protos::{
     BatchResponse,
     DataMessage,
     DataOperation,
-    LocateRequest,
-    LocateResponse,
+    HasTxnMeta,
     ManifestMessage,
-    TabletDeployRequest,
-    TabletDeployResponse,
+    ParticipateTxnRequest,
+    ParticipateTxnResponse,
+    ShardDescriptor,
+    ShardResponse,
     TabletDeployment,
     TabletDescriptor,
-    TabletHeartbeatRequest,
     TabletHeartbeatResponse,
     TabletId,
-    TabletService,
+    Temporal,
 };
 use crate::tablet::{
     BatchResult,
@@ -53,11 +52,31 @@ use crate::tablet::{
     LeadingTablet,
     LogMessageConsumer,
     ReplicationStage,
+    ReplicationTracker,
+    Request,
     TabletClient,
     TabletLoader,
-    Temporal,
 };
 use crate::utils::{self, DropOwner};
+
+struct BatchResponser {
+    temporal: Temporal,
+    responses: Vec<ShardResponse>,
+    responser: oneshot::Sender<Result<BatchResponse>>,
+}
+
+impl BatchResponser {
+    pub fn send(self) {
+        let Self { temporal, responses, responser } = self;
+        let response = BatchResponse { temporal, responses, deployments: Default::default() };
+        responser.send(Ok(response)).ignore();
+    }
+}
+
+struct WritingBatch {
+    replication: ReplicationTracker,
+    responser: Option<BatchResponser>,
+}
 
 pub struct TabletServiceState {
     node: NodeId,
@@ -72,7 +91,39 @@ enum ServingTablet {
     Follower(FollowingTablet),
 }
 
+impl ServingTablet {
+    pub fn shards(&self) -> (TabletId, Vec<ShardDescriptor>) {
+        let (id, shards) = match self {
+            ServingTablet::Leader(leader) => (leader.id(), leader.shards()),
+            ServingTablet::Follower(follower) => (follower.id(), follower.shards()),
+        };
+        let shards = shards
+            .iter()
+            .map(|shard| ShardDescriptor { id: shard.id, range: shard.range.clone(), tablet_id: id.into() })
+            .collect();
+        (id, shards)
+    }
+}
+
+trait Unify {
+    fn unify(&self);
+}
+
+impl<T> Unify for T {
+    fn unify(&self) {}
+}
+
 impl TabletServiceState {
+    pub fn new(node: NodeId, cluster: ClusterEnv, messager: mpsc::Sender<TabletServiceRequest>) -> Self {
+        let clock = cluster.clock().clone();
+        let loader = TabletLoader::new(cluster.log().clone());
+        Self { node, clock, loader, messager, cluster }
+    }
+
+    pub fn messager(&self) -> &mpsc::Sender<TabletServiceRequest> {
+        &self.messager
+    }
+
     fn deploy(
         self: &Arc<TabletServiceState>,
         mut deployment: TabletDeployment,
@@ -82,7 +133,7 @@ impl TabletServiceState {
         let state = self.clone();
         tokio::spawn(async move {
             if let Err(err) = state.serve(&mut deployment, self_requester, &mut requester).await {
-                tracing::warn!("tablet deployment {:?} quit: {:?}", deployment, err);
+                warn!("tablet deployment {:?} quit: {:?}", deployment, err);
             }
             drop(requester);
             state.messager.send(TabletServiceRequest::UnloadTablet { deployment }).await.ignore();
@@ -102,6 +153,8 @@ impl TabletServiceState {
             Some(0) => ServingTablet::Leader(self.load_leading(deployment, &descriptor).await?),
             Some(_) => ServingTablet::Follower(self.load_following(&descriptor).await?),
         };
+        let (id, shards) = tablet.shards();
+        self.messager.send(TabletServiceRequest::DeployedTablet { id, shards }).await.ignore();
         loop {
             match tablet {
                 ServingTablet::Leader(leader) => {
@@ -125,7 +178,14 @@ impl TabletServiceState {
         deployment: &TabletDeployment,
         descriptor: &TabletDescriptor,
     ) -> Result<LeadingTablet> {
-        self.loader.fence_load_tablet(deployment.epoch, descriptor.manifest_log.as_str()).await
+        self.loader
+            .fence_load_tablet(
+                self.clock.clone(),
+                TabletClient::new(self.cluster.clone()),
+                deployment.epoch,
+                descriptor.manifest_log.as_str(),
+            )
+            .await
     }
 
     async fn load_following(&self, descriptor: &TabletDescriptor) -> Result<FollowingTablet> {
@@ -137,12 +197,8 @@ impl TabletServiceState {
         tablet: &LeadingTablet,
         requester: mpsc::WeakUnboundedSender<TabletRequest>,
     ) -> Option<DropOwner> {
-        let Some(shard_id) = tablet.deployment_shard_id() else {
-            return None;
-        };
-        let Some(requester) = requester.upgrade() else {
-            return None;
-        };
+        let shard_id = tablet.deployment_shard_id()?;
+        let requester = requester.upgrade()?;
         let (drop_owner, drop_watcher) = utils::drop_watcher();
         RangeTabletDeployer::start(tablet.id(), shard_id, self.cluster.clone(), requester, drop_watcher);
         Some(drop_owner)
@@ -169,7 +225,60 @@ impl TabletServiceState {
         let mut writing_batches = VecDeque::with_capacity(128);
 
         let mut next_watermark = tokio::time::sleep(watermark_duration);
+        let mut unblocking_requests = VecDeque::with_capacity(16);
         loop {
+            while let Some(request) = unblocking_requests.pop_front() {
+                let Some(result) = tablet.process_request(request)? else {
+                    continue;
+                };
+
+                match result {
+                    BatchResult::Read { temporal, responses, responser, mut blocker } => {
+                        trace!("batch reads, response: {:?}", responses);
+                        let request_ts = temporal.timestamp();
+                        self.clock.update(request_ts);
+                        match blocker.is_empty() {
+                            true => responser
+                                .send(Ok(BatchResponse { temporal, responses, deployments: Default::default() }))
+                                .ignore(),
+                            false => tokio::spawn(async move {
+                                let stage = blocker.wait().await;
+                                let result = if stage == ReplicationStage::Replicated {
+                                    Ok(BatchResponse { temporal, responses, deployments: Default::default() })
+                                } else {
+                                    assert!(stage == ReplicationStage::Failed);
+                                    Err(anyhow!("replication failed"))
+                                };
+                                responser.send(result).ignore();
+                            })
+                            .unify(),
+                        };
+                        continue;
+                    },
+                    BatchResult::Write { temporal, responses, responser, writes, replication, requests } => {
+                        trace!("batch writes: {:?}, response: {:?}", writes, responses);
+                        let request_ts = temporal.timestamp();
+                        self.clock.update(request_ts);
+                        let message = DataMessage {
+                            temporal: temporal.clone(),
+                            operation: if writes.is_empty() {
+                                None
+                            } else {
+                                Some(DataOperation::Batch(protos::Batch { writes }))
+                            },
+                            ..tablet.new_data_message()
+                        };
+                        tablet.store.producer.queue(&message)?;
+                        writing_batches.push_back(WritingBatch {
+                            replication,
+                            responser: Some(BatchResponser { temporal, responses, responser }),
+                        });
+                        unblocking_requests.extend(requests.into_iter());
+                    },
+                    BatchResult::Error { error, responser } => responser.send(Err(error)).ignore(),
+                };
+            }
+
             select! {
                 _ = unsafe { std::pin::Pin::new_unchecked(&mut next_watermark) } => {
                     let now = self.clock.now();
@@ -189,19 +298,37 @@ impl TabletServiceState {
                 },
                 result = tablet.store.producer.wait() => {
                     let _offset = result?;
-                    let (sequence, BatchResult { ts, responses, mut replication, .. }, responser): (_, _, oneshot::Sender<Result<BatchResponse>>) = writing_batches.pop_front().unwrap();
-                    replication.commit();
-                    let response = BatchResponse {
-                        timestamp: Some(ts),
-                        responses,
-                        deployments: Default::default(),
-                    };
-                    responser.send(Ok(response)).ignore();
-                    tablet.store.cursor.sequence = sequence;
+                    let mut batch = writing_batches.pop_front().unwrap();
+                    batch.replication.commit();
+                    if let Some(responser) = batch.responser {
+                        responser.send();
+                    }
+                },
+                Some(mut txn) = tablet.store.store.updated_txns().recv() => {
+                    let (replication, requests) = tablet.store.store.update_txn(&mut txn);
+                    trace!("unblock txn {}(epoch:{}, {:?}) requests {:?}", txn.id(), txn.epoch(), txn.status(), requests);
+                    unblocking_requests.extend(requests.into_iter());
+                    if let Some(replication) = replication {
+                        self.clock.update(txn.commit_ts());
+                        txn.write_set.clear();
+                        let message = DataMessage {
+                            temporal: Temporal::Transaction(txn),
+                            ..tablet.new_data_message()
+                        };
+                        tablet.store.producer.queue(&message)?;
+                        writing_batches.push_back(WritingBatch {
+                            replication,
+                            responser: None,
+                        });
+                    }
                 },
                 Some(request) = requester.recv() => {
-                    let (batch, responser) = match request {
+                    let (mut batch, responser) = match request {
                         TabletRequest::Batch { batch, responser } => (batch, responser),
+                        TabletRequest::ParticipateTxn { request, channel } => {
+                            tablet.store.store.participate_txn(request, channel);
+                            continue;
+                        },
                         TabletRequest::Deploy { epoch, generation, servers } => {
                             deployment.epoch = epoch;
                             deployment.generation = generation;
@@ -216,61 +343,12 @@ impl TabletServiceState {
                             }
                         },
                     };
-                    tracing::trace!("batch request: {:?}", batch);
-                    let mut temporal = match batch.temporal {
-                        None => Temporal::from(self.clock.now()),
-                        Some(temporal) => Temporal::try_from(temporal)?,
-                    };
-                    let mut result = match tablet.process_batch(&mut temporal, batch.shards, batch.requests) {
-                        Err(err) => {
-                            tracing::trace!("batch error: {:?}", err);
-                            responser.send(Err(err)).ignore();
-                            continue;
-                        },
-                        Ok(result) => result,
-                    };
-
-                    tracing::trace!("batch writes: {:?}, response: {:?}", result.writes, result.responses);
-
-                    let request_ts = temporal.timestamp();
-                    self.clock.update(request_ts);
-                    tablet.update_closed_timestamp(request_ts);
-
-                    let writes = result.take_writes();
-                    if writes.is_empty() {
-                        let BatchResult { ts, mut blocker, responses, .. } = result;
-                        if blocker.is_empty() {
-                            let response = BatchResponse {
-                                timestamp: Some(ts),
-                                responses,
-                                deployments: Default::default(),
-                            };
-                            responser.send(Ok(response)).ignore();
-                        } else {
-                            tokio::spawn(async move {
-                                let stage = blocker.wait().await;
-                                let result = if stage == ReplicationStage::Replicated {
-                                    Ok(BatchResponse {
-                                        timestamp: Some(ts),
-                                        responses,
-                                        deployments: Default::default(),
-                                    })
-                                } else {
-                                    assert!(stage == ReplicationStage::Failed);
-                                    Err(anyhow!("replication failed"))
-                                };
-                                responser.send(result).ignore();
-                            });
-                        }
-                        continue;
+                    trace!("batch request: {:?}", batch);
+                    if batch.temporal == Temporal::default() {
+                        batch.temporal = Temporal::from(self.clock.now());
                     }
-                    let mut message = DataMessage {
-                        operation: Some(DataOperation::Batch(protos::Batch { writes })),
-                        ..tablet.new_data_message()
-                    };
-                    tablet.store.producer.queue(&message)?;
-                    result.writes = message.take_writes();
-                    writing_batches.push_back((message.sequence, result, responser));
+
+                    unblocking_requests.push_back(Request::new(batch, responser));
                 },
             }
         }
@@ -299,12 +377,15 @@ impl TabletServiceState {
                             let result = tablet.query_batch(deployment, batch);
                             responser.send(result).ignore();
                         },
+                        TabletRequest::ParticipateTxn { .. } => {},
                         TabletRequest::Deploy { epoch, generation, servers } => {
                             deployment.update(epoch, generation, servers);
                             match deployment.index(&self.node) {
                                 None => return Ok(None),
                                 Some(0) => {
-                                    return Ok(Some(self.loader.lead_tablet(epoch, descriptor.manifest_log.as_str(), tablet).await?));
+                                    return Ok(Some(self.loader.lead_tablet(
+                self.clock.clone(), TabletClient::new(self.cluster.clone()),
+                                                epoch, descriptor.manifest_log.as_str(), tablet).await?));
                                 },
                                 Some(_) => {},
                             }
@@ -316,14 +397,104 @@ impl TabletServiceState {
     }
 }
 
-pub struct TabletServiceManager {
+#[derive(Default)]
+struct OrderedShards {
+    shards: Vec<ShardDescriptor>,
+    tablets: HashMap<TabletId, Vec<ShardDescriptor>>,
+}
+
+impl OrderedShards {
+    pub fn locate(&self, key: &[u8]) -> Option<&ShardDescriptor> {
+        if let Ok(i) = self.shards.binary_search_by(|shard| shard.range.compare(key)) {
+            return Some(&self.shards[i]);
+        }
+        None
+    }
+
+    pub fn unload_tablet(&mut self, id: TabletId) {
+        let Some(shards) = self.tablets.remove(&id) else {
+            return;
+        };
+        shards.iter().for_each(|shard| self.remove_shard(shard));
+    }
+
+    pub fn install_tablet(&mut self, id: TabletId, shards: Vec<ShardDescriptor>) {
+        match self.tablets.entry(id) {
+            HashEntry::Occupied(mut entry) => {
+                let exists = entry.get_mut();
+                if exists == &shards {
+                    return;
+                }
+                exists.clone_from(&shards);
+            },
+            HashEntry::Vacant(entry) => {
+                entry.insert(shards.clone());
+            },
+        };
+        self.extend(shards);
+    }
+
+    fn remove_shard(&mut self, shard: &ShardDescriptor) {
+        let i = self.shards.partition_point(|x| x.range.end <= shard.range.start);
+        while i < self.shards.len() && self.shards[i].range.is_intersect_with(&shard.range) {
+            self.shards.remove(i);
+        }
+    }
+
+    fn extend(&mut self, shards: Vec<ShardDescriptor>) {
+        if self.shards.is_empty() {
+            self.shards = shards;
+            self.shards.sort_by(|a, b| a.range.start.cmp(&b.range.start));
+            return;
+        }
+        for shard in shards.into_iter() {
+            let i = self.shards.partition_point(|x| x.range.end <= shard.range.start);
+            while i < self.shards.len() && self.shards[i].is_predecessor_of(&shard) {
+                self.shards.remove(i);
+            }
+            self.shards.insert(i, shard);
+        }
+    }
+}
+
+pub(super) struct TabletServiceManager {
     state: Arc<TabletServiceState>,
+    shards: OrderedShards,
     tablets: HashMap<TabletId, (TabletDeployment, mpsc::UnboundedSender<TabletRequest>)>,
 }
 
 impl TabletServiceManager {
-    fn new(state: Arc<TabletServiceState>) -> Self {
-        Self { state, tablets: HashMap::with_capacity(128) }
+    pub fn new(state: Arc<TabletServiceState>) -> Self {
+        Self { state, shards: Default::default(), tablets: HashMap::with_capacity(128) }
+    }
+
+    fn participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        channel: StreamingChannel<ParticipateTxnRequest, ParticipateTxnResponse>,
+        responser: oneshot::Sender<Result<()>>,
+    ) {
+        let Some(shard) = self.shards.locate(request.txn.key()) else {
+            debug!("no shard to participate txn {} key: {:?}", request.txn.id(), request.txn.key());
+            return;
+        };
+        trace!(
+            "route to tablet {} to participate txn {} key: {:?}",
+            shard.tablet_id,
+            request.txn.id(),
+            request.txn.key()
+        );
+        if let Some((_, requester)) = self.tablets.get(&shard.tablet_id) {
+            let request = TabletRequest::ParticipateTxn { request, channel };
+            if requester.send(request).is_err() {
+                responser.send(Err(anyhow!("tablet {} closed", shard.tablet_id))).ignore();
+                return;
+            }
+        } else {
+            responser.send(Err(anyhow!("tablet {} not found", shard.tablet_id))).ignore();
+            return;
+        }
+        responser.send(Ok(())).ignore();
     }
 
     fn apply_batch(&mut self, batch: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>>) {
@@ -338,6 +509,7 @@ impl TabletServiceManager {
     }
 
     fn unload_tablet(&mut self, deployment: TabletDeployment) {
+        self.shards.unload_tablet(deployment.id.into());
         self.tablets.remove(&deployment.id);
     }
 
@@ -375,101 +547,23 @@ impl TabletServiceManager {
         }
     }
 
-    async fn serve(&mut self, mut requester: mpsc::Receiver<TabletServiceRequest>) {
+    pub async fn serve(&mut self, mut requester: mpsc::Receiver<TabletServiceRequest>) {
         while let Some(request) = requester.recv().await {
             match request {
                 TabletServiceRequest::DeployTablet { deployment, responser } => {
                     let result = self.deploy_tablet(deployment);
                     responser.send(result).ignore();
                 },
+                TabletServiceRequest::DeployedTablet { id, shards } => self.shards.install_tablet(id, shards),
                 TabletServiceRequest::HeartbeatTablet { tablet_id, responser } => {
                     self.heartbeat_tablet(tablet_id, responser)
                 },
                 TabletServiceRequest::UnloadTablet { deployment } => self.unload_tablet(deployment),
                 TabletServiceRequest::Batch { batch, responser } => self.apply_batch(batch, responser),
+                TabletServiceRequest::ParticipateTxn { request, channel, responser } => {
+                    self.participate_txn(request, channel, responser)
+                },
             }
         }
-    }
-}
-
-pub struct TabletServiceImpl {
-    state: Arc<TabletServiceState>,
-    client: TabletClient,
-}
-
-unsafe impl Send for TabletServiceImpl {}
-unsafe impl Sync for TabletServiceImpl {}
-
-impl TabletServiceImpl {
-    pub fn new(node: NodeId, cluster: ClusterEnv) -> Self {
-        let (requester, receiver) = mpsc::channel(5000);
-        let state = Arc::new(TabletServiceState {
-            node,
-            clock: cluster.clock().clone(),
-            loader: TabletLoader::new(cluster.log().clone()),
-            messager: requester,
-            cluster: cluster.clone(),
-        });
-        tokio::spawn({
-            let mut manager = TabletServiceManager::new(state.clone());
-            async move {
-                manager.serve(receiver).await;
-            }
-        });
-        let client = TabletClient::new(cluster);
-        Self { state, client }
-    }
-
-    async fn request<T>(&self, request: TabletServiceRequest, receiver: oneshot::Receiver<T>) -> Result<T, Status> {
-        self.state.messager.send(request).await.map_err(|_| Status::unavailable("service shutdown"))?;
-        receiver.await.map_err(|_| Status::unavailable("service shutdown"))
-    }
-
-    async fn request_result<T>(
-        &self,
-        request: TabletServiceRequest,
-        receiver: oneshot::Receiver<Result<T>>,
-    ) -> Result<T, Status> {
-        self.request(request, receiver).await?.map_err(|e| Status::invalid_argument(e.to_string()))
-    }
-}
-
-#[async_trait]
-impl TabletService for TabletServiceImpl {
-    async fn deploy_tablet(
-        &self,
-        request: Request<TabletDeployRequest>,
-    ) -> Result<Response<TabletDeployResponse>, Status> {
-        let deployment = request.into_inner().deployment;
-        let (sender, receiver) = oneshot::channel();
-        let deployments =
-            self.request_result(TabletServiceRequest::DeployTablet { deployment, responser: sender }, receiver).await?;
-        Ok(Response::new(TabletDeployResponse { deployments }))
-    }
-
-    async fn heartbeat_tablet(
-        &self,
-        request: Request<TabletHeartbeatRequest>,
-    ) -> Result<Response<TabletHeartbeatResponse>, Status> {
-        let (sender, receiver) = oneshot::channel();
-        let tablet_id = request.into_inner().tablet_id.into();
-        let response =
-            self.request(TabletServiceRequest::HeartbeatTablet { tablet_id, responser: sender }, receiver).await?;
-        Ok(Response::new(response))
-    }
-
-    async fn batch(&self, request: Request<BatchRequest>) -> Result<Response<BatchResponse>, Status> {
-        let (sender, receiver) = oneshot::channel();
-        let response = self
-            .request_result(TabletServiceRequest::Batch { batch: request.into_inner(), responser: sender }, receiver)
-            .await?;
-        Ok(Response::new(response))
-    }
-
-    async fn locate(&self, request: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
-        let query = request.into_inner();
-        let deployment = self.client.locate(query.key).await?;
-        let reply = LocateResponse { shard: deployment.shard().clone(), deployment: deployment.deployment().clone() };
-        Ok(Response::new(reply))
     }
 }

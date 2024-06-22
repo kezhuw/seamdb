@@ -1,3 +1,12 @@
+#[derive(Copy, Eq, Hash, PartialOrd, Ord)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Uuid {
+    #[prost(fixed64, tag = "1")]
+    pub msb: u64,
+    #[prost(fixed64, tag = "2")]
+    pub lsb: u64,
+}
 #[derive(Copy, Eq, PartialOrd, Ord)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -13,6 +22,15 @@ pub struct MessageId {
 pub struct KeyRange {
     #[prost(bytes = "vec", tag = "1")]
     pub start: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub end: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KeySpan {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    /// Empty if this is a single key span.
     #[prost(bytes = "vec", tag = "2")]
     pub end: ::prost::alloc::vec::Vec<u8>,
 }
@@ -45,11 +63,6 @@ pub struct ShardDepot {
 pub struct ShardDescriptor {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    /// Increment on each split/merge.
-    ///
-    /// XXX: What if a query arrive after range split ?
-    #[prost(uint64, tag = "2")]
-    pub generation: u64,
     #[prost(message, required, tag = "3")]
     pub range: KeyRange,
     #[prost(uint64, tag = "4")]
@@ -60,8 +73,6 @@ pub struct ShardDescriptor {
 pub struct ShardDescription {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(uint64, tag = "2")]
-    pub generation: u64,
     #[prost(message, required, tag = "3")]
     pub range: KeyRange,
     #[prost(message, repeated, tag = "4")]
@@ -224,8 +235,8 @@ pub struct DataMessage {
     /// Sequence for deduplication.
     #[prost(uint64, tag = "2")]
     pub sequence: u64,
-    #[prost(message, optional, tag = "3")]
-    pub temporal: ::core::option::Option<Temporal>,
+    #[prost(message, required, tag = "3")]
+    pub temporal: Temporal,
     #[prost(message, optional, tag = "6")]
     pub closed_timestamp: ::core::option::Option<Timestamp>,
     #[prost(message, optional, tag = "7")]
@@ -246,83 +257,31 @@ pub mod data_message {
         Batch(super::Batch),
     }
 }
+#[derive(Copy)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Transaction {
-    #[prost(bytes = "vec", tag = "1")]
-    pub id: ::prost::alloc::vec::Vec<u8>,
-    /// Tablet locating key where this txn record resides in.
-    #[prost(bytes = "vec", tag = "2")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
-    /// Increase on restart.
-    #[prost(uint32, tag = "3")]
-    pub epoch: u32,
-    /// Increase on write.
-    #[prost(uint32, tag = "4")]
-    pub sequence: u32,
-    #[prost(message, required, tag = "5")]
-    pub create_ts: Timestamp,
-    /// Default to create_ts if not pushed forward.
-    #[prost(message, optional, tag = "6")]
-    pub commit_ts: ::core::option::Option<Timestamp>,
-    #[prost(enumeration = "!TxnStatus", tag = "7")]
-    pub status: TxnStatus,
-    /// Write set to resolve in txn commitment.
-    #[prost(message, repeated, tag = "8")]
-    pub write_set: ::prost::alloc::vec::Vec<WriteSpan>,
-    /// Milliseconds that transaction read will fence write.
-    #[prost(uint32, tag = "10")]
-    pub fence_duration: u32,
+pub struct SequenceRange {
+    #[prost(uint32, tag = "1")]
+    pub start: u32,
+    #[prost(uint32, tag = "2")]
+    pub end: u32,
 }
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TxnRecord {
-    #[prost(bytes = "vec", tag = "1")]
-    pub id: ::prost::alloc::vec::Vec<u8>,
-    /// Tablet locating key where this txn record resides in.
-    #[prost(bytes = "vec", tag = "2")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
-    /// Increment on transaction restart.
-    #[prost(uint32, tag = "3")]
-    pub epoch: u32,
-    /// Timestamp at which point this transaction was created and got timestamp assigned.
-    ///
-    /// This is required as writes of transaction record and data records are parallel.
-    /// In transaction query, it is agnostic whether transaction record has been written.
-    ///
-    /// * In query, node use this timestamp to decide whether this transaction is aborted or
-    ///    has not been created yet.
-    /// * In creation, node use this timestamp to decide whether this transaction is able to create.
-    ///
-    /// This field should never be changed after assigned.
-    #[prost(message, required, tag = "5")]
-    pub create_ts: Timestamp,
-    /// Timestamp at which point this transaction was considered as committed or aborted.
-    ///
-    /// Fallback to create_ts if None.
-    #[prost(message, optional, tag = "6")]
-    pub commit_ts: ::core::option::Option<Timestamp>,
-    #[prost(enumeration = "!TxnStatus", tag = "7")]
-    pub status: TxnStatus,
-    #[prost(message, repeated, tag = "8")]
-    pub write_set: ::prost::alloc::vec::Vec<WriteSpan>,
-    #[prost(message, optional, tag = "9")]
-    pub heartbeat_ts: ::core::option::Option<Timestamp>,
-}
+/// Unique priority: priority, start_ts, id
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnMeta {
-    #[prost(bytes = "vec", tag = "1")]
-    pub id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, required, tag = "1")]
+    pub id: Uuid,
     /// Tablet locating key where this txn record resides in.
     #[prost(bytes = "vec", tag = "2")]
     pub key: ::prost::alloc::vec::Vec<u8>,
     /// Increment on transaction restart.
+    ///
+    /// Changes:
+    /// 1. Increments on client initiating transaction restart.
+    /// 2. Increments on server transaction restart due to priority/deadlock reason.
     #[prost(uint32, tag = "3")]
     pub epoch: u32,
-    /// Increase on write.
-    #[prost(uint32, tag = "4")]
-    pub sequence: u32,
     /// Timestamp at which point this transaction was created and got timestamp assigned.
     ///
     /// This is required as writes of transaction record and data records are parallel.
@@ -332,36 +291,49 @@ pub struct TxnMeta {
     ///    has not been created yet.
     /// * In creation, node use this timestamp to decide whether this transaction is able to create.
     ///
-    /// This field should never be changed after assigned.
+    /// This field must never be changed after assigned.
     #[prost(message, required, tag = "5")]
-    pub create_ts: Timestamp,
-    /// Timestamp at which point this transaction was considered as committed or aborted.
-    ///
-    /// Fallback to create_ts if None.
-    #[prost(message, optional, tag = "6")]
-    pub commit_ts: ::core::option::Option<Timestamp>,
+    pub start_ts: Timestamp,
+    #[prost(int32, tag = "6")]
+    pub priority: i32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TxnIntent {
-    #[prost(message, optional, tag = "1")]
-    pub txn: ::core::option::Option<TxnMeta>,
-    #[prost(message, optional, tag = "2")]
-    pub value: ::core::option::Option<Value>,
-    #[prost(message, repeated, tag = "4")]
-    pub history: ::prost::alloc::vec::Vec<txn_intent::Intent>,
-}
-/// Nested message and enum types in `TxnIntent`.
-pub mod txn_intent {
-    #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct Intent {
-        #[prost(message, optional, tag = "1")]
-        pub value: ::core::option::Option<super::Value>,
-        /// Sequence of this intent.
-        #[prost(uint32, tag = "2")]
-        pub sequence: u32,
-    }
+pub struct Transaction {
+    #[prost(message, required, tag = "1")]
+    pub meta: TxnMeta,
+    #[prost(enumeration = "!TxnStatus", tag = "3")]
+    pub status: TxnStatus,
+    /// Timestamp at which point this transaction is trying to read and write.
+    ///
+    /// Fallback to start_ts if zero.
+    #[prost(message, required, tag = "6")]
+    pub commit_ts: Timestamp,
+    /// Only set and piggybacked from locating tablet.
+    #[prost(message, required, tag = "7")]
+    pub heartbeat_ts: Timestamp,
+    /// Assistant field for local usage.
+    #[prost(message, repeated, tag = "8")]
+    pub write_set: ::prost::alloc::vec::Vec<KeySpan>,
+    /// Commit set to resolve in txn abortion and commitment.
+    ///
+    /// Changes:
+    /// 1. Sets in client initiating abortion or commitment, must contain all changes in latest epoch.
+    /// 2. Cleared after all write set resolved so replayer knowns that.
+    /// 3. Piggybacked resolved ranges.
+    #[prost(message, repeated, tag = "9")]
+    pub commit_set: ::prost::alloc::vec::Vec<KeySpan>,
+    /// Piggybacked resolved set for txn abortion and commitment.
+    #[prost(message, repeated, tag = "10")]
+    pub resolved_set: ::prost::alloc::vec::Vec<KeySpan>,
+    /// Rollbacked sequences due to savepoint and partial restart/retry.
+    ///
+    /// Changes:
+    /// 1. Appends new sequence range.
+    /// 2. Extends last sequence range's `end`.
+    /// 3. Clears on epoch bump.
+    #[prost(message, repeated, tag = "11")]
+    pub rollbacked_sequences: ::prost::alloc::vec::Vec<SequenceRange>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -420,6 +392,24 @@ pub enum DataRequest {
     Increment(IncrementRequest),
     #[prost(message, tag = "4")]
     Find(FindRequest),
+    #[prost(message, tag = "5")]
+    RefreshRead(RefreshReadRequest),
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardRequest {
+    #[prost(uint64, tag = "1")]
+    pub shard_id: u64,
+    #[prost(message, required, tag = "2")]
+    pub request: DataRequest,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardResponse {
+    #[prost(message, optional, tag = "1")]
+    pub shard: ::core::option::Option<ShardDescriptor>,
+    #[prost(message, required, tag = "2")]
+    pub response: DataResponse,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -432,14 +422,8 @@ pub enum DataResponse {
     Increment(IncrementResponse),
     #[prost(message, tag = "4")]
     Find(FindResponse),
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WriteSpan {
-    #[prost(bytes = "vec", tag = "1")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub end_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, tag = "5")]
+    RefreshRead(RefreshReadResponse),
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -448,25 +432,21 @@ pub struct BatchRequest {
     pub tablet_id: u64,
     #[prost(message, optional, tag = "2")]
     pub uncertainty: ::core::option::Option<Timestamp>,
-    /// An atomic transactional batch request could be committed in one phase.
-    /// This means that all writes resides in one tablet.
-    #[prost(bool, tag = "6")]
-    pub atomic: bool,
-    #[prost(message, optional, tag = "3")]
-    pub temporal: ::core::option::Option<Temporal>,
-    #[prost(uint64, repeated, tag = "4")]
-    pub shards: ::prost::alloc::vec::Vec<u64>,
+    #[prost(message, required, tag = "3")]
+    pub temporal: Temporal,
     #[prost(message, repeated, tag = "5")]
-    pub requests: ::prost::alloc::vec::Vec<DataRequest>,
+    pub requests: ::prost::alloc::vec::Vec<ShardRequest>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BatchResponse {
-    /// Pushed timestamp.
-    #[prost(message, optional, tag = "1")]
-    pub timestamp: ::core::option::Option<Timestamp>,
+    /// Updated temporal.
+    #[prost(message, required, tag = "1")]
+    pub temporal: Temporal,
+    /// 1. Responses to above requests.
+    /// 2. No responses due to txn restart or abortion. Check piggybacked temporal for sure.
     #[prost(message, repeated, tag = "2")]
-    pub responses: ::prost::alloc::vec::Vec<DataResponse>,
+    pub responses: ::prost::alloc::vec::Vec<ShardResponse>,
     #[prost(message, repeated, tag = "3")]
     pub deployments: ::prost::alloc::vec::Vec<TabletDeployment>,
 }
@@ -552,6 +532,34 @@ pub struct IncrementResponse {
     #[prost(int64, tag = "1")]
     pub value: i64,
 }
+/// Bump read timestamp.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefreshReadRequest {
+    #[prost(message, required, tag = "1")]
+    pub span: KeySpan,
+    #[prost(message, required, tag = "2")]
+    pub from: Timestamp,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefreshReadResponse {}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParticipateTxnRequest {
+    #[prost(message, required, tag = "1")]
+    pub txn: Transaction,
+    #[prost(message, repeated, tag = "2")]
+    pub dependents: ::prost::alloc::vec::Vec<TxnMeta>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParticipateTxnResponse {
+    #[prost(message, required, tag = "1")]
+    pub txn: Transaction,
+    #[prost(message, repeated, tag = "2")]
+    pub dependents: ::prost::alloc::vec::Vec<TxnMeta>,
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletHeartbeatRequest {
@@ -601,8 +609,21 @@ impl ShardMergeBounds {
 #[repr(i32)]
 pub enum TxnStatus {
     Pending = 0,
-    Committed = 1,
-    Aborted = 2,
+    /// Terminal status.
+    ///
+    /// Changes:
+    /// 1. Client aborts manually.
+    /// 2. Locating server eagerly aborts it if not hear within heartbeat interval.
+    Aborted = 1,
+    /// Terminal status.
+    ///
+    /// Changes:
+    /// 1. Client proposes commitment to locating tablet.
+    /// 2. Locating tablet accepts client commitment proposal.
+    ///
+    /// Invariants:
+    /// 1. Never changed after accepted.
+    Committed = 2,
 }
 impl TxnStatus {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -612,16 +633,16 @@ impl TxnStatus {
     pub fn as_str_name(&self) -> &'static str {
         match self {
             TxnStatus::Pending => "Pending",
-            TxnStatus::Committed => "Committed",
             TxnStatus::Aborted => "Aborted",
+            TxnStatus::Committed => "Committed",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
             "Pending" => Some(Self::Pending),
-            "Committed" => Some(Self::Committed),
             "Aborted" => Some(Self::Aborted),
+            "Committed" => Some(Self::Committed),
             _ => None,
         }
     }
@@ -783,6 +804,33 @@ pub mod tablet_service_client {
                 .insert(GrpcMethod::new("seamdb.TabletService", "Batch"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn participate_txn(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::ParticipateTxnRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ParticipateTxnResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/seamdb.TabletService/ParticipateTxn",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("seamdb.TabletService", "ParticipateTxn"));
+            self.inner.streaming(req, path, codec).await
+        }
         pub async fn locate(
             &mut self,
             request: impl tonic::IntoRequest<super::LocateRequest>,
@@ -832,6 +880,19 @@ pub mod tablet_service_server {
             &self,
             request: tonic::Request<super::BatchRequest>,
         ) -> std::result::Result<tonic::Response<super::BatchResponse>, tonic::Status>;
+        /// Server streaming response type for the ParticipateTxn method.
+        type ParticipateTxnStream: futures_core::Stream<
+                Item = std::result::Result<super::ParticipateTxnResponse, tonic::Status>,
+            >
+            + Send
+            + 'static;
+        async fn participate_txn(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::ParticipateTxnRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ParticipateTxnStream>,
+            tonic::Status,
+        >;
         async fn locate(
             &self,
             request: tonic::Request<super::LocateRequest>,
@@ -1047,6 +1108,55 @@ pub mod tablet_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/seamdb.TabletService/ParticipateTxn" => {
+                    #[allow(non_camel_case_types)]
+                    struct ParticipateTxnSvc<T: TabletService>(pub Arc<T>);
+                    impl<
+                        T: TabletService,
+                    > tonic::server::StreamingService<super::ParticipateTxnRequest>
+                    for ParticipateTxnSvc<T> {
+                        type Response = super::ParticipateTxnResponse;
+                        type ResponseStream = T::ParticipateTxnStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::ParticipateTxnRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                (*inner).participate_txn(request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ParticipateTxnSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

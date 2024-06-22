@@ -15,7 +15,6 @@
 use std::time::Duration;
 
 use ignore_result::Ignore;
-use scopeguard::defer;
 use tokio::net::TcpListener;
 use tonic::transport::server::{Server, TcpIncoming};
 
@@ -34,14 +33,12 @@ impl TabletNode {
         let service = TabletServiceImpl::new(id, cluster);
         let (_drop_owner, mut drop_watcher) = utils::drop_watcher();
         tokio::spawn(async move {
-            defer! {
-                drop(lease);
-            }
             Server::builder()
                 .add_service(TabletServiceServer::new(service))
                 .serve_with_incoming_shutdown(incoming, async move { drop_watcher.dropped().await })
                 .await
                 .ignore();
+            drop(lease);
         });
         Self { _drop_owner }
     }

@@ -17,20 +17,21 @@ use std::ops::RangeFrom;
 
 use anyhow::Result;
 
-use super::store::DataStore;
-use super::types::{Temporal, Timestamp, TimestampedValue, Value};
+use super::provision::{TimestampedValue, Value};
+use super::store::Store;
+use crate::protos::Timestamp;
 
 #[derive(Default)]
 pub struct MemoryStore {
     table: MemoryTable<Timestamp, Value>,
 }
 
-impl DataStore for MemoryStore {
-    fn get(&self, temporal: &Temporal, key: &[u8]) -> Result<TimestampedValue> {
-        let Some((ts, value)) = self.table.get(key, temporal.timestamp()) else {
+impl Store for MemoryStore {
+    fn get(&self, key: &[u8], ts: Timestamp) -> Result<TimestampedValue> {
+        let Some((ts, value)) = self.table.get(key, ts) else {
             return Ok(TimestampedValue::default());
         };
-        Ok(TimestampedValue::new(ts, value).adjust_timestamp())
+        Ok(TimestampedValue::new(ts, value))
     }
 
     fn put(&mut self, key: Vec<u8>, ts: Timestamp, value: Value) -> Result<()> {
@@ -38,11 +39,11 @@ impl DataStore for MemoryStore {
         Ok(())
     }
 
-    fn find(&self, key: &[u8], temporal: &Temporal) -> Result<(Vec<u8>, TimestampedValue)> {
-        let Some((key, ts, value)) = self.table.find(key, temporal.timestamp()) else {
-            return Ok((key.to_owned(), TimestampedValue::default()));
+    fn find(&self, key: &[u8], ts: Timestamp) -> Result<(Vec<u8>, TimestampedValue)> {
+        let Some((key, ts, value)) = self.table.find(key, ts) else {
+            return Ok((vec![], TimestampedValue::default()));
         };
-        Ok((key.to_owned(), TimestampedValue::new(ts, value).adjust_timestamp()))
+        Ok((key.to_owned(), TimestampedValue::new(ts, value)))
     }
 }
 
@@ -56,10 +57,12 @@ impl<S: Copy + Ord + std::fmt::Debug, V: Clone + std::fmt::Debug> MemoryTable<S,
         std::mem::take(&mut self.map)
     }
 
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     pub fn get(&self, key: &[u8], seq: S) -> Option<(S, V)> {
-        let Some(values) = self.map.get(key) else {
-            return None;
-        };
+        let values = self.map.get(key)?;
         for (s, v) in values.iter().rev() {
             if *s <= seq {
                 return Some((*s, v.clone()));
