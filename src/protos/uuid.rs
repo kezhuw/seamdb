@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
 
 use super::Uuid;
 
@@ -36,8 +36,14 @@ impl From<Uuid> for uuid::Uuid {
     }
 }
 
+impl Debug for Uuid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&uuid::Uuid::from(*self), f)
+    }
+}
+
 impl Display for Uuid {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        uuid::Uuid::from(*self).fmt(f)
+        Display::fmt(&uuid::Uuid::from(*self), f)
     }
 }

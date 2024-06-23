@@ -36,12 +36,10 @@ fn main() {
 
     let mut config = prost_build::Config::new();
     config
-        .type_attribute("Timestamp", "#[derive(Copy, Eq, PartialOrd, Ord)]")
-        .type_attribute("MessageId", "#[derive(Copy, Eq, PartialOrd, Ord)]")
-        .type_attribute("TabletWatermark", "#[derive(Copy)]")
-        .type_attribute("SequenceRange", "#[derive(Copy)]")
-        .type_attribute("TxnStatus", "#[derive(::num_enum::TryFromPrimitive)]")
-        .type_attribute("Uuid", "#[derive(Copy, Eq, Hash, PartialOrd, Ord)]")
+        .skip_debug(std::iter::once("Uuid"))
+        .type_attribute("Timestamp", "#[derive(Eq, PartialOrd, Ord)]")
+        .type_attribute("MessageId", "#[derive(Eq, PartialOrd, Ord)]")
+        .type_attribute("Uuid", "#[derive(Eq, Hash, PartialOrd, Ord)]")
         .oneof_enum("Value")
         .oneof_enum("Temporal")
         .oneof_enum("DataRequest")
