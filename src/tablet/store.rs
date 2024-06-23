@@ -656,9 +656,7 @@ impl TxnProvision {
             return entry.get().clone();
         }
         let outdated_txn = entry.remove();
-        for span in &outdated_txn.write_set {
-            self.intents.remove(&span.key);
-        }
+        self.remove_intents(&outdated_txn.write_set);
         TxnRecord::new(txn.clone())
     }
 
@@ -718,6 +716,12 @@ impl TxnProvision {
         }
     }
 
+    fn remove_intents(&mut self, spans: &[KeySpan]) {
+        for span in spans {
+            self.intents.remove(&span.key);
+        }
+    }
+
     fn get_intent(&self, context: &BatchContext, key: &[u8]) -> Option<&TxnIntent> {
         if let Some(intent) = context.cache.transactional.get(key) {
             return Some(unsafe { std::mem::transmute(intent) });
@@ -758,12 +762,16 @@ impl TxnProvision {
         txn: &Transaction,
         self_update: bool,
     ) {
-        if txn.status == TxnStatus::Pending {
-            return;
-        }
         let HashEntry::Occupied(mut entry) = self.transactions.entry(txn.id()) else {
             return;
         };
+        if txn.status == TxnStatus::Pending {
+            if txn.epoch() > entry.get().epoch() {
+                let record = entry.remove();
+                self.remove_intents(&record.write_set);
+            }
+            return;
+        }
 
         let current = entry.get_mut();
         if !current.commit_set.is_empty() && txn.commit_set.is_empty() && !self_update {
@@ -1100,11 +1108,11 @@ impl TxnTabletStore {
     }
 
     pub fn update_txn(&mut self, txn: &mut Transaction) -> (Option<ReplicationTracker>, Vec<Request>) {
-        let Some(requests) = self.txn_table.update_txn(txn, false) else {
+        let Some(requests) = self.txn_table.update_txn(txn, true) else {
             return (None, vec![]);
         };
         let mut tracker = ReplicationTracker::default();
-        self.store.resolve(&mut tracker, txn, false);
+        self.store.resolve(&mut tracker, txn, true);
         (Some(tracker), requests)
     }
 
@@ -1132,8 +1140,8 @@ impl TxnTabletStore {
             Ok(responses) => responses,
         };
         let requests = if let Temporal::Transaction(txn) = &mut temporal {
-            self.store.resolve(&mut context.replication, txn, true);
-            self.txn_table.update_txn(txn, true).unwrap_or_default()
+            self.store.resolve(&mut context.replication, txn, false);
+            self.txn_table.update_txn(txn, false).unwrap_or_default()
         } else {
             vec![]
         };
