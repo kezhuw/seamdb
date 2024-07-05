@@ -729,6 +729,69 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     #[tracing_test::traced_test]
+    async fn tablet_client_transactional_read_your_write() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let locating_key = keys::user_key(b"count");
+        let deployment = client.locate(&locating_key).await.unwrap();
+        let (tablet_id, mut tablet_client) = client.tablet_client(&locating_key).await.unwrap();
+        let txn = client.new_transaction(locating_key);
+        tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: deployment.shard_id().into(),
+                    request: DataRequest::Increment(IncrementRequest {
+                        key: keys::user_key(b"count"),
+                        increment: 5,
+                        sequence: 1,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let get = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(txn.clone()),
+                requests: vec![ShardRequest {
+                    shard_id: deployment.shard_id().into(),
+                    request: DataRequest::Get(GetRequest { key: keys::user_key(b"count"), sequence: 1 }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .into_get()
+            .unwrap();
+        assert_eq!(get.value.unwrap().value, Value::Int(5));
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
     async fn tablet_client_transactional_once() {
         let etcd = etcd_container();
         let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
