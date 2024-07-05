@@ -307,9 +307,12 @@ impl LockTable {
             for (_end, lock) in range {
                 match span.compare(lock.span.as_ref()) {
                     Less => continue 'next_write_span,
-                    Equal => {
-                        lock.block_txn(participant, request);
-                        return None;
+                    Equal => match lock.owner.id() == participant.txn.id() {
+                        true => continue 'next_write_span,
+                        false => {
+                            lock.block_txn(participant, request);
+                            return None;
+                        },
                     },
                     Greater => continue,
                 }
