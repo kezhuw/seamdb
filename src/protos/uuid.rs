@@ -17,9 +17,37 @@ use std::fmt::{self, Debug, Display, Formatter};
 use super::Uuid;
 
 impl Uuid {
+    pub fn nil() -> Self {
+        Self { lsb: 0, msb: 0 }
+    }
+
+    pub fn max() -> Self {
+        Self { lsb: u64::MAX, msb: u64::MAX }
+    }
+
+    pub fn is_nil(self) -> bool {
+        self.lsb == 0 && self.msb == 0
+    }
+
     pub fn new_random() -> Self {
         let id = uuid::Uuid::new_v4();
         id.into()
+    }
+
+    pub fn xor(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::max()
+        }
+    }
+
+    pub fn normalize(self) -> Self {
+        if self == Self::max() {
+            Self::nil()
+        } else {
+            self
+        }
     }
 }
 

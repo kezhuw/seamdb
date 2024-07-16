@@ -114,6 +114,14 @@ impl Timestamp {
     pub fn into_physical(self) -> Self {
         Self { logical: 0, ..self }
     }
+
+    pub fn next(self) -> Self {
+        if self.logical < u32::MAX {
+            return Self { logical: self.logical + 1, ..self };
+        }
+        let duration = Duration::new(self.seconds, self.nanoseconds) + Duration::new(0, 1);
+        Self { seconds: duration.as_secs(), nanoseconds: duration.subsec_nanos(), logical: 0 }
+    }
 }
 
 impl Add<Duration> for Timestamp {

@@ -1635,4 +1635,341 @@ mod tests {
         let (_ts, value) = client.get(b"counter").await.unwrap().unwrap();
         assert_eq!(value, Value::Int(50));
     }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_write_beneath_closed_timestamp() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+
+        let write_ts = client.now();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let counter_key = keys::user_key(b"counter");
+
+        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+
+        let response = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Timestamp(write_ts),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Put(PutRequest {
+                        key: counter_key.clone(),
+                        value: Some(Value::Int(1)),
+                        sequence: 0,
+                        expect_ts: None,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let written_ts = response.temporal.timestamp();
+        assert_that!(written_ts).is_greater_than(write_ts);
+        assert_that!(response.into_put().unwrap().write_ts).is_equal_to(written_ts);
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_timestamped_write_push_forward() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let counter_key = keys::user_key(b"counter");
+
+        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+
+        let write_ts = client.now();
+        let not_found_read_ts = client.now();
+        assert_that!(not_found_read_ts).is_greater_than(write_ts);
+
+        tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Timestamp(not_found_read_ts),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Get(GetRequest { key: counter_key.clone(), sequence: 0 }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let response = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Timestamp(write_ts),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Put(PutRequest {
+                        key: counter_key.clone(),
+                        value: Some(Value::Int(1)),
+                        sequence: 0,
+                        expect_ts: None,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let written_ts = response.temporal.timestamp();
+        assert_that!(written_ts).is_greater_than(write_ts);
+        assert_that!(response.into_put().unwrap().write_ts).is_equal_to(written_ts);
+
+        let write_ts = client.now();
+        let read_ts = client.now();
+        assert_that!(read_ts).is_greater_than(write_ts);
+
+        let read_value = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Timestamp(read_ts),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Get(GetRequest { key: counter_key.clone(), sequence: 0 }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .into_get()
+            .unwrap()
+            .value
+            .unwrap();
+        assert_that!(read_value.value).is_equal_to(Value::Int(1));
+        assert_that!(read_value.timestamp).is_equal_to(written_ts);
+
+        let response = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Timestamp(write_ts),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Put(PutRequest {
+                        key: counter_key.clone(),
+                        value: Some(Value::Int(2)),
+                        sequence: 0,
+                        expect_ts: None,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let written_ts = response.temporal.timestamp();
+        assert_that!(written_ts).is_greater_than(write_ts);
+        assert_that!(response.into_put().unwrap().write_ts).is_equal_to(written_ts);
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_write_push_forward() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let counter_key = keys::user_key(b"counter");
+        let txn = client.new_transaction(counter_key.clone());
+
+        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+
+        let not_found_read_ts = client.now();
+        let write_ts = txn.commit_ts();
+        assert_that!(not_found_read_ts).is_greater_than(write_ts);
+
+        tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Timestamp(not_found_read_ts),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Get(GetRequest { key: counter_key.clone(), sequence: 0 }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut response = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(txn),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Put(PutRequest {
+                        key: counter_key.clone(),
+                        value: Some(Value::Int(1)),
+                        sequence: 0,
+                        expect_ts: None,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let txn = std::mem::take(&mut response.temporal).into_transaction();
+        let written_ts = txn.commit_ts();
+        assert_that!(written_ts).is_greater_than(write_ts);
+
+        tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(Transaction { status: TxnStatus::Committed, ..txn }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        let read_value = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Get(GetRequest { key: counter_key.clone(), sequence: 0 }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .into_get()
+            .unwrap()
+            .value
+            .unwrap();
+        assert_that!(read_value.value).is_equal_to(Value::Int(1));
+        assert_that!(read_value.timestamp).is_equal_to(written_ts);
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn tablet_client_transactional_commit_push_forward() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let counter_key = keys::user_key(b"counter");
+        let txn = client.new_transaction(counter_key.clone());
+
+        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+
+        let mut response = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(txn),
+                requests: vec![ShardRequest {
+                    shard_id: 0,
+                    request: DataRequest::Put(PutRequest {
+                        key: counter_key.clone(),
+                        value: Some(Value::Int(1)),
+                        sequence: 0,
+                        expect_ts: None,
+                    }),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let txn = std::mem::take(&mut response.temporal).into_transaction();
+
+        let txn_heartbeat = heartbeat_txn(client.clone(), txn.meta.clone());
+
+        select! {
+            _ = txn_heartbeat => unreachable!(""),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+        };
+
+        let write_ts = txn.commit_ts();
+        let txn = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(Transaction { status: TxnStatus::Committed, ..txn }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .temporal
+            .into_transaction();
+        assert_that!(txn.status).is_equal_to(TxnStatus::Pending);
+        assert_that!(txn.commit_ts()).is_greater_than(write_ts);
+    }
 }

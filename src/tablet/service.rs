@@ -213,11 +213,9 @@ impl TabletServiceState {
     ) -> Result<Option<FollowingTablet>> {
         let now = self.clock.now();
         let watermark_duration = Duration::from_secs(5);
-        let closed_timestamp = tablet.leader_expiration().max(now - watermark_duration);
         let leader_expiration = tablet.leader_expiration().max(now + watermark_duration * 2);
-        tablet.manifest.manifest.rotate();
-        tablet.publish_watermark(closed_timestamp, leader_expiration).await?;
-        self.clock.update(closed_timestamp);
+        tablet.rotate(tablet.leader_expiration(), leader_expiration).await?;
+        self.clock.update(tablet.closed_timestamp());
 
         let _drop_owner = self.start_deployment(&tablet, self_requester);
 
@@ -282,11 +280,12 @@ impl TabletServiceState {
             select! {
                 _ = unsafe { std::pin::Pin::new_unchecked(&mut next_watermark) } => {
                     let now = self.clock.now();
-                    let closed_timestamp = tablet.closed_timestamp().max(now - watermark_duration).min(tablet.leader_expiration());
-                    tablet.update_closed_timestamp(closed_timestamp);
+                    let closing_timestamp = tablet.closed_timestamp().max(now - watermark_duration).min(tablet.leader_expiration());
                     let leader_expiration = now + watermark_duration * 2;
+
+                    tablet.update_watermark(closing_timestamp, leader_expiration);
                     next_watermark = tokio::time::sleep(watermark_duration);
-                    let message = tablet.new_expiration_message(leader_expiration);
+                    let message = tablet.new_manifest_message();
                     tablet.manifest.producer.queue(&message)?;
                     manifest_messages.push_back(message);
                 },

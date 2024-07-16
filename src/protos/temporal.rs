@@ -18,6 +18,13 @@ use std::time::Duration;
 use super::*;
 
 impl Temporal {
+    pub fn txn_id(&self) -> Uuid {
+        match self {
+            Self::Transaction(txn) => txn.id(),
+            Self::Timestamp(_) => Uuid::nil(),
+        }
+    }
+
     pub fn timestamp(&self) -> Timestamp {
         match self {
             Temporal::Timestamp(ts) => *ts,
@@ -81,18 +88,17 @@ impl Transaction {
         assert_eq!(self.id(), other.id());
         assert_eq!(self.key(), other.key());
         assert_eq!(self.start_ts(), other.start_ts());
+        self.commit_ts.forward(other.commit_ts);
         self.heartbeat_ts.forward(other.heartbeat_ts);
         match self.epoch().cmp(&other.epoch()) {
             Less => {
                 self.status = other.status;
                 self.meta.epoch = other.epoch();
                 self.rollbacked_sequences.clear();
-                self.commit_ts = other.commit_ts;
                 self.commit_set.clear();
                 self.commit_set.extend(other.commit_set.iter().cloned());
             },
             Equal => {
-                self.commit_ts.forward(other.commit_ts);
                 let n = self.rollbacked_sequences.len();
                 if n < other.rollbacked_sequences.len() {
                     self.rollbacked_sequences.extend(other.rollbacked_sequences[n..].iter().copied());
