@@ -382,13 +382,6 @@ impl LeadingTabletManifest {
             manifest: Some(self.manifest.clone()),
         }
     }
-
-    pub fn new_expiration_message(&mut self, leader_expiration: Timestamp) -> ManifestMessage {
-        self.cursor.sequence += 1;
-        let mut manifest = self.manifest.clone();
-        manifest.watermark.leader_expiration = leader_expiration;
-        ManifestMessage { epoch: self.cursor.epoch, sequence: self.cursor.sequence, manifest: Some(manifest) }
-    }
 }
 
 pub struct FollowingTabletManifest {
@@ -426,8 +419,8 @@ impl LeadingTablet {
         }
     }
 
-    pub fn new_expiration_message(&mut self, leader_expiration: Timestamp) -> ManifestMessage {
-        self.manifest.new_expiration_message(leader_expiration)
+    pub fn new_manifest_message(&mut self) -> ManifestMessage {
+        self.manifest.new_message()
     }
 
     pub fn closed_timestamp(&self) -> Timestamp {
@@ -444,6 +437,7 @@ impl LeadingTablet {
         }
         if closed_timestamp > self.manifest.manifest.watermark.closed_timestamp {
             self.manifest.manifest.watermark.closed_timestamp = closed_timestamp;
+            self.store.store.close_ts(closed_timestamp);
         }
     }
 
@@ -452,26 +446,24 @@ impl LeadingTablet {
         self.manifest.manifest = manifest;
     }
 
-    pub async fn publish_watermark(
-        &mut self,
-        closed_timestamp: Timestamp,
-        leader_expiration: Timestamp,
-    ) -> Result<LogPosition> {
+    pub async fn rotate(&mut self, closing_timestamp: Timestamp, leader_expiration: Timestamp) -> Result<()> {
+        self.manifest.manifest.rotate();
+        self.update_watermark(closing_timestamp, leader_expiration);
+        self.manifest.publish().await?;
+        Ok(())
+    }
+
+    pub fn update_watermark(&mut self, closing_timestamp: Timestamp, leader_expiration: Timestamp) {
+        let closed_timestamp = self.store.store.close_ts(closing_timestamp);
         let watermark = TabletWatermark::new(self.store.cursor, closed_timestamp, leader_expiration);
         self.manifest.manifest.update_watermark(watermark);
-        self.manifest.publish().await
     }
 
     pub fn process_request(&mut self, request: Request) -> Result<Option<BatchResult>> {
-        if !request.request.is_readonly() {
-            let ts = request.request.temporal.timestamp();
+        if !request.is_readonly() {
+            let ts = request.temporal.timestamp();
             let watermark = &self.manifest.manifest.watermark;
-            if ts < watermark.closed_timestamp {
-                return Ok(Some(BatchResult::Error {
-                    error: anyhow!("write beneath closed timestamp"),
-                    responser: request.responser,
-                }));
-            } else if ts > watermark.leader_expiration {
+            if ts > watermark.leader_expiration {
                 return Ok(Some(BatchResult::Error {
                     error: anyhow!("write above leader expiration"),
                     responser: request.responser,

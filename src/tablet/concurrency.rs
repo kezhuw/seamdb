@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod fence;
+
 use std::cmp::Ordering::*;
 use std::collections::btree_map::BTreeMap;
 use std::ops::{Range, RangeFrom};
@@ -29,6 +31,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSend
 use tokio::sync::oneshot;
 use tracing::{debug, instrument, trace};
 
+use self::fence::FenceTable;
 use crate::clock::Clock;
 use crate::keys::Key;
 use crate::protos::{
@@ -41,7 +44,10 @@ use crate::protos::{
     ParticipateTxnRequest,
     ParticipateTxnResponse,
     ShardDescription,
+    ShardRequest,
+    SpanOrdering,
     Temporal,
+    Timestamp,
     Transaction,
     TxnMeta,
     TxnStatus,
@@ -52,10 +58,11 @@ use crate::tablet::types::{StreamingChannel, StreamingResponser};
 
 #[derive(Debug)]
 pub struct Request {
-    read_keys: Vec<KeySpan>,
-    write_keys: Vec<KeySpan>,
+    pub read_keys: Vec<KeySpan>,
+    pub write_keys: Vec<KeySpan>,
 
-    pub request: BatchRequest,
+    pub temporal: Temporal,
+    pub requests: Vec<ShardRequest>,
     pub responser: oneshot::Sender<Result<BatchResponse>>,
 }
 
@@ -63,7 +70,8 @@ impl Request {
     pub fn new(request: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>>) -> Self {
         let mut read_keys = vec![];
         let mut write_keys = vec![];
-        request.requests.iter().for_each(|r| {
+        let BatchRequest { temporal, requests, .. } = request;
+        requests.iter().for_each(|r| {
             let key = r.key();
             let span = KeySpan { key: key.to_vec(), end: vec![] };
             if r.is_read() {
@@ -72,18 +80,22 @@ impl Request {
                 write_keys.push(span)
             }
         });
-        Self { read_keys, write_keys, request, responser }
+        Self { read_keys, write_keys, temporal, requests, responser }
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.requests.iter().all(|r| r.is_read())
     }
 
     pub fn txn(&self) -> Option<&Transaction> {
-        match &self.request.temporal {
+        match &self.temporal {
             Temporal::Transaction(txn) => Some(txn),
             _ => None,
         }
     }
 
     pub fn txn_mut(&mut self) -> Option<&mut Transaction> {
-        match &mut self.request.temporal {
+        match &mut self.temporal {
             Temporal::Transaction(txn) => Some(txn),
             _ => None,
         }
@@ -269,28 +281,41 @@ impl LockTable {
             let mut span = span.as_ref();
             let range = self.locks.range_mut(RangeFrom { start: span.key.to_owned() });
             for (_end, lock) in range {
-                match span.compare(lock.span.as_ref()) {
-                    Less => {
+                match (span.compare(lock.span.as_ref()), lock.owner.id() == participant.txn.id()) {
+                    (SpanOrdering::LessDisjoint | SpanOrdering::LessContiguous, _) => {
                         let lock = WriteLock::new(span.into_owned(), participant);
                         locks.insert(span.end_key().to_owned(), lock);
                         continue 'next_write_span;
                     },
-                    Equal => match lock.owner.id() == participant.txn.id() {
-                        false => {
-                            lock.block_txn(participant, request);
-                            return None;
-                        },
-                        true => {
-                            // FIXME: extend modify lock here
-                            lock.span.extend_start(span.key);
-                            if lock.span.end_key() < span.end_key() {
-                                span.key = lock.span.end_key();
-                                continue;
-                            }
-                            continue 'next_write_span;
-                        },
+                    (SpanOrdering::GreaterDisjoint | SpanOrdering::GreaterContiguous, _) => continue,
+                    (_, false) => {
+                        lock.block_txn(participant, request);
+                        return None;
                     },
-                    Greater => continue,
+                    (
+                        SpanOrdering::Equal
+                        | SpanOrdering::SubsetAll
+                        | SpanOrdering::SubsetRight
+                        | SpanOrdering::SubsetLeft,
+                        true,
+                    ) => continue 'next_write_span,
+                    (SpanOrdering::IntersectRight | SpanOrdering::ContainRight, true) => {
+                        let span = KeySpan { key: span.key.to_owned(), end: lock.span.key.to_owned() };
+                        let lock = WriteLock::new(span, participant);
+                        locks.insert(lock.span.end_key().to_owned(), lock);
+                        continue 'next_write_span;
+                    },
+                    (SpanOrdering::IntersectLeft | SpanOrdering::ContainLeft, true) => {
+                        span.key = lock.span.end_key();
+                    },
+                    (SpanOrdering::ContainAll, true) => {
+                        let lock = WriteLock::new(
+                            KeySpan { key: span.key.to_owned(), end: lock.span.key.to_owned() },
+                            participant,
+                        );
+                        span.key = unsafe { std::mem::transmute(lock.span.end_key()) };
+                        locks.insert(lock.span.end_key().to_owned(), lock);
+                    },
                 }
             }
             let lock = WriteLock::new(span.into_owned(), participant);
@@ -306,15 +331,29 @@ impl LockTable {
             let range = self.locks.range_mut(RangeFrom { start: span.key.to_owned() });
             for (_end, lock) in range {
                 match span.compare(lock.span.as_ref()) {
-                    Less => continue 'next_write_span,
-                    Equal => match lock.owner.id() == participant.txn.id() {
+                    SpanOrdering::LessDisjoint | SpanOrdering::LessContiguous => continue 'next_write_span,
+                    SpanOrdering::GreaterDisjoint | SpanOrdering::GreaterContiguous => continue,
+                    SpanOrdering::Equal
+                    | SpanOrdering::SubsetAll
+                    | SpanOrdering::SubsetLeft
+                    | SpanOrdering::SubsetRight
+                    | SpanOrdering::IntersectRight
+                    | SpanOrdering::ContainRight => match lock.owner.id() == participant.txn.id() {
                         true => continue 'next_write_span,
                         false => {
                             lock.block_txn(participant, request);
                             return None;
                         },
                     },
-                    Greater => continue,
+                    SpanOrdering::IntersectLeft | SpanOrdering::ContainLeft | SpanOrdering::ContainAll => {
+                        match lock.owner.id() == participant.txn.id() {
+                            false => {
+                                lock.block_txn(participant, request);
+                                return None;
+                            },
+                            true => continue,
+                        }
+                    },
                 }
             }
         }
@@ -327,12 +366,12 @@ impl LockTable {
             let range = self.locks.range_mut(RangeFrom { start: span.key.to_owned() });
             for (_end, lock) in range {
                 match span.compare(lock.span.as_ref()) {
-                    Less => continue 'next_write_span,
-                    Equal => {
+                    SpanOrdering::LessDisjoint | SpanOrdering::LessContiguous => continue 'next_write_span,
+                    SpanOrdering::GreaterDisjoint | SpanOrdering::GreaterContiguous => continue,
+                    _ => {
                         lock.block(request);
                         return None;
                     },
-                    Greater => continue,
                 }
             }
         }
@@ -394,7 +433,13 @@ impl TxnParticipant {
             txn.status = status;
             txn.commit_set = commit_set;
         }
+        let commit_ts = txn.commit_ts();
         txn.update(&self.txn);
+        if txn.commit_ts() != commit_ts && txn.status == TxnStatus::Committed {
+            debug!("txn pushed");
+            txn.status = TxnStatus::Pending;
+            txn.commit_set.clear();
+        }
         self.updates.send(self.txn.clone()).ignore();
         Ok(())
     }
@@ -408,6 +453,21 @@ impl TxnParticipant {
         self.updates.send(Transaction { resolved_set: txn.resolved_set.clone(), ..self.txn.clone() }).ignore();
         txn.update(&self.txn);
         epoch != self.txn.epoch() || txn.status.is_terminal()
+    }
+
+    pub fn fence_ts(&mut self, ts: Timestamp) -> Timestamp {
+        match (self.coordination.is_some(), self.txn.status) {
+            (false, _) => self.txn.commit_ts(),
+            (true, TxnStatus::Pending) => {
+                if ts > self.txn.commit_ts() {
+                    debug!("push txn {} commit ts from {} to {}", self.txn.id(), self.txn.commit_ts(), ts);
+                    self.txn.commit_ts = ts;
+                    self.updates.send(self.txn.clone()).ignore();
+                }
+                ts
+            },
+            (true, TxnStatus::Aborted | TxnStatus::Committed) => ts,
+        }
     }
 }
 
@@ -822,6 +882,16 @@ impl TxnParticipantTable {
         self.txns.insert(participant.txn.id(), participant);
     }
 
+    pub fn fence_ts(&mut self, ts: Timestamp) -> Timestamp {
+        debug!("fencing ts: {ts}, txns {}", self.txns.len());
+        let mut fenced_ts = ts;
+        for participant in self.txns.values_mut() {
+            fenced_ts = fenced_ts.min(participant.fence_ts(ts));
+        }
+        debug!("fenced ts: {fenced_ts}");
+        fenced_ts
+    }
+
     pub fn update_txn(&mut self, txn: &mut Transaction, self_update: bool) -> Option<Vec<KeySpan>> {
         if let HashEntry::Occupied(mut entry) = self.txns.entry(txn.id()) {
             let participant = entry.get_mut();
@@ -909,6 +979,7 @@ impl TxnParticipantTable {
 pub struct TxnTable {
     txns: TxnParticipantTable,
     locks: LockTable,
+    fences: FenceTable,
 }
 
 impl TxnTable {
@@ -931,12 +1002,21 @@ impl TxnTable {
             }
             txns.add(participant);
         }
-        (Self { txns, locks }, receiver)
+        (Self { txns, locks, fences: FenceTable::default() }, receiver)
     }
 
     pub fn sequence(&mut self, mut request: Request) -> Option<Request> {
-        match request.txn_mut() {
-            Some(txn) => {
+        match &mut request.temporal {
+            Temporal::Transaction(txn) => {
+                if txn.status != TxnStatus::Aborted {
+                    let commit_ts = txn.commit_ts();
+                    let bumped_ts = self.fences.min_write_ts(txn.id(), &request.write_keys, txn.commit_ts());
+                    if bumped_ts != commit_ts {
+                        txn.status = TxnStatus::Pending;
+                        txn.commit_ts = bumped_ts;
+                        txn.commit_set.clear();
+                    }
+                }
                 let epoch = txn.epoch();
                 let participate = match self.txns.participate(txn) {
                     Ok(participate) => participate,
@@ -946,15 +1026,19 @@ impl TxnTable {
                     },
                 };
                 if epoch != txn.epoch() || txn.is_aborted() {
+                    request.read_keys.clear();
                     request.write_keys.clear();
-                    request.request.requests.clear();
+                    request.requests.clear();
                 }
                 let Some(participant) = participate else {
                     return Some(request);
                 };
                 self.locks.sequence_txn(participant, request)
             },
-            None => self.locks.sequence_timestamped(request),
+            Temporal::Timestamp(ts) => {
+                *ts = self.fences.min_write_ts(Uuid::nil(), &request.write_keys, *ts);
+                self.locks.sequence_timestamped(request)
+            },
         }
     }
 
@@ -974,5 +1058,17 @@ impl TxnTable {
         channel: StreamingChannel<ParticipateTxnRequest, ParticipateTxnResponse>,
     ) {
         self.txns.participate_txn(request, channel)
+    }
+
+    pub fn close_ts(&mut self, ts: Timestamp) -> Timestamp {
+        let ts = self.txns.fence_ts(ts);
+        self.fences.close_ts(ts);
+        ts
+    }
+
+    pub fn fence_reads(&mut self, txn_id: Uuid, spans: Vec<KeySpan>, ts: Timestamp) {
+        for span in spans {
+            self.fences.fence(txn_id, span, ts);
+        }
     }
 }

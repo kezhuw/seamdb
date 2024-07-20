@@ -37,7 +37,6 @@ use crate::clock::Clock;
 use crate::keys::Key;
 use crate::protos::{
     self,
-    BatchRequest,
     BatchResponse,
     DataOperation,
     DataRequest,
@@ -1085,9 +1084,14 @@ pub struct TxnTabletStore {
 
 impl TxnTabletStore {
     pub fn new(store: TabletStore, clock: Clock, client: TabletClient) -> Self {
-        let (txn_table, updated_txns) =
+        let (mut txn_table, updated_txns) =
             TxnTable::new(clock, client, store.shards().to_vec(), store.transactions().cloned());
+        txn_table.close_ts(store.watermark.leader_expiration);
         Self { store, txn_table, updated_txns }
+    }
+
+    pub fn close_ts(&mut self, ts: Timestamp) -> Timestamp {
+        self.txn_table.close_ts(ts)
     }
 
     pub fn shards(&self) -> &[ShardDescription] {
@@ -1126,11 +1130,11 @@ impl TxnTabletStore {
 
     #[instrument(skip(self))]
     pub fn process_request(&mut self, request: Request) -> Result<Option<BatchResult>> {
-        let Some(Request { request, responser, .. }) = self.txn_table.sequence(request) else {
+        let Some(Request { read_keys, mut temporal, requests, responser, .. }) = self.txn_table.sequence(request)
+        else {
             return Ok(None);
         };
 
-        let BatchRequest { mut temporal, requests, .. } = request;
         let mut context = BatchContext::default();
         let responses = match self.store.batch(&mut context, &temporal, requests) {
             Err(err) => {
@@ -1145,6 +1149,7 @@ impl TxnTabletStore {
         } else {
             vec![]
         };
+        self.txn_table.fence_reads(temporal.txn_id(), read_keys, temporal.timestamp());
         let result = match context.replication.is_empty() {
             true => BatchResult::Read { temporal, responses, responser, blocker: context.reads },
             false => BatchResult::Write {
