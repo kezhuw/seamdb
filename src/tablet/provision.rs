@@ -198,6 +198,27 @@ impl From<TimestampedValue> for Option<protos::TimestampedValue> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TimestampedKeyValue {
+    pub key: Vec<u8>,
+    pub value: TimestampedValue,
+}
+
+impl TimestampedKeyValue {
+    pub fn new(key: Vec<u8>, value: TimestampedValue) -> Self {
+        Self { key, value }
+    }
+}
+
+impl From<TimestampedKeyValue> for protos::TimestampedKeyValue {
+    fn from(value: TimestampedKeyValue) -> protos::TimestampedKeyValue {
+        let key = value.key;
+        let timestamp = value.value.timestamp;
+        let value = value.value.value.value.unwrap();
+        protos::TimestampedKeyValue { timestamp, key, value }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct ReplicationTracker {
     stage: ReplicationStage,

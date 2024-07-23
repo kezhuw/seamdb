@@ -383,13 +383,30 @@ impl TabletClient {
         let user_key = keys::user_key(request.key());
         let deployment = self.locate(&user_key).await?;
         request.set_key(user_key);
+        let end_key = request.end_key();
+        if !end_key.is_empty() {
+            request.set_end_key(keys::user_key(end_key));
+        }
         Ok(deployment)
     }
 
     fn relocate_user_responses(responses: &mut [DataResponse]) {
         for response in responses {
-            if let Some(find) = response.as_find_mut() {
-                find.key.drain(0..keys::USER_KEY_PREFIX.len());
+            match response {
+                DataResponse::Find(find) => {
+                    if !find.key.is_empty() {
+                        find.key.drain(0..keys::USER_KEY_PREFIX.len());
+                    }
+                },
+                DataResponse::Scan(scan) => {
+                    if scan.resume_key.strip_prefix(keys::USER_KEY_PREFIX).is_some() {
+                        scan.resume_key.drain(0..keys::USER_KEY_PREFIX.len());
+                    }
+                    scan.rows.iter_mut().for_each(|row| {
+                        row.key.drain(0..keys::USER_KEY_PREFIX.len());
+                    });
+                },
+                _ => {},
             }
         }
     }
@@ -559,6 +576,7 @@ mod tests {
     use assertor::*;
     use asyncs::select;
     use tokio::net::TcpListener;
+    use tracing::debug;
 
     use crate::cluster::tests::etcd_container;
     use crate::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
@@ -572,9 +590,11 @@ mod tests {
         GetRequest,
         HasTxnMeta,
         IncrementRequest,
+        KeyRange,
         KeySpan,
         PutRequest,
         RefreshReadRequest,
+        ScanRequest,
         SequenceRange,
         ShardRequest,
         Temporal,
@@ -725,6 +745,185 @@ mod tests {
 
         let get = responses.pop().unwrap().into_get().unwrap();
         assert_that!(get.value.unwrap()).is_equal_to(&expect_value);
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn test_tablet_client_find_timestamped() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let requests = vec![
+            DataRequest::Find(FindRequest { key: b"count".to_vec(), sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count0".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count1".to_vec(), increment: 10, sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"count".to_vec(), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"count01".to_vec(), sequence: 0 }),
+        ];
+        let mut responses = client.batch(requests).await.unwrap();
+        let find = responses.remove(0).into_find().unwrap();
+        assert_that!(find.key).is_empty();
+        assert_that!(find.value).is_none();
+
+        responses.remove(0);
+        responses.remove(0);
+
+        let find0 = responses.remove(0).into_find().unwrap();
+        assert_that!(find0.key).is_equal_to(b"count0".to_vec());
+        assert_that!(find0.value).is_some();
+        assert_that!(find0.value.unwrap().value).is_equal_to(Value::Int(5));
+
+        let find1 = responses.remove(0).into_find().unwrap();
+        assert_that!(find1.key).is_equal_to(b"count1".to_vec());
+        assert_that!(find1.value.unwrap().value).is_equal_to(Value::Int(10));
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn test_tablet_client_scan_timestamped() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let requests = vec![
+            DataRequest::Scan(ScanRequest {
+                range: KeyRange { start: b"count".to_vec(), end: b"counu".to_vec() },
+                limit: 0,
+                sequence: 0,
+            }),
+            DataRequest::Increment(IncrementRequest { key: b"count0".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count1".to_vec(), increment: 10, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count2".to_vec(), increment: 15, sequence: 0 }),
+            DataRequest::Scan(ScanRequest {
+                range: KeyRange { start: b"count".to_vec(), end: b"counu".to_vec() },
+                limit: 2,
+                sequence: 0,
+            }),
+        ];
+        let mut responses = client.batch(requests).await.unwrap();
+        let scan = responses.remove(0).into_scan().unwrap();
+        debug!("resume key: {:?}", scan.resume_key);
+        assert_that!(scan.rows).is_empty();
+
+        responses.remove(0);
+        responses.remove(0);
+        responses.remove(0);
+
+        let scan = responses.remove(0).into_scan().unwrap();
+        debug!("resume key: {:?}", scan.resume_key);
+        assert_that!(scan.rows).has_length(2);
+        assert_that!(scan.rows[0].key).is_equal_to(b"count0".to_vec());
+        assert_that!(scan.rows[0].value).is_equal_to(Value::Int(5));
+        assert_that!(scan.rows[1].key).is_equal_to(b"count1".to_vec());
+        assert_that!(scan.rows[1].value).is_equal_to(Value::Int(10));
+    }
+
+    #[test_log::test(tokio::test)]
+    #[tracing_test::traced_test]
+    async fn test_tablet_client_scan_transactional() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager =
+            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let txn = client.new_transaction(keys::user_key(b"count"));
+
+        let requests = vec![
+            DataRequest::Scan(ScanRequest {
+                range: KeyRange { start: keys::user_key(b"count"), end: keys::user_key(b"counu") },
+                limit: 0,
+                sequence: 0,
+            }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count0"), increment: 5, sequence: 1 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count1"), increment: 10, sequence: 2 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count2"), increment: 15, sequence: 3 }),
+            DataRequest::Scan(ScanRequest {
+                range: KeyRange { start: keys::user_key(b"count"), end: keys::user_key(b"counu") },
+                limit: 2,
+                sequence: 3,
+            }),
+        ];
+
+        let (tablet_id, mut tablet_client) = client.tablet_client(&txn.meta.key).await.unwrap();
+
+        let mut responses = tablet_client
+            .batch(BatchRequest {
+                tablet_id: tablet_id.into(),
+                temporal: Temporal::Transaction(txn),
+                requests: requests.into_iter().map(|request| ShardRequest { shard_id: 0, request }).collect(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .responses;
+
+        let scan = responses.remove(0).response.into_scan().unwrap();
+        debug!("resume key: {:?}", scan.resume_key);
+        assert_that!(scan.rows).is_empty();
+
+        responses.remove(0);
+        responses.remove(0);
+        responses.remove(0);
+
+        let scan = responses.remove(0).response.into_scan().unwrap();
+        debug!("resume key: {:?}", scan.resume_key);
+        assert_that!(scan.rows).has_length(2);
+        assert_that!(scan.rows[0].key).is_equal_to(keys::user_key(b"count0"));
+        assert_that!(scan.rows[0].value).is_equal_to(Value::Int(5));
+        assert_that!(scan.rows[1].key).is_equal_to(keys::user_key(b"count1"));
+        assert_that!(scan.rows[1].value).is_equal_to(Value::Int(10));
     }
 
     #[test_log::test(tokio::test)]

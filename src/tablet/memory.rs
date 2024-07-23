@@ -47,7 +47,7 @@ impl Store for MemoryStore {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MemoryTable<S, V> {
     map: BTreeMap<Vec<u8>, Vec<(S, V)>>,
 }
