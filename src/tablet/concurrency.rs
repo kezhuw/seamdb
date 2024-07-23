@@ -72,8 +72,7 @@ impl Request {
         let mut write_keys = vec![];
         let BatchRequest { temporal, requests, .. } = request;
         requests.iter().for_each(|r| {
-            let key = r.key();
-            let span = KeySpan { key: key.to_vec(), end: vec![] };
+            let span = KeySpan { key: r.key().to_vec(), end: r.end_key().to_vec() };
             if r.is_read() {
                 read_keys.push(span)
             } else {

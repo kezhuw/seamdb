@@ -179,6 +179,16 @@ pub struct TimestampedValue {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TimestampedKeyValue {
+    #[prost(message, required, tag = "1")]
+    pub timestamp: Timestamp,
+    #[prost(bytes = "vec", tag = "2")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, required, tag = "3")]
+    pub value: Value,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeyValue {
     #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
@@ -392,6 +402,8 @@ pub enum DataRequest {
     Increment(IncrementRequest),
     #[prost(message, tag = "4")]
     Find(FindRequest),
+    #[prost(message, tag = "6")]
+    Scan(ScanRequest),
     #[prost(message, tag = "5")]
     RefreshRead(RefreshReadRequest),
 }
@@ -422,6 +434,8 @@ pub enum DataResponse {
     Increment(IncrementResponse),
     #[prost(message, tag = "4")]
     Find(FindResponse),
+    #[prost(message, tag = "6")]
+    Scan(ScanResponse),
     #[prost(message, tag = "5")]
     RefreshRead(RefreshReadResponse),
 }
@@ -494,6 +508,24 @@ pub struct FindResponse {
     pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<TimestampedValue>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScanRequest {
+    #[prost(message, required, tag = "1")]
+    pub range: KeyRange,
+    #[prost(uint32, tag = "2")]
+    pub limit: u32,
+    #[prost(uint32, tag = "3")]
+    pub sequence: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScanResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub resume_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, repeated, tag = "2")]
+    pub rows: ::prost::alloc::vec::Vec<TimestampedKeyValue>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

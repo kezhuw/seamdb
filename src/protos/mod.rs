@@ -231,6 +231,10 @@ impl ShardRequest {
     pub fn key(&self) -> &[u8] {
         self.request.key()
     }
+
+    pub fn end_key(&self) -> &[u8] {
+        self.request.end_key()
+    }
 }
 
 impl DataRequest {
@@ -254,9 +258,17 @@ impl DataRequest {
         match self {
             Self::Get(request) => &request.key,
             Self::Find(request) => &request.key,
+            Self::Scan(request) => &request.range.start,
             Self::Put(request) => &request.key,
             Self::Increment(request) => &request.key,
             Self::RefreshRead(request) => &request.span.key,
+        }
+    }
+
+    pub fn end_key(&self) -> &[u8] {
+        match self {
+            Self::Scan(request) => &request.range.end,
+            _ => Default::default(),
         }
     }
 
@@ -264,9 +276,16 @@ impl DataRequest {
         match self {
             Self::Get(request) => request.key = key,
             Self::Find(request) => request.key = key,
+            Self::Scan(request) => request.range.start = key,
             Self::Put(request) => request.key = key,
             Self::Increment(request) => request.key = key,
             Self::RefreshRead(request) => request.span.key = key,
+        }
+    }
+
+    pub fn set_end_key(&mut self, key: Vec<u8>) {
+        if let Self::Scan(request) = self {
+            request.range.end = key
         }
     }
 }
@@ -365,6 +384,12 @@ impl TimestampedValue {
     }
 }
 
+impl TimestampedKeyValue {
+    pub fn new(key: Vec<u8>, value: TimestampedValue) -> Self {
+        Self { timestamp: value.timestamp, key, value: value.value }
+    }
+}
+
 impl BatchResponse {
     #[allow(clippy::result_large_err)]
     pub fn into_one(mut self) -> Result<ShardResponse, Self> {
@@ -433,6 +458,13 @@ impl DataResponse {
         }
     }
 
+    pub fn into_scan(self) -> Result<ScanResponse, Self> {
+        match self {
+            Self::Scan(scan) => Ok(scan),
+            _ => Err(self),
+        }
+    }
+
     pub fn into_put(self) -> Result<PutResponse, Self> {
         match self {
             Self::Put(put) => Ok(put),
@@ -444,13 +476,6 @@ impl DataResponse {
         match self {
             Self::Increment(increment) => Ok(increment),
             _ => Err(self),
-        }
-    }
-
-    pub fn as_find_mut(&mut self) -> Option<&mut FindResponse> {
-        match self {
-            Self::Find(find) => Some(find),
-            _ => None,
         }
     }
 }

@@ -21,12 +21,13 @@ use anyhow::{anyhow, bail, Result};
 use hashbrown::hash_map::{Entry as HashEntry, HashMap};
 use ignore_result::Ignore;
 use tokio::sync::{mpsc, oneshot};
-use tracing::instrument;
+use tracing::{instrument, trace};
 
 use super::provision::{
     ReplicationHandle,
     ReplicationTracker,
     ReplicationWatcher,
+    TimestampedKeyValue,
     TimestampedValue,
     TxnIntent,
     TxnRecord,
@@ -53,6 +54,7 @@ use crate::protos::{
     ParticipateTxnResponse,
     PutResponse,
     RefreshReadResponse,
+    ScanResponse,
     ShardDescription,
     ShardDescriptor,
     ShardId,
@@ -180,10 +182,15 @@ impl ShardStore {
     }
 
     pub fn find(&self, context: &BatchContext, ts: Timestamp, key: &[u8]) -> Result<(Vec<u8>, TimestampedValue)> {
-        if let Some((key, ts, value)) = context.cache.timestamped.find(key, ts) {
-            return Ok((key.to_owned(), TimestampedValue::new(ts, value)));
+        let (found_key, found_value) = self.store.find(key, ts)?;
+        let Some((cached_key, cached_ts, cached_value)) = context.cache.timestamped.find(key, ts) else {
+            return Ok((found_key, found_value));
+        };
+        if found_key.is_empty() || found_key > cached_key {
+            Ok((cached_key, TimestampedValue::new(cached_ts, cached_value)))
+        } else {
+            Ok((found_key, found_value))
         }
-        self.store.find(key, ts)
     }
 
     pub fn find_timestamped(
@@ -193,6 +200,42 @@ impl ShardStore {
         key: &[u8],
     ) -> Result<(Vec<u8>, TimestampedValue)> {
         self.find(context, ts, key).map(|(key, value)| (key, value.into_client()))
+    }
+
+    pub fn scan_timestamped(
+        &self,
+        context: &BatchContext,
+        ts: Timestamp,
+        range: KeyRange,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        let mut resume_key = range.start;
+        let end_key = if range.end <= self.range.end {
+            range.end
+        } else {
+            let mut end = range.end;
+            end.clone_from(&self.range.end);
+            end
+        };
+        trace!("end key: {end_key:?}");
+        let mut rows = vec![];
+        while limit == 0 || rows.len() < limit as usize {
+            trace!("find key: {resume_key:?}");
+            let (key, value) = self.find_timestamped(context, ts, &resume_key)?;
+            trace!("found: {key:?}, {value:?}");
+            if key.is_empty() {
+                resume_key.clone_from(&self.range.end);
+                break;
+            } else if key >= end_key {
+                resume_key = end_key;
+                break;
+            }
+            resume_key.clone_from(&key);
+            resume_key.push(0);
+            rows.push(TimestampedKeyValue::new(key, value));
+        }
+        trace!("resume key: {resume_key:?}");
+        Ok((resume_key, rows))
     }
 
     fn check_timestamped_write(&self, context: &BatchContext, ts: Timestamp, key: &[u8]) -> Result<TimestampedValue> {
@@ -342,7 +385,7 @@ impl ShardStore {
     }
 
     pub fn find_transactional(
-        &mut self,
+        &self,
         context: &BatchContext,
         provision: &TxnProvision,
         txn: &TxnRecord,
@@ -361,6 +404,40 @@ impl ShardStore {
             start.push(0);
         }
         Ok((found, value))
+    }
+
+    pub fn scan_transactional(
+        &self,
+        context: &BatchContext,
+        provision: &TxnProvision,
+        txn: &TxnRecord,
+        range: KeyRange,
+        limit: u32,
+        sequence: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        let mut resume_key = range.start;
+        let end_key = if range.end <= self.range.end {
+            range.end
+        } else {
+            let mut end = range.end;
+            end.clone_from(&self.range.end);
+            end
+        };
+        let mut rows = vec![];
+        while limit == 0 || rows.len() < limit as usize {
+            let (key, value) = self.find_transactional(context, provision, txn, &resume_key, sequence)?;
+            if key.is_empty() {
+                resume_key.clone_from(&self.range.end);
+                break;
+            } else if key >= end_key {
+                resume_key = end_key;
+                break;
+            }
+            resume_key.clone_from(&key);
+            resume_key.push(0);
+            rows.push(TimestampedKeyValue::new(key, value));
+        }
+        Ok((resume_key, rows))
     }
 
     pub fn get_txn_latest_value(
@@ -579,7 +656,7 @@ pub enum ValueExtractor<F: FnMut(Option<protos::Value>) -> Result<Option<protos:
     Compute(F),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TabletCache {
     timestamped: MemoryTable<Timestamp, Value>,
     transactional: BTreeMap<Key, TxnIntent>,
@@ -955,6 +1032,14 @@ impl TabletStore {
                     let response = FindResponse { key, value: value.into() };
                     DataResponse::Find(response)
                 },
+                DataRequest::Scan(scan) => {
+                    let (resume_key, rows) = shard_store.scan_timestamped(context, ts, scan.range, scan.limit)?;
+                    rows.iter().for_each(|row| {
+                        context.reads.watch(&row.value.value);
+                    });
+                    let response = ScanResponse { resume_key, rows: rows.into_iter().map(Into::into).collect() };
+                    DataResponse::Scan(response)
+                },
                 DataRequest::Put(put) => {
                     let ts = shard_store.put_timestamped(context, ts, &put.key, put.value, put.expect_ts)?;
                     let response = PutResponse { write_ts: ts };
@@ -1011,6 +1096,21 @@ impl TabletStore {
                     context.reads.watch(&value.value);
                     let response = FindResponse { key, value: value.into() };
                     DataResponse::Find(response)
+                },
+                DataRequest::Scan(scan) => {
+                    let (resume_key, rows) = shard_store.scan_transactional(
+                        context,
+                        &self.provision,
+                        &txn,
+                        scan.range,
+                        scan.limit,
+                        scan.sequence,
+                    )?;
+                    rows.iter().for_each(|row| {
+                        context.reads.watch(&row.value.value);
+                    });
+                    let response = ScanResponse { resume_key, rows: rows.into_iter().map(Into::into).collect() };
+                    DataResponse::Scan(response)
                 },
                 DataRequest::Put(put) => {
                     let ts = shard_store.put_transactional(
