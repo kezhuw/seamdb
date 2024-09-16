@@ -780,14 +780,14 @@ impl TxnParticipation {
 
     async fn resolve_txn(&self, txn: Transaction, key: &[u8]) -> Result<Vec<KeySpan>> {
         trace!("resolving txn for key: {key:?}");
-        let (tablet_id, mut client) = self.client.tablet_client(key).await?;
+        let (deployment, mut service) = self.client.service(key).await?;
         let request = BatchRequest {
-            tablet_id: tablet_id.into(),
+            tablet_id: deployment.tablet_id().into(),
             uncertainty: None,
             temporal: Temporal::Transaction(txn),
             requests: vec![],
         };
-        let response = client.batch(request).await?.into_inner();
+        let response = service.batch(request).await?.into_inner();
         let txn = response.temporal.into_transaction();
         debug!("resolved txn spans: {:?}", txn.resolved_set);
         Ok(txn.resolved_set)
