@@ -18,13 +18,13 @@ use anyhow::{bail, Result};
 
 use crate::protos::{KeyRange, TabletId};
 
-pub const TABLET_DESCRIPTOR_KEY_PREFIX: &[u8] = &[b'T', b'D'];
-pub const TABLET_DEPLOYMENT_KEY_PREFIX: &[u8] = &[b'T', b'T'];
-pub const ROOT_KEY_PREFIX: &[u8] = &[b'a', b'1'];
-pub const RANGE_KEY_PREFIX: &[u8] = &[b'a', b'2'];
-pub const DATA_KEY_PREFIX: &[u8] = &[b'd'];
-pub const SYSTEM_KEY_PREFIX: &[u8] = &[b'd', b's'];
-pub const USER_KEY_PREFIX: &[u8] = &[b'd', b'u'];
+pub const TABLET_DESCRIPTOR_KEY_PREFIX: &[u8] = b"TD";
+pub const TABLET_DEPLOYMENT_KEY_PREFIX: &[u8] = b"TT";
+pub const ROOT_KEY_PREFIX: &[u8] = b"a1";
+pub const RANGE_KEY_PREFIX: &[u8] = b"a2";
+pub const DATA_KEY_PREFIX: &[u8] = b"d";
+pub const SYSTEM_KEY_PREFIX: &[u8] = b"ds";
+pub const USER_KEY_PREFIX: &[u8] = b"du";
 pub const MAX_KEY: &[u8] = &[0xffu8];
 
 pub type Key = Vec<u8>;
