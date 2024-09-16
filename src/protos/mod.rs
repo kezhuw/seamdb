@@ -441,6 +441,20 @@ impl BatchResponse {
             },
         }
     }
+
+    #[allow(clippy::result_large_err)]
+    pub fn into_increment(mut self) -> Result<IncrementResponse, Self> {
+        if self.responses.len() != 1 {
+            return Err(self);
+        }
+        match self.responses.remove(0) {
+            ShardResponse { response: DataResponse::Increment(increment), .. } => Ok(increment),
+            response => {
+                self.responses.push(response);
+                Err(self)
+            },
+        }
+    }
 }
 
 impl DataResponse {
