@@ -90,10 +90,7 @@ impl<T> StreamingRequester<T> {
     }
 
     pub async fn next(&mut self) -> Option<T> {
-        match self.stream.message().await {
-            Ok(message) => message,
-            Err(_) => None,
-        }
+        self.stream.message().await.unwrap_or_default()
     }
 }
 
