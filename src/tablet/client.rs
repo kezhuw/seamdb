@@ -339,31 +339,32 @@ impl TabletClient {
         self.get_shard_deployment(&shard, shard_key).await
     }
 
-    pub async fn tablet_client(
+    pub async fn connect(
         &self,
-        key: &[u8],
-    ) -> Result<(TabletId, TabletServiceClient<tonic::transport::Channel>)> {
-        let deployment = self.locate(key).await?;
+        deployment: &ShardDeployment,
+    ) -> Result<TabletServiceClient<tonic::transport::Channel>> {
         let Some(node) = deployment.node_id() else {
             return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
         };
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
             return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
-        let client =
+        let service =
             TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
-        Ok((deployment.tablet_id(), client))
+        Ok(service)
+    }
+
+    pub async fn service(
+        &self,
+        key: &[u8],
+    ) -> Result<(ShardDeployment, TabletServiceClient<tonic::transport::Channel>)> {
+        let deployment = self.locate(key).await?;
+        let service = self.connect(&deployment).await?;
+        Ok((deployment, service))
     }
 
     async fn request(&self, deployment: &ShardDeployment, request: DataRequest) -> Result<DataResponse> {
-        let Some(node) = deployment.node_id() else {
-            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
-        };
-        let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
-            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
-        };
-        let mut client =
-            TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
+        let mut service = self.connect(deployment).await?;
         let tablet_id = deployment.tablet_id().into();
         let shard_id = deployment.shard_id().into();
         let batch = BatchRequest {
@@ -372,43 +373,11 @@ impl TabletClient {
             temporal: Temporal::default(),
             requests: vec![ShardRequest { shard_id, request }],
         };
-        let response = client.batch(batch).await?.into_inner();
+        let response = service.batch(batch).await?.into_inner();
         let response = response
             .into_one()
             .map_err(|r| TabletClientError::unexpected(format!("expect one response, got {:?}", r)))?;
         Ok(response.response)
-    }
-
-    async fn relocate_one_request(&self, request: &mut DataRequest) -> Result<ShardDeployment> {
-        let user_key = keys::user_key(request.key());
-        let deployment = self.locate(&user_key).await?;
-        request.set_key(user_key);
-        let end_key = request.end_key();
-        if !end_key.is_empty() {
-            request.set_end_key(keys::user_key(end_key));
-        }
-        Ok(deployment)
-    }
-
-    fn relocate_user_responses(responses: &mut [DataResponse]) {
-        for response in responses {
-            match response {
-                DataResponse::Find(find) => {
-                    if !find.key.is_empty() {
-                        find.key.drain(0..keys::USER_KEY_PREFIX.len());
-                    }
-                },
-                DataResponse::Scan(scan) => {
-                    if scan.resume_key.strip_prefix(keys::USER_KEY_PREFIX).is_some() {
-                        scan.resume_key.drain(0..keys::USER_KEY_PREFIX.len());
-                    }
-                    scan.rows.iter_mut().for_each(|row| {
-                        row.key.drain(0..keys::USER_KEY_PREFIX.len());
-                    });
-                },
-                _ => {},
-            }
-        }
     }
 
     async fn request_batch(
@@ -442,10 +411,10 @@ impl TabletClient {
         let Some((first, remains)) = requests.split_first_mut() else {
             return Err(TabletClientError::invalid_argument("empty requests"));
         };
-        let deployment = self.relocate_one_request(first).await?;
+        let deployment = self.locate(first.key()).await?;
         let mut shards = vec![deployment.shard_id()];
         for request in remains {
-            let new_deployment = self.relocate_one_request(request).await?;
+            let new_deployment = self.locate(request.key()).await?;
             if deployment.tablet_id() != new_deployment.tablet_id() {
                 return Err(TabletClientError::invalid_argument(""));
             }
@@ -456,9 +425,7 @@ impl TabletClient {
             .zip(requests.into_iter())
             .map(|(shard_id, request)| ShardRequest { shard_id: shard_id.into(), request })
             .collect();
-        let mut responses = self.request_batch(&deployment, requests).await?;
-        Self::relocate_user_responses(&mut responses);
-        Ok(responses)
+        self.request_batch(&deployment, requests).await
     }
 
     async fn raw_get(
@@ -472,7 +439,7 @@ impl TabletClient {
         Ok(response.value.map(|v| (v.timestamp, v.value)))
     }
 
-    pub async fn get_key(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
+    pub async fn get(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
         let key = key.into().into_owned();
         let deployment = self.locate(&key).await?;
         let get = GetRequest { key, sequence: 0 };
@@ -481,37 +448,38 @@ impl TabletClient {
         Ok(response.value.map(|v| (v.timestamp, v.value)))
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
-        self.get_key(Cow::Owned(keys::user_key(key))).await
-    }
-
     async fn put_internally(
         &self,
-        key: &[u8],
+        key: Cow<'_, [u8]>,
         value: Option<Value>,
         expect_ts: Option<Timestamp>,
     ) -> Result<Timestamp> {
-        let user_key = keys::user_key(key);
-        let deployment = self.locate(&user_key).await?;
-        let put = PutRequest { key: user_key, value, sequence: 0, expect_ts };
+        let key = key.into_owned();
+        let deployment = self.locate(&key).await?;
+        let put = PutRequest { key, value, sequence: 0, expect_ts };
         let response = self.request(&deployment, DataRequest::Put(put)).await?;
         let response = response.into_put().map_err(|r| anyhow!("expect put response, get {:?}", r))?;
         Ok(response.write_ts)
     }
 
-    pub async fn delete(&self, key: &[u8], expect_ts: Option<Timestamp>) -> Result<()> {
-        self.put_internally(key, None, expect_ts).await?;
+    pub async fn delete(&self, key: impl Into<Cow<'_, [u8]>>, expect_ts: Option<Timestamp>) -> Result<()> {
+        self.put_internally(key.into(), None, expect_ts).await?;
         Ok(())
     }
 
-    pub async fn put(&self, key: &[u8], value: Value, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
-        self.put_internally(key, Some(value), expect_ts).await
+    pub async fn put(
+        &self,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Value,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
+        self.put_internally(key.into(), Some(value), expect_ts).await
     }
 
-    pub async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
-        let user_key = keys::user_key(key);
-        let deployment = self.locate(&user_key).await?;
-        let increment = IncrementRequest { key: user_key, increment, sequence: 0 };
+    pub async fn increment(&self, key: impl Into<Cow<'_, [u8]>>, increment: i64) -> Result<i64> {
+        let key = key.into();
+        let deployment = self.locate(key.as_ref()).await?;
+        let increment = IncrementRequest { key: key.to_vec(), increment, sequence: 0 };
         let response = self.request(&deployment, DataRequest::Increment(increment)).await?;
         let response = response.into_increment().map_err(|r| anyhow!("expect increment response, get {:?}", r))?;
         Ok(response.value)
@@ -557,13 +525,13 @@ impl TabletClient {
         request: ParticipateTxnRequest,
         coordinator: bool,
     ) -> Result<(mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>)> {
-        let (_tablet_id, mut client) = self.tablet_client(&request.txn.meta.key).await?;
+        let (_deployment, mut service) = self.service(&request.txn.meta.key).await?;
         let (sender, receiver) = mpsc::channel(128);
         sender.send(request).await.unwrap();
         let mut request = tonic::Request::new(ReceiverStream::new(receiver));
         let metadata = request.metadata_mut();
         metadata.insert("seamdb-txn-coordinator", coordinator.to_string().parse().unwrap());
-        let responses = client.participate_txn(request).await?.into_inner();
+        let responses = service.participate_txn(request).await?.into_inner();
         Ok((sender, responses))
     }
 }
@@ -633,24 +601,27 @@ mod tests {
 
         let client = TabletClient::new(cluster_env);
 
-        let count = client.increment(b"count", 5).await.unwrap();
+        let count = client.increment(keys::user_key(b"count"), 5).await.unwrap();
         assert_eq!(count, 5);
-        let count = client.increment(b"count", 5).await.unwrap();
+        let count = client.increment(keys::user_key(b"count"), 5).await.unwrap();
         assert_eq!(count, 10);
 
-        let put_ts = client.put(b"k1", Value::Bytes(b"v1_1".to_vec()), None).await.unwrap();
-        let (get_ts, value) = client.get(b"k1").await.unwrap().unwrap();
+        let put_ts = client.put(keys::user_key(b"k1"), Value::Bytes(b"v1_1".to_vec()), None).await.unwrap();
+        let (get_ts, value) = client.get(keys::user_key(b"k1")).await.unwrap().unwrap();
         assert_that!(get_ts).is_equal_to(put_ts);
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_1".to_vec());
 
-        let put_ts = client.put(b"k1", Value::Bytes(b"v1_2".to_vec()), Some(put_ts)).await.unwrap();
-        let (get_ts, value) = client.get(b"k1").await.unwrap().unwrap();
+        let put_ts = client.put(keys::user_key(b"k1"), Value::Bytes(b"v1_2".to_vec()), Some(put_ts)).await.unwrap();
+        let (get_ts, value) = client.get(keys::user_key(b"k1")).await.unwrap().unwrap();
         assert_that!(get_ts).is_equal_to(put_ts);
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_2".to_vec());
 
-        client.delete(b"k1", Some(put_ts)).await.unwrap();
-        assert_that!(client.get(b"k1").await.unwrap().is_none()).is_true();
-        let put_ts = client.put(b"k1", Value::Bytes(b"v1_3".to_vec()), Some(Timestamp::default())).await.unwrap();
+        client.delete(keys::user_key(b"k1"), Some(put_ts)).await.unwrap();
+        assert_that!(client.get(keys::user_key(b"k1")).await.unwrap().is_none()).is_true();
+        let put_ts = client
+            .put(keys::user_key(b"k1"), Value::Bytes(b"v1_3".to_vec()), Some(Timestamp::default()))
+            .await
+            .unwrap();
 
         let (ts, key, value) = client.find(b"k").await.unwrap().unwrap();
         assert_that!(ts).is_equal_to(put_ts);
@@ -690,11 +661,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let requests = vec![
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
-            DataRequest::Get(GetRequest { key: b"count".to_vec(), sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
+            DataRequest::Get(GetRequest { key: keys::user_key(b"count"), sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
             DataRequest::Put(PutRequest {
-                key: b"k1".to_vec(),
+                key: keys::user_key(b"k1"),
                 value: Some(Value::String("v1_1".to_owned())),
                 expect_ts: None,
                 sequence: 0,
@@ -708,9 +679,9 @@ mod tests {
         assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(5);
 
         let requests = vec![
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
             DataRequest::Put(PutRequest {
-                key: b"k1".to_vec(),
+                key: keys::user_key(b"k1"),
                 value: Some(Value::String("v1_1".to_owned())),
                 expect_ts: Some(Timestamp::ZERO),
                 sequence: 0,
@@ -719,9 +690,9 @@ mod tests {
         client.batch(requests).await.unwrap_err();
 
         let requests = vec![
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
             DataRequest::Put(PutRequest {
-                key: b"k1".to_vec(),
+                key: keys::user_key(b"k1"),
                 value: Some(Value::String("v1_2".to_owned())),
                 expect_ts: Some(put_ts),
                 sequence: 0,
@@ -732,15 +703,15 @@ mod tests {
         assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(15);
 
         let requests = vec![
-            DataRequest::Get(GetRequest { key: b"k1".to_vec(), sequence: 0 }),
-            DataRequest::Find(FindRequest { key: b"k1".to_vec(), sequence: 0 }),
+            DataRequest::Get(GetRequest { key: keys::user_key(b"k1"), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: keys::user_key(b"k1"), sequence: 0 }),
         ];
         let mut responses = client.batch(requests).await.unwrap();
 
         let expect_value = TimestampedValue { value: Value::String("v1_2".to_owned()), timestamp: put_ts };
 
         let find = responses.pop().unwrap().into_find().unwrap();
-        assert_that!(find.key).is_equal_to(b"k1".to_vec());
+        assert_that!(find.key).is_equal_to(keys::user_key(b"k1"));
         assert_that!(find.value.unwrap()).is_equal_to(&expect_value);
 
         let get = responses.pop().unwrap().into_get().unwrap();
@@ -772,11 +743,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let requests = vec![
-            DataRequest::Find(FindRequest { key: b"count".to_vec(), sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: b"count0".to_vec(), increment: 5, sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: b"count1".to_vec(), increment: 10, sequence: 0 }),
-            DataRequest::Find(FindRequest { key: b"count".to_vec(), sequence: 0 }),
-            DataRequest::Find(FindRequest { key: b"count01".to_vec(), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: keys::user_key(b"count"), sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count0"), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count1"), increment: 10, sequence: 0 }),
+            DataRequest::Find(FindRequest { key: keys::user_key(b"count"), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: keys::user_key(b"count01"), sequence: 0 }),
         ];
         let mut responses = client.batch(requests).await.unwrap();
         let find = responses.remove(0).into_find().unwrap();
@@ -787,12 +758,12 @@ mod tests {
         responses.remove(0);
 
         let find0 = responses.remove(0).into_find().unwrap();
-        assert_that!(find0.key).is_equal_to(b"count0".to_vec());
+        assert_that!(find0.key).is_equal_to(keys::user_key(b"count0"));
         assert_that!(find0.value).is_some();
         assert_that!(find0.value.unwrap().value).is_equal_to(Value::Int(5));
 
         let find1 = responses.remove(0).into_find().unwrap();
-        assert_that!(find1.key).is_equal_to(b"count1".to_vec());
+        assert_that!(find1.key).is_equal_to(keys::user_key(b"count1"));
         assert_that!(find1.value.unwrap().value).is_equal_to(Value::Int(10));
     }
 
@@ -822,15 +793,15 @@ mod tests {
 
         let requests = vec![
             DataRequest::Scan(ScanRequest {
-                range: KeyRange { start: b"count".to_vec(), end: b"counu".to_vec() },
+                range: KeyRange { start: keys::user_key(b"count"), end: keys::user_key(b"counu") },
                 limit: 0,
                 sequence: 0,
             }),
-            DataRequest::Increment(IncrementRequest { key: b"count0".to_vec(), increment: 5, sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: b"count1".to_vec(), increment: 10, sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: b"count2".to_vec(), increment: 15, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count0"), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count1"), increment: 10, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count2"), increment: 15, sequence: 0 }),
             DataRequest::Scan(ScanRequest {
-                range: KeyRange { start: b"count".to_vec(), end: b"counu".to_vec() },
+                range: KeyRange { start: keys::user_key(b"count"), end: keys::user_key(b"counu") },
                 limit: 2,
                 sequence: 0,
             }),
@@ -847,9 +818,9 @@ mod tests {
         let scan = responses.remove(0).into_scan().unwrap();
         debug!("resume key: {:?}", scan.resume_key);
         assert_that!(scan.rows).has_length(2);
-        assert_that!(scan.rows[0].key).is_equal_to(b"count0".to_vec());
+        assert_that!(scan.rows[0].key).is_equal_to(keys::user_key(b"count0"));
         assert_that!(scan.rows[0].value).is_equal_to(Value::Int(5));
-        assert_that!(scan.rows[1].key).is_equal_to(b"count1".to_vec());
+        assert_that!(scan.rows[1].key).is_equal_to(keys::user_key(b"count1"));
         assert_that!(scan.rows[1].value).is_equal_to(Value::Int(10));
     }
 
@@ -895,11 +866,11 @@ mod tests {
             }),
         ];
 
-        let (tablet_id, mut tablet_client) = client.tablet_client(&txn.meta.key).await.unwrap();
+        let (deployment, mut service) = client.service(&txn.meta.key).await.unwrap();
 
-        let mut responses = tablet_client
+        let mut responses = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn),
                 requests: requests.into_iter().map(|request| ShardRequest { shard_id: 0, request }).collect(),
                 ..Default::default()
@@ -951,12 +922,11 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let locating_key = keys::user_key(b"count");
-        let deployment = client.locate(&locating_key).await.unwrap();
-        let (tablet_id, mut tablet_client) = client.tablet_client(&locating_key).await.unwrap();
+        let (deployment, mut service) = client.service(&locating_key).await.unwrap();
         let txn = client.new_transaction(locating_key);
-        tablet_client
+        service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: deployment.shard_id().into(),
@@ -971,9 +941,9 @@ mod tests {
             .await
             .unwrap();
 
-        let get = tablet_client
+        let get = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: deployment.shard_id().into(),
@@ -1014,27 +984,22 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let locating_key = keys::user_key(b"count");
-        let deployment = client.locate(&locating_key).await.unwrap();
-        let (tablet_id, mut tablet_client) = client.tablet_client(&locating_key).await.unwrap();
-        let mut requests = vec![
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 1 }),
-            DataRequest::Get(GetRequest { key: b"count".to_vec(), sequence: 1 }),
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 2 }),
+        let (deployment, mut service) = client.service(&locating_key).await.unwrap();
+        let requests = vec![
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 1 }),
+            DataRequest::Get(GetRequest { key: keys::user_key(b"count"), sequence: 1 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 2 }),
             DataRequest::Put(PutRequest {
-                key: b"k1".to_vec(),
+                key: keys::user_key(b"k1"),
                 value: Some(Value::String("v1_1".to_owned())),
                 expect_ts: None,
                 sequence: 2,
             }),
         ];
-        requests.iter_mut().for_each(|r| {
-            let key = keys::user_key(r.key());
-            r.set_key(key);
-        });
         let mut txn = client.new_transaction(locating_key);
         txn.status = TxnStatus::Committed;
         let batch_request = BatchRequest {
-            tablet_id: tablet_id.into(),
+            tablet_id: deployment.tablet_id().into(),
             temporal: Temporal::Transaction(txn),
             requests: requests
                 .into_iter()
@@ -1042,12 +1007,12 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        tablet_client.batch(batch_request).await.unwrap().into_inner();
+        service.batch(batch_request).await.unwrap().into_inner();
 
-        let incremented = client.increment(b"count", 100).await.unwrap();
+        let incremented = client.increment(keys::user_key(b"count"), 100).await.unwrap();
         assert_eq!(incremented, 110);
 
-        let (_ts, value) = client.get(b"k1").await.unwrap().unwrap();
+        let (_ts, value) = client.get(keys::user_key(b"k1")).await.unwrap().unwrap();
         assert_eq!(value, Value::String("v1_1".to_owned()));
     }
 
@@ -1076,26 +1041,21 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let locating_key = keys::user_key(b"count");
-        let deployment = client.locate(&locating_key).await.unwrap();
-        let (tablet_id, mut tablet_client) = client.tablet_client(&locating_key).await.unwrap();
-        let mut requests = vec![
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 1 }),
-            DataRequest::Get(GetRequest { key: b"count".to_vec(), sequence: 1 }),
-            DataRequest::Increment(IncrementRequest { key: b"count".to_vec(), increment: 5, sequence: 2 }),
+        let (deployment, mut service) = client.service(&locating_key).await.unwrap();
+        let requests = vec![
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 1 }),
+            DataRequest::Get(GetRequest { key: keys::user_key(b"count"), sequence: 1 }),
+            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 2 }),
             DataRequest::Put(PutRequest {
-                key: b"k1".to_vec(),
+                key: keys::user_key(b"k1"),
                 value: Some(Value::String("v1_1".to_owned())),
                 expect_ts: None,
                 sequence: 3,
             }),
         ];
-        requests.iter_mut().for_each(|r| {
-            let key = keys::user_key(r.key());
-            r.set_key(key);
-        });
         let mut txn = client.new_transaction(locating_key);
         let batch_request = BatchRequest {
-            tablet_id: tablet_id.into(),
+            tablet_id: deployment.tablet_id().into(),
             temporal: Temporal::Transaction(txn.clone()),
             requests: requests
                 .into_iter()
@@ -1103,10 +1063,10 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        tablet_client.batch(batch_request).await.unwrap().into_inner();
+        service.batch(batch_request).await.unwrap().into_inner();
 
-        let incremented_future = client.increment(b"count", 100);
-        let get_future = client.get(b"k1");
+        let incremented_future = client.increment(keys::user_key(b"count"), 100);
+        let get_future = client.get(keys::user_key(b"k1"));
         let mut incremented_future = pin!(incremented_future);
         let mut get_future = pin!(get_future);
 
@@ -1116,9 +1076,9 @@ mod tests {
                 r = get_future.as_mut() => unreachable!("{r:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
             }
-            tablet_client
+            service
                 .batch(BatchRequest {
-                    tablet_id: tablet_id.into(),
+                    tablet_id: deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(txn.clone()),
                     ..Default::default()
                 })
@@ -1128,9 +1088,9 @@ mod tests {
 
         txn.status = TxnStatus::Committed;
         txn.rollbacked_sequences.push(SequenceRange { start: 2, end: 3 });
-        let response = tablet_client
+        let response = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn),
                 ..Default::default()
             })
@@ -1185,7 +1145,7 @@ mod tests {
 
         let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
         let tablet_id_counter = client
-            .get_key(tablet_id_counter_key.clone())
+            .get(tablet_id_counter_key.clone())
             .await
             .unwrap()
             .unwrap()
@@ -1193,16 +1153,17 @@ mod tests {
             .read_int(b"tablet-id-counter", "read")
             .unwrap();
 
-        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+        let (system_tablet_deployment, mut system_tablet_service) =
+            client.service(&tablet_id_counter_key).await.unwrap();
 
         let user_tablet_key = keys::user_key(b"counter");
-        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+        let (user_tablet_deployment, mut user_tablet_service) = client.service(&user_tablet_key).await.unwrap();
 
         let mut txn = client.new_transaction(tablet_id_counter_key.clone());
 
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1216,9 +1177,9 @@ mod tests {
             })
             .await
             .unwrap();
-        user_tablet_client
+        user_tablet_service
             .batch(BatchRequest {
-                tablet_id: user_tablet_id.into(),
+                tablet_id: user_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1233,8 +1194,8 @@ mod tests {
             .await
             .unwrap();
 
-        let user_tablet_get_future = client.get_key(user_tablet_key.clone());
-        let system_tablet_get_future = client.get_key(tablet_id_counter_key.clone());
+        let user_tablet_get_future = client.get(user_tablet_key.clone());
+        let system_tablet_get_future = client.get(tablet_id_counter_key.clone());
 
         let mut user_tablet_get_future = pin!(user_tablet_get_future);
         let mut system_tablet_get_future = pin!(system_tablet_get_future);
@@ -1245,9 +1206,9 @@ mod tests {
                 r = system_tablet_get_future.as_mut() => unreachable!("{r:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
             }
-            system_tablet_client
+            system_tablet_service
                 .batch(BatchRequest {
-                    tablet_id: system_tablet_id.into(),
+                    tablet_id: system_tablet_deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(txn.clone()),
                     ..Default::default()
                 })
@@ -1256,9 +1217,9 @@ mod tests {
         }
 
         txn.status = TxnStatus::Committed;
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(Transaction {
                     commit_set: vec![KeySpan { key: keys::user_key(b"counter"), end: vec![] }, KeySpan {
                         key: keys::system_key(b"tablet-id-counter"),
@@ -1316,7 +1277,7 @@ mod tests {
 
         let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
         let tablet_id_counter = client
-            .get_key(tablet_id_counter_key.clone())
+            .get(tablet_id_counter_key.clone())
             .await
             .unwrap()
             .unwrap()
@@ -1324,16 +1285,17 @@ mod tests {
             .read_int(b"tablet-id-counter", "read")
             .unwrap();
 
-        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+        let (system_tablet_deployment, mut system_tablet_service) =
+            client.service(&tablet_id_counter_key).await.unwrap();
 
         let user_tablet_key = keys::user_key(b"counter");
-        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+        let (user_tablet_deployment, mut user_tablet_service) = client.service(&user_tablet_key).await.unwrap();
 
         let mut txn = client.new_transaction(tablet_id_counter_key.clone());
 
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1347,9 +1309,9 @@ mod tests {
             })
             .await
             .unwrap();
-        user_tablet_client
+        user_tablet_service
             .batch(BatchRequest {
-                tablet_id: user_tablet_id.into(),
+                tablet_id: user_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1364,8 +1326,8 @@ mod tests {
             .await
             .unwrap();
 
-        let user_tablet_get_future = client.get_key(user_tablet_key.clone());
-        let system_tablet_get_future = client.get_key(tablet_id_counter_key.clone());
+        let user_tablet_get_future = client.get(user_tablet_key.clone());
+        let system_tablet_get_future = client.get(tablet_id_counter_key.clone());
 
         let mut user_tablet_get_future = pin!(user_tablet_get_future);
         let mut system_tablet_get_future = pin!(system_tablet_get_future);
@@ -1376,9 +1338,9 @@ mod tests {
                 r = system_tablet_get_future.as_mut() => unreachable!("{r:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(2)) => {},
             }
-            system_tablet_client
+            system_tablet_service
                 .batch(BatchRequest {
-                    tablet_id: system_tablet_id.into(),
+                    tablet_id: system_tablet_deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(txn.clone()),
                     ..Default::default()
                 })
@@ -1387,9 +1349,9 @@ mod tests {
         }
 
         txn.status = TxnStatus::Aborted;
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(Transaction {
                     commit_set: vec![KeySpan { key: keys::user_key(b"counter"), end: vec![] }, KeySpan {
                         key: keys::system_key(b"tablet-id-counter"),
@@ -1446,7 +1408,7 @@ mod tests {
 
         let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
         let tablet_id_counter = client
-            .get_key(tablet_id_counter_key.clone())
+            .get(tablet_id_counter_key.clone())
             .await
             .unwrap()
             .unwrap()
@@ -1454,16 +1416,17 @@ mod tests {
             .read_int(b"tablet-id-counter", "read")
             .unwrap();
 
-        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+        let (system_tablet_deployment, mut system_tablet_service) =
+            client.service(&tablet_id_counter_key).await.unwrap();
 
         let user_tablet_key = keys::user_key(b"counter");
-        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+        let (user_tablet_deployment, mut user_tablet_service) = client.service(&user_tablet_key).await.unwrap();
 
         let txn = client.new_transaction(tablet_id_counter_key.clone());
 
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1477,9 +1440,9 @@ mod tests {
             })
             .await
             .unwrap();
-        user_tablet_client
+        user_tablet_service
             .batch(BatchRequest {
-                tablet_id: user_tablet_id.into(),
+                tablet_id: user_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1494,20 +1457,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            client.get_key(tablet_id_counter_key.clone()).await.unwrap().unwrap().1,
-            Value::Int(tablet_id_counter)
-        );
-        assert!(client.get_key(user_tablet_key.clone()).await.unwrap().is_none());
+        assert_eq!(client.get(tablet_id_counter_key.clone()).await.unwrap().unwrap().1, Value::Int(tablet_id_counter));
+        assert!(client.get(user_tablet_key.clone()).await.unwrap().is_none());
     }
 
     async fn heartbeat_txn(client: TabletClient, txn: TxnMeta) {
         let mut txn = Transaction { meta: txn, ..Default::default() };
-        let (tablet_id, mut tablet_client) = client.tablet_client(txn.key()).await.unwrap();
+        let (deployment, mut service) = client.service(txn.key()).await.unwrap();
         loop {
-            txn = tablet_client
+            txn = service
                 .batch(BatchRequest {
-                    tablet_id: tablet_id.into(),
+                    tablet_id: deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(txn),
                     ..Default::default()
                 })
@@ -1547,16 +1507,17 @@ mod tests {
 
         let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
 
-        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+        let (system_tablet_deployment, mut system_tablet_service) =
+            client.service(&tablet_id_counter_key).await.unwrap();
 
         let user_tablet_key = keys::user_key(b"counter");
-        let (user_tablet_id, mut user_tablet_client) = client.tablet_client(&user_tablet_key).await.unwrap();
+        let (user_tablet_deployment, mut user_tablet_service) = client.service(&user_tablet_key).await.unwrap();
 
         let mut txn = client.new_transaction(tablet_id_counter_key.clone());
 
-        let tablet_id_counter = system_tablet_client
+        let tablet_id_counter = system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1580,9 +1541,9 @@ mod tests {
 
         select! {
             _ = heartbeat.as_mut() => unreachable!(""),
-            Ok(_) = user_tablet_client
+            Ok(_) = user_tablet_service
                 .batch(BatchRequest {
-                    tablet_id: user_tablet_id.into(),
+                    tablet_id: user_tablet_deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(txn.clone()),
                     requests: vec![ShardRequest {
                         shard_id: 0,
@@ -1603,9 +1564,9 @@ mod tests {
         }
         txn.commit_ts = client.now();
 
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1626,9 +1587,9 @@ mod tests {
 
         select! {
             _ = heartbeat.as_mut() => unreachable!(""),
-            Ok(_) = system_tablet_client
+            Ok(_) = system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Timestamp(client.now()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1649,9 +1610,9 @@ mod tests {
         }
         txn.commit_ts = client.now();
 
-        let status = system_tablet_client
+        let status = system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1694,13 +1655,14 @@ mod tests {
 
         let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
 
-        let (system_tablet_id, mut system_tablet_client) = client.tablet_client(&tablet_id_counter_key).await.unwrap();
+        let (system_tablet_deployment, mut system_tablet_service) =
+            client.service(&tablet_id_counter_key).await.unwrap();
 
         let mut system_tablet_txn = client.new_transaction(tablet_id_counter_key.clone());
 
-        system_tablet_client
+        system_tablet_service
             .batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(system_tablet_txn.clone()),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1721,16 +1683,16 @@ mod tests {
         let user_tablet_key = keys::user_key(b"counter");
         let user_tablet_txn = client.new_transaction(user_tablet_key.clone());
 
-        let (user_tablet_id, mut user_tablet_client) = select! {
+        let (user_tablet_deployment, mut user_tablet_service) = select! {
             _ = system_tablet_txn_heartbeat.as_mut() => unreachable!(""),
-            Ok((user_tablet_id, user_tablet_client)) = client.tablet_client(&user_tablet_key) => (user_tablet_id, user_tablet_client),
+            Ok((user_tablet_deployment, user_tablet_service)) = client.service(&user_tablet_key) => (user_tablet_deployment, user_tablet_service),
         };
 
         select! {
             _ = system_tablet_txn_heartbeat.as_mut() => unreachable!(""),
-            Ok(_) = user_tablet_client
+            Ok(_) = user_tablet_service
                 .batch(BatchRequest {
-                    tablet_id: user_tablet_id.into(),
+                    tablet_id: user_tablet_deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(user_tablet_txn.clone()),
                     requests: vec![ShardRequest {
                         shard_id: 0,
@@ -1747,12 +1709,12 @@ mod tests {
         let user_tablet_txn_heartbeat = heartbeat_txn(client.clone(), user_tablet_txn.meta.clone());
         let mut user_tablet_txn_heartbeat = pin!(user_tablet_txn_heartbeat);
 
-        let mut system_tablet_txn_user_operation_client = user_tablet_client.clone();
+        let mut system_tablet_txn_user_operation_client = user_tablet_service.clone();
         let system_tablet_txn_user_operation = {
             let user_tablet_key = user_tablet_key.clone();
             let system_tablet_txn = system_tablet_txn.clone();
             system_tablet_txn_user_operation_client.batch(BatchRequest {
-                tablet_id: user_tablet_id.into(),
+                tablet_id: user_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(system_tablet_txn),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1774,12 +1736,12 @@ mod tests {
             _ = tokio::time::sleep(Duration::from_millis(20)) => {},
         }
 
-        let mut user_tablet_txn_system_client = Box::new(system_tablet_client.clone());
+        let mut user_tablet_txn_system_client = Box::new(system_tablet_service.clone());
         let user_tablet_txn_system_operation = {
             let tablet_id_counter_key = tablet_id_counter_key.clone();
             let user_tablet_txn = user_tablet_txn.clone();
             user_tablet_txn_system_client.batch(BatchRequest {
-                tablet_id: system_tablet_id.into(),
+                tablet_id: system_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(user_tablet_txn),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1804,9 +1766,9 @@ mod tests {
         system_tablet_txn.status = TxnStatus::Committed;
         select! {
             _ = user_tablet_txn_heartbeat.as_mut() => unreachable!(""),
-            Ok(_) = system_tablet_client
+            Ok(_) = system_tablet_service
                 .batch(BatchRequest {
-                    tablet_id: system_tablet_id.into(),
+                    tablet_id: system_tablet_deployment.tablet_id().into(),
                     temporal: Temporal::Transaction(Transaction {
                         commit_set: vec![KeySpan { key: keys::user_key(b"counter"), end: vec![] }, KeySpan {
                             key: keys::system_key(b"tablet-id-counter"),
@@ -1818,9 +1780,9 @@ mod tests {
                 }) => {},
         }
 
-        let piggybacked_user_tablet_txn = user_tablet_client
+        let piggybacked_user_tablet_txn = user_tablet_service
             .batch(BatchRequest {
-                tablet_id: user_tablet_id.into(),
+                tablet_id: user_tablet_deployment.tablet_id().into(),
                 temporal: Temporal::Transaction(user_tablet_txn.clone()),
                 ..Default::default()
             })
@@ -1831,7 +1793,7 @@ mod tests {
             .into_transaction();
         assert_eq!(piggybacked_user_tablet_txn.epoch(), user_tablet_txn.epoch() + 1);
 
-        let (_ts, value) = client.get(b"counter").await.unwrap().unwrap();
+        let (_ts, value) = client.get(keys::user_key(b"counter")).await.unwrap().unwrap();
         assert_eq!(value, Value::Int(50));
     }
 
@@ -1863,11 +1825,11 @@ mod tests {
 
         let counter_key = keys::user_key(b"counter");
 
-        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+        let (deployment, mut service) = client.service(&counter_key).await.unwrap();
 
-        let response = tablet_client
+        let response = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: deployment.tablet_id().into(),
                 temporal: Temporal::Timestamp(write_ts),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1914,15 +1876,15 @@ mod tests {
 
         let counter_key = keys::user_key(b"counter");
 
-        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+        let (shard, mut service) = client.service(&counter_key).await.unwrap();
 
         let write_ts = client.now();
         let not_found_read_ts = client.now();
         assert_that!(not_found_read_ts).is_greater_than(write_ts);
 
-        tablet_client
+        service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Timestamp(not_found_read_ts),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1933,9 +1895,9 @@ mod tests {
             .await
             .unwrap();
 
-        let response = tablet_client
+        let response = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Timestamp(write_ts),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1959,9 +1921,9 @@ mod tests {
         let read_ts = client.now();
         assert_that!(read_ts).is_greater_than(write_ts);
 
-        let read_value = tablet_client
+        let read_value = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Timestamp(read_ts),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -1979,9 +1941,9 @@ mod tests {
         assert_that!(read_value.value).is_equal_to(Value::Int(1));
         assert_that!(read_value.timestamp).is_equal_to(written_ts);
 
-        let response = tablet_client
+        let response = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Timestamp(write_ts),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -2029,15 +1991,15 @@ mod tests {
         let counter_key = keys::user_key(b"counter");
         let txn = client.new_transaction(counter_key.clone());
 
-        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+        let (shard, mut service) = client.service(&counter_key).await.unwrap();
 
         let not_found_read_ts = client.now();
         let write_ts = txn.commit_ts();
         assert_that!(not_found_read_ts).is_greater_than(write_ts);
 
-        tablet_client
+        service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Timestamp(not_found_read_ts),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -2048,9 +2010,9 @@ mod tests {
             .await
             .unwrap();
 
-        let mut response = tablet_client
+        let mut response = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Transaction(txn),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -2070,9 +2032,9 @@ mod tests {
         let written_ts = txn.commit_ts();
         assert_that!(written_ts).is_greater_than(write_ts);
 
-        tablet_client
+        service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Transaction(Transaction { status: TxnStatus::Committed, ..txn }),
                 ..Default::default()
             })
@@ -2080,9 +2042,9 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        let read_value = tablet_client
+        let read_value = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 requests: vec![ShardRequest {
                     shard_id: 0,
                     request: DataRequest::Get(GetRequest { key: counter_key.clone(), sequence: 0 }),
@@ -2127,11 +2089,11 @@ mod tests {
         let counter_key = keys::user_key(b"counter");
         let txn = client.new_transaction(counter_key.clone());
 
-        let (tablet_id, mut tablet_client) = client.tablet_client(&counter_key).await.unwrap();
+        let (shard, mut service) = client.service(&counter_key).await.unwrap();
 
-        let mut response = tablet_client
+        let mut response = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Transaction(txn),
                 requests: vec![ShardRequest {
                     shard_id: 0,
@@ -2157,9 +2119,9 @@ mod tests {
         };
 
         let write_ts = txn.commit_ts();
-        let txn = tablet_client
+        let txn = service
             .batch(BatchRequest {
-                tablet_id: tablet_id.into(),
+                tablet_id: shard.tablet_id().into(),
                 temporal: Temporal::Transaction(Transaction { status: TxnStatus::Committed, ..txn }),
                 ..Default::default()
             })

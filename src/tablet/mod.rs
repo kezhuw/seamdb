@@ -24,7 +24,7 @@ mod service;
 mod store;
 mod types;
 
-pub use self::client::TabletClient;
+pub use self::client::{TabletClient, TabletClientError};
 pub use self::concurrency::{LockTable, Request, TxnTable};
 pub use self::deployer::{TabletDeployServant, TabletDeployer};
 pub use self::loader::{
