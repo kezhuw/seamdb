@@ -46,6 +46,7 @@ use crate::protos::{
     TabletServiceClient,
     Temporal,
     Timestamp,
+    TimestampedValue,
     Transaction,
     TxnMeta,
     Uuid,
@@ -499,6 +500,81 @@ impl TabletClient {
                 Ok(Some((value.timestamp, key, value.value)))
             },
         }
+    }
+
+    pub async fn transactional_get(
+        &self,
+        txn: Transaction,
+        key: &[u8],
+        sequence: u32,
+    ) -> Result<(Transaction, Option<TimestampedValue>)> {
+        let (shard, mut service) = self.service(key).await?;
+        let mut response = service
+            .batch(BatchRequest {
+                tablet_id: shard.tablet_id().into(),
+                temporal: Temporal::Transaction(txn),
+                requests: vec![ShardRequest {
+                    shard_id: shard.shard_id().into(),
+                    request: DataRequest::Get(GetRequest { key: key.to_owned(), sequence }),
+                }],
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let txn = std::mem::take(&mut response.temporal).into_transaction();
+        let get = response.into_get().map_err(|r| anyhow!("expect get response, get {r:?}"))?;
+        Ok((txn, get.value))
+    }
+
+    pub async fn transactional_put(
+        &self,
+        txn: Transaction,
+        key: &[u8],
+        value: Option<Value>,
+        sequence: u32,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Transaction> {
+        let (shard, mut service) = self.service(key).await?;
+        let mut response = service
+            .batch(BatchRequest {
+                tablet_id: shard.tablet_id().into(),
+                temporal: Temporal::Transaction(txn),
+                requests: vec![ShardRequest {
+                    shard_id: shard.shard_id().into(),
+                    request: DataRequest::Put(PutRequest { key: key.to_owned(), value, sequence, expect_ts }),
+                }],
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let txn = std::mem::take(&mut response.temporal).into_transaction();
+        response.into_put().map_err(|r| anyhow!("expect put response, get {r:?}"))?;
+        Ok(txn)
+    }
+
+    pub async fn transactional_increment(
+        &self,
+        txn: Transaction,
+        key: &[u8],
+        increment: i64,
+        sequence: u32,
+    ) -> Result<(Transaction, i64)> {
+        let (shard, mut service) = self.service(key).await?;
+        let mut response = service
+            .batch(BatchRequest {
+                tablet_id: shard.tablet_id().into(),
+                temporal: Temporal::Transaction(txn),
+                requests: vec![ShardRequest {
+                    shard_id: shard.shard_id().into(),
+                    request: DataRequest::Increment(IncrementRequest { key: key.to_owned(), increment, sequence }),
+                }],
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let txn = std::mem::take(&mut response.temporal).into_transaction();
+        let increment = response.into_increment().map_err(|r| anyhow!("expect increment response, get {r:?}"))?;
+        Ok((txn, increment.value))
     }
 
     pub async fn open_participate_txn(

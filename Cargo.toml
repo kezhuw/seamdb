@@ -56,9 +56,11 @@ futures = "0.3.28"
 thiserror = "1.0.48"
 tokio-stream = "0.1.15"
 asyncs = "0.3.0"
+async-io = "2.3.4"
 
 [dev-dependencies]
 assertor = "0.0.2"
+asyncs = { version = "0.3.0", features = ["test", "tokio"] }
 env_logger = "0.10.0"
 serial_test = "2.0.0"
 speculoos = "0.11.0"

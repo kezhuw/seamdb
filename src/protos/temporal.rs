@@ -38,9 +38,18 @@ impl Temporal {
             Temporal::Transaction(txn) => txn,
         }
     }
+
+    pub fn txn(&self) -> &Transaction {
+        match self {
+            Temporal::Timestamp(ts) => panic!("expect transaction, got timestamp {ts}"),
+            Temporal::Transaction(txn) => txn,
+        }
+    }
 }
 
 impl Transaction {
+    pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
     pub fn comparer() -> impl Fn(&Transaction, &Transaction) -> Ordering {
         let comparer = TxnMeta::comparer();
         move |a, b| comparer(&a.meta, &b.meta)
@@ -70,7 +79,7 @@ impl Transaction {
     }
 
     pub fn next_heartbeat_ts(&self) -> Timestamp {
-        self.heartbeat_ts.max(self.start_ts()).into_physical() + Duration::from_millis(500)
+        self.heartbeat_ts.max(self.start_ts()).into_physical() + Self::HEARTBEAT_INTERVAL
     }
 
     pub fn restart(&mut self) {
