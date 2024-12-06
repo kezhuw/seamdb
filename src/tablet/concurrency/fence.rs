@@ -56,7 +56,7 @@ impl Barrier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Fence {
     span: KeySpan,
     barrier: Barrier,
@@ -70,14 +70,17 @@ impl Fence {
     pub fn split(&mut self, pivot: Vec<u8>) -> Self {
         let mut end = pivot;
         std::mem::swap(&mut self.span.end, &mut end);
-        let next_span = KeySpan { key: self.span.end.clone(), end };
+        let next_span = KeySpan {
+            key: self.span.end().into_owned(),
+            end,
+        };
         Self { span: next_span, barrier: self.barrier }
     }
 }
 
 /// Fence table tracks maximum span read timestamp to calculate minimum span write timestamp to
 /// prevent write-beneath-read.
-#[derive(Default, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct FenceTable {
     fences: Vec<Fence>,
     closed_ts: Timestamp,
@@ -168,7 +171,8 @@ impl FenceTable {
                 },
                 SpanOrdering::ContainLeft => {
                     fence.barrier.update(txn_id, ts);
-                    span.key.clone_from(&fence.span.end);
+                    span.key.clear();
+                    fence.span.append_end(&mut span.key);
                     i += 1;
                 },
                 SpanOrdering::ContainAll => {
@@ -258,7 +262,7 @@ mod tests {
 
     use assertor::*;
 
-    use super::FenceTable;
+    use super::{Fence, FenceTable};
     use crate::protos::{KeySpan, Timestamp, Uuid};
 
     #[test]
@@ -274,23 +278,23 @@ mod tests {
         let txn3 = Uuid::new_random();
 
         let mut fences = FenceTable::default();
-        assert_that!(fences.min_write_ts(Uuid::nil(), &vec![KeySpan::new_key(b"k1")], Timestamp::ZERO))
+        assert_that!(fences.min_write_ts(Uuid::nil(), &[KeySpan::new_key(b"k1")], Timestamp::ZERO))
             .is_equal_to(Timestamp::ZERO.next());
-        assert_that!(fences.min_write_ts(Uuid::nil(), &vec![KeySpan::new_key(b"k1")], ts10)).is_equal_to(ts10);
-        assert_that!(fences.min_write_ts(Uuid::new_random(), &vec![KeySpan::new_key(b"k1")], Timestamp::ZERO))
+        assert_that!(fences.min_write_ts(Uuid::nil(), &[KeySpan::new_key(b"k1")], ts10)).is_equal_to(ts10);
+        assert_that!(fences.min_write_ts(Uuid::new_random(), &[KeySpan::new_key(b"k1")], Timestamp::ZERO))
             .is_equal_to(Timestamp::ZERO.next());
-        assert_that!(fences.min_write_ts(Uuid::new_random(), &vec![KeySpan::new_key(b"k1")], ts10)).is_equal_to(ts10);
+        assert_that!(fences.min_write_ts(Uuid::new_random(), &[KeySpan::new_key(b"k1")], ts10)).is_equal_to(ts10);
 
         // given: close ts50
         fences.close_ts(ts50);
 
         // then: min write ts advances to ts50.next()
-        assert_that!(fences.min_write_ts(Uuid::nil(), &vec![KeySpan::new_key(b"k1")], Timestamp::ZERO))
+        assert_that!(fences.min_write_ts(Uuid::nil(), &[KeySpan::new_key(b"k1")], Timestamp::ZERO))
             .is_equal_to(ts50.next());
-        assert_that!(fences.min_write_ts(Uuid::nil(), &vec![KeySpan::new_key(b"k1")], ts10)).is_equal_to(ts50.next());
-        assert_that!(fences.min_write_ts(Uuid::new_random(), &vec![KeySpan::new_key(b"k1")], Timestamp::ZERO))
+        assert_that!(fences.min_write_ts(Uuid::nil(), &[KeySpan::new_key(b"k1")], ts10)).is_equal_to(ts50.next());
+        assert_that!(fences.min_write_ts(Uuid::new_random(), &[KeySpan::new_key(b"k1")], Timestamp::ZERO))
             .is_equal_to(ts50.next());
-        assert_that!(fences.min_write_ts(Uuid::new_random(), &vec![KeySpan::new_key(b"k1")], ts10))
+        assert_that!(fences.min_write_ts(Uuid::new_random(), &[KeySpan::new_key(b"k1")], ts10))
             .is_equal_to(ts50.next());
 
         // given:
@@ -387,5 +391,42 @@ mod tests {
         assert_that!(fences.min_write_ts(txn3, &[KeySpan::new_range(b"k16", b"k21")], ts70)).is_equal_to(ts70.next());
 
         fences.fence(Uuid::nil(), KeySpan::new_range("k19", "k20"), ts70);
+    }
+
+    #[test]
+    fn contain_all_span_key() {
+        let mut fences = FenceTable::default();
+        let txn_id = Uuid::new_random();
+        let ts = Timestamp::ZERO + Duration::from_secs(10);
+
+        fences.fences.push(Fence::new(KeySpan { key: b"abc".to_vec(), end: vec![] }, txn_id, ts));
+        fences.fences.push(Fence::new(KeySpan { key: b"abd".to_vec(), end: b"abe".to_vec() }, txn_id, ts));
+        fences.fences.push(Fence::new(KeySpan { key: b"abef".to_vec(), end: vec![] }, txn_id, ts));
+
+        fences.fence(txn_id, KeySpan { key: b"ab".to_vec(), end: b"af".to_vec() }, ts);
+    }
+
+    #[test]
+    fn subset_all_span_key() {
+        let mut fences = FenceTable::default();
+        let txn_id = Uuid::new_random();
+        let ts = Timestamp::ZERO + Duration::from_secs(10);
+
+        fences.fences.push(Fence::new(KeySpan { key: b"abc".to_vec(), end: b"abf".to_vec() }, txn_id, ts));
+        fences.fence(txn_id, KeySpan { key: b"abd".to_vec(), end: vec![] }, ts + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn contain_left_span_key() {
+        use std::str::FromStr;
+        let mut fences = FenceTable::default();
+        let txn_id = uuid::Uuid::from_str("5f8c2d8b-965c-455a-8e97-4392c59b8839").unwrap().into();
+        let ts = Timestamp { seconds: 1733404865, nanoseconds: 50223000, logical: 0 };
+
+        fences.fences.push(Fence::new(KeySpan { key: b"abc".to_vec(), end: vec![] }, txn_id, ts));
+        fences.fences.push(Fence::new(KeySpan { key: b"abd".to_vec(), end: b"abf".to_vec() }, txn_id, ts));
+        fences.fences.push(Fence::new(KeySpan { key: b"abfg".to_vec(), end: vec![] }, txn_id, ts));
+
+        fences.fence(txn_id, KeySpan { key: b"abc".to_vec(), end: b"abcd".to_vec() }, ts);
     }
 }
