@@ -84,6 +84,15 @@ impl KeySpan {
         }
     }
 
+    pub fn append_end(&self, end: &mut Vec<u8>) {
+        if self.end.is_empty() {
+            end.extend(&self.key);
+            end.push(0);
+        } else {
+            end.extend_from_slice(self.end.as_slice());
+        }
+    }
+
     pub fn into_end(mut self) -> Vec<u8> {
         match self.end.is_empty() {
             true => {
@@ -167,7 +176,7 @@ impl<'a> KeySpanRef<'a> {
                 Less => SpanOrdering::LessDisjoint,
                 Equal => SpanOrdering::SubsetLeft,
                 Greater => match self.key.cmp(other.end) {
-                    Less => SpanOrdering::ContainAll,
+                    Less => SpanOrdering::SubsetAll,
                     Equal => SpanOrdering::GreaterContiguous,
                     Greater => SpanOrdering::GreaterDisjoint,
                 },
@@ -238,7 +247,7 @@ mod tests {
         assert_that!(KeySpanRef::new(b"k1", b"").compare(KeySpanRef::new(b"k1", b"k10")))
             .is_equal_to(SpanOrdering::SubsetLeft);
         assert_that!(KeySpanRef::new(b"k1", b"").compare(KeySpanRef::new(b"k0", b"k10")))
-            .is_equal_to(SpanOrdering::ContainAll);
+            .is_equal_to(SpanOrdering::SubsetAll);
         assert_that!(KeySpanRef::new(b"k1", b"").compare(KeySpanRef::new(b"k0", b"k1")))
             .is_equal_to(SpanOrdering::GreaterContiguous);
         assert_that!(KeySpanRef::new(b"k1", b"").compare(KeySpanRef::new(b"k0", b"k01")))
@@ -249,7 +258,7 @@ mod tests {
         assert_that!(KeySpanRef::new(b"k1", b"k10").compare(KeySpanRef::new(b"k1", b"")))
             .is_equal_to(SpanOrdering::ContainLeft);
         assert_that!(KeySpanRef::new(b"k0", b"k10").compare(KeySpanRef::new(b"k1", b"")))
-            .is_equal_to(SpanOrdering::SubsetAll);
+            .is_equal_to(SpanOrdering::ContainAll);
         assert_that!(KeySpanRef::new(b"k0", b"k1").compare(KeySpanRef::new(b"k1", b"")))
             .is_equal_to(SpanOrdering::LessContiguous);
         assert_that!(KeySpanRef::new(b"k0", b"k01").compare(KeySpanRef::new(b"k1", b"")))
