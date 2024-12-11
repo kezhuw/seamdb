@@ -17,14 +17,16 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use derivative::Derivative;
+use derive_where::derive_where;
 use tokio::select;
+use tracing::trace;
 
 use super::store::{BatchContext, BatchResult, TabletStore, TxnTabletStore};
 use super::types::{MessageId, TabletWatermark};
 use crate::clock::{Clock, Timestamp};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogManager, LogOffset, LogPosition};
 use crate::protos::{
+    BatchError,
     BatchRequest,
     BatchResponse,
     DataMessage,
@@ -85,11 +87,11 @@ pub trait LogMessageProducer<T: Sync>: ByteLogProducer {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[allow(clippy::needless_lifetimes)]
+#[derive_where(Debug)]
 pub struct TypedLogConsumer<'a, T> {
     consumer: &'a mut dyn ByteLogSubscriber,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -101,7 +103,7 @@ impl<'a, T> TypedLogConsumer<'a, T> {
 
 #[async_trait]
 impl<T: Send + Sync> ByteLogSubscriber for TypedLogConsumer<'_, T> {
-    async fn read(&mut self) -> Result<(LogPosition, &[u8])> {
+    async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])> {
         self.consumer.read().await
     }
 
@@ -148,20 +150,19 @@ impl<'a, T> LimitedLogConsumer<'a, T> {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive_where(Debug)]
 pub struct MessageConsumer<T> {
     last_recv: LogPosition,
     last_epoch: u64,
     last_sequence: u64,
     consumer: Box<dyn ByteLogSubscriber>,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     _marker: std::marker::PhantomData<T>,
 }
 
 #[async_trait]
 impl<T: LogMessage> ByteLogSubscriber for MessageConsumer<T> {
-    async fn read(&mut self) -> Result<(LogPosition, &[u8])> {
+    async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])> {
         let (offset, _, payload) = (self as &mut MessageConsumer<T>).read().await?;
         Ok((offset, payload))
     }
@@ -183,12 +184,11 @@ impl<T: LogMessage> LogMessageConsumer<T> for MessageConsumer<T> {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive_where(Debug)]
 pub struct BufMessageProducer<T> {
     buf: Vec<u8>,
     producer: Box<dyn ByteLogProducer>,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -309,7 +309,7 @@ impl<T: LogMessage> MessageProducer<T> {
                     if position.is_next_of(&self.last_sent) {
                         return Ok(position);
                     }
-                    tracing::debug!("interleaving sending detected: last sent position {}, but got next {}", self.last_sent, position);
+                    trace!("interleaving sending detected: last sent position {}, but got next {}", self.last_sent, position);
                 },
             }
         }
@@ -465,7 +465,7 @@ impl LeadingTablet {
             let watermark = &self.manifest.manifest.watermark;
             if ts > watermark.leader_expiration {
                 return Ok(Some(BatchResult::Error {
-                    error: anyhow!("write above leader expiration"),
+                    error: BatchError::with_message("write above leader expiration"),
                     responser: request.responser,
                 }));
             }
@@ -516,12 +516,16 @@ impl FollowingTablet {
         }
     }
 
-    fn query(&mut self, ts: Timestamp, requests: Vec<ShardRequest>) -> Result<Vec<ShardResponse>> {
+    fn query(&mut self, ts: Timestamp, requests: Vec<ShardRequest>) -> Result<Vec<ShardResponse>, BatchError> {
         let mut context = BatchContext::default();
         self.store.store.batch_timestamped(&mut context, ts, requests)
     }
 
-    pub fn query_batch(&mut self, deployment: &TabletDeployment, batch: BatchRequest) -> Result<BatchResponse> {
+    pub fn query_batch(
+        &mut self,
+        deployment: &TabletDeployment,
+        batch: BatchRequest,
+    ) -> Result<BatchResponse, BatchError> {
         let mut response = BatchResponse::default();
         if let Some(ts) = self.extract_read_timestamp(&batch) {
             response.responses = self.query(ts, batch.requests)?;
@@ -577,10 +581,7 @@ impl TabletLoader {
                     (_, None) => continue,
                 },
                 Ok(None) => bail!("no manifest message"),
-                Err(err) => {
-                    tracing::warn!("XXXX: {:?}", err);
-                    return Err(err);
-                },
+                Err(err) => return Err(err),
             }
         };
         while let Some(message) = subscriber.read().await? {
@@ -696,6 +697,7 @@ impl TabletLoader {
             return Err(anyhow!("do not support file compaction and transaction rotation for now"));
         }
         let uri = tablet.data_log.as_str().try_into()?;
+        trace!("subscribing log {uri}");
         let mut consumer: Box<dyn ByteLogSubscriber> = self.log.subscribe_log(&uri, LogOffset::Earliest).await?;
         let limit = match limit {
             None => consumer.latest().await?,

@@ -70,10 +70,7 @@ impl Fence {
     pub fn split(&mut self, pivot: Vec<u8>) -> Self {
         let mut end = pivot;
         std::mem::swap(&mut self.span.end, &mut end);
-        let next_span = KeySpan {
-            key: self.span.end().into_owned(),
-            end,
-        };
+        let next_span = KeySpan { key: self.span.end().into_owned(), end };
         Self { span: next_span, barrier: self.barrier }
     }
 }

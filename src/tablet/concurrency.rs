@@ -35,6 +35,7 @@ use self::fence::FenceTable;
 use crate::clock::Clock;
 use crate::keys::Key;
 use crate::protos::{
+    BatchError,
     BatchRequest,
     BatchResponse,
     HasTxnMeta,
@@ -63,11 +64,11 @@ pub struct Request {
 
     pub temporal: Temporal,
     pub requests: Vec<ShardRequest>,
-    pub responser: oneshot::Sender<Result<BatchResponse>>,
+    pub responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
 }
 
 impl Request {
-    pub fn new(request: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>>) -> Self {
+    pub fn new(request: BatchRequest, responser: oneshot::Sender<Result<BatchResponse, BatchError>>) -> Self {
         let mut read_keys = vec![];
         let mut write_keys = vec![];
         let BatchRequest { temporal, requests, .. } = request;
@@ -1020,7 +1021,7 @@ impl TxnTable {
                 let participate = match self.txns.participate(txn) {
                     Ok(participate) => participate,
                     Err(err) => {
-                        request.responser.send(Err(err)).ignore();
+                        request.responser.send(Err(BatchError::with_message(err.to_string()))).ignore();
                         return None;
                     },
                 };

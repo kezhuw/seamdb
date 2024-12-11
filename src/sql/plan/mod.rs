@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::missing_transmute_annotations)]
+mod catalog;
+mod create_table;
+mod drop_table;
+mod insert;
+mod planner;
+mod table;
 
-pub mod clock;
-pub mod cluster;
-pub mod endpoint;
-pub mod keys;
-pub mod kv;
-pub mod log;
-pub mod protos;
-pub mod sql;
-pub mod tablet;
-pub mod timer;
-pub mod txn;
-pub mod utils;
+pub use self::catalog::*;
+pub use self::create_table::*;
+pub use self::drop_table::*;
+pub use self::planner::*;
+pub use self::table::*;

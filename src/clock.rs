@@ -16,6 +16,7 @@ use std::ops::{Add, Sub};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use jiff::Timestamp as JiffTimestamp;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 pub use crate::protos::Timestamp;
@@ -88,7 +89,15 @@ impl SystemTimeClock {
 
 impl std::fmt::Display for Timestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        if let Some(sequence) = self.get_txn_sequence() {
+            return write!(f, "txn-seq-{}", sequence);
+        }
+        let ts = JiffTimestamp::new(self.seconds as i64, self.nanoseconds as i32).unwrap();
+        if self.logical == 0 {
+            write!(f, "{}", ts)
+        } else {
+            write!(f, "{}-{}", ts, self.logical)
+        }
     }
 }
 
@@ -99,6 +108,13 @@ impl Timestamp {
 
     pub const fn is_zero(&self) -> bool {
         self.seconds == 0 && self.nanoseconds == 0 && self.logical == 0
+    }
+
+    pub const fn get_txn_sequence(&self) -> Option<u32> {
+        match self.seconds & 0x8000000000000000 != 0 {
+            true => Some(self.seconds as u32),
+            false => None,
+        }
     }
 
     pub const fn txn_sequence(sequence: u32) -> Self {

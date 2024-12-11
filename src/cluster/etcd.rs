@@ -46,7 +46,7 @@ impl EtcdLease {
     }
 }
 
-pub(super) enum EtcdHelper {}
+pub enum EtcdHelper {}
 
 impl EtcdHelper {
     pub async fn connect(endpoint: Endpoint<'_>, params: &Params<'_>) -> Result<Client> {
@@ -128,6 +128,8 @@ pub mod tests {
     pub struct EtcdContainer {
         container: Container<'static, GenericImage>,
     }
+
+    unsafe impl Send for EtcdContainer {}
 
     impl EtcdContainer {
         pub fn uri(&self) -> ServiceUri<'static> {

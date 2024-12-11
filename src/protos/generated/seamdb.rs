@@ -19,6 +19,7 @@ pub struct MessageId {
     #[prost(uint64, tag = "2")]
     pub sequence: u64,
 }
+#[derive(Eq, PartialOrd, Ord)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeyRange {
@@ -27,6 +28,7 @@ pub struct KeyRange {
     #[prost(bytes = "vec", tag = "2")]
     pub end: ::prost::alloc::vec::Vec<u8>,
 }
+#[derive(Eq, PartialOrd, Ord)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeySpan {
@@ -146,7 +148,7 @@ pub struct TabletManifest {
     #[prost(string, repeated, tag = "35")]
     pub obsoleted_files: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-#[derive(Eq, PartialOrd, Ord)]
+#[derive(Eq, Hash, PartialOrd, Ord)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Timestamp {
@@ -195,6 +197,14 @@ pub struct KeyValue {
     /// Tombstone if empty.
     #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<Value>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub enum Transient {
+    #[prost(message, tag = "1")]
+    Timestamp(Timestamp),
+    #[prost(message, tag = "2")]
+    Transaction(TxnMeta),
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -574,8 +584,12 @@ pub struct RefreshReadRequest {
     pub from: Timestamp,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct RefreshReadResponse {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefreshReadResponse {
+    /// Empty if full span refreshed.
+    #[prost(bytes = "vec", tag = "1")]
+    pub resume_key: ::prost::alloc::vec::Vec<u8>,
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParticipateTxnRequest {
@@ -603,6 +617,76 @@ pub struct TabletHeartbeatRequest {
 pub struct TabletHeartbeatResponse {
     #[prost(message, optional, tag = "1")]
     pub deployment: ::core::option::Option<TabletDeployment>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BatchError {
+    #[prost(uint32, optional, tag = "1")]
+    pub request_index: ::core::option::Option<u32>,
+    #[prost(message, required, tag = "2")]
+    pub error: DataError,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub enum DataError {
+    #[prost(message, tag = "1")]
+    ConflictWrite(ConflictWriteError),
+    #[prost(message, tag = "2")]
+    MismatchDataType(DataTypeMismatchError),
+    #[prost(message, tag = "3")]
+    ShardNotFound(ShardNotFoundError),
+    #[prost(message, tag = "4")]
+    TimestampMismatch(TimestampMismatchError),
+    #[prost(message, tag = "5")]
+    Store(StoreError),
+    #[prost(message, tag = "6")]
+    Internal(SimpleError),
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConflictWriteError {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, required, tag = "2")]
+    pub transient: Transient,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DataTypeMismatchError {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "!ValueType", tag = "2")]
+    pub expect: ValueType,
+    #[prost(enumeration = "!ValueType", tag = "3")]
+    pub actual: ValueType,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TimestampMismatchError {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, required, tag = "2")]
+    pub actual: Timestamp,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShardNotFoundError {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub shard_id: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StoreError {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SimpleError {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -632,6 +716,41 @@ impl ShardMergeBounds {
             "Left" => Some(Self::Left),
             "Right" => Some(Self::Right),
             "None" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ValueType {
+    Absent = 0,
+    Int = 1,
+    Float = 2,
+    Bytes = 3,
+    String = 4,
+}
+impl ValueType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ValueType::Absent => "Absent",
+            ValueType::Int => "Int",
+            ValueType::Float => "Float",
+            ValueType::Bytes => "Bytes",
+            ValueType::String => "String",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "Absent" => Some(Self::Absent),
+            "Int" => Some(Self::Int),
+            "Float" => Some(Self::Float),
+            "Bytes" => Some(Self::Bytes),
+            "String" => Some(Self::String),
             _ => None,
         }
     }

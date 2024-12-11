@@ -134,6 +134,14 @@ message Value {
     }
 }
 
+enum ValueType {
+    Absent = 0;
+    Int = 1;
+    Float = 2;
+    Bytes = 3;
+    String = 4;
+}
+
 message TimestampedValue {
     Value value = 1;
     Timestamp timestamp = 2;
@@ -149,6 +157,13 @@ message KeyValue {
     bytes key = 1;
     // Tombstone if empty.
     Value value = 2;
+}
+
+message Transient {
+    oneof value {
+        Timestamp timestamp = 1;
+        TxnMeta transaction = 2;
+    }
 }
 
 message Temporal {
@@ -448,6 +463,8 @@ message RefreshReadRequest {
 }
 
 message RefreshReadResponse {
+    // Empty if full span refreshed.
+    bytes resume_key = 1;
 }
 
 message ParticipateTxnRequest {
@@ -478,4 +495,49 @@ service TabletService {
     rpc ParticipateTxn(stream ParticipateTxnRequest) returns (stream ParticipateTxnResponse);
 
     rpc Locate(LocateRequest) returns (LocateResponse);
+}
+
+message BatchError {
+    optional uint32 request_index = 1;
+    DataError error = 2;
+}
+
+message DataError {
+    oneof error {
+        ConflictWriteError conflict_write = 1;
+        DataTypeMismatchError mismatch_data_type = 2;
+        ShardNotFoundError shard_not_found = 3;
+        TimestampMismatchError timestamp_mismatch = 4;
+        StoreError store = 5;
+        SimpleError internal = 6;
+    }
+}
+
+message ConflictWriteError {
+    bytes key = 1;
+    Transient transient = 2;
+}
+
+message DataTypeMismatchError {
+    bytes key = 1;
+    ValueType expect = 2;
+    ValueType actual = 3;
+}
+
+message TimestampMismatchError {
+    bytes key = 1;
+    Timestamp actual = 2;
+}
+
+message ShardNotFoundError {
+    bytes key = 1;
+    uint64 shard_id = 2;
+}
+
+message StoreError {
+    string message = 1;
+}
+
+message SimpleError {
+    string message = 1;
 }

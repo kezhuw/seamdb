@@ -130,10 +130,10 @@ pub trait TabletDeployer {
                         let nodes = self.nodes().clone();
                         let deployment_receiver = deployment_watcher.clone();
                         let crash_reporter = crash_reporter.clone();
-                        let deployment_span = span!(Level::INFO, "cluster deployment deployment", %node, %addr);
+                        let deployment_span = span!(Level::INFO, "cluster deployment", %node, %addr);
                         tokio::spawn(async move {
                             if let Err(err) = nodes.start_deployment(&node, addr, deployment_receiver).await {
-                                tracing::info!("deployment deployment terminated: {}", err);
+                                tracing::info!("deployment terminated: {}", err);
                             }
                             crash_reporter.send(node).ignore();
                         }.instrument(deployment_span));
@@ -384,7 +384,6 @@ impl RangeTabletDeployer {
         receiver
     }
 
-    #[instrument(skip(self), fields(self.shard = %self.shard_id, self.tablet = %self.tablet_id))]
     async fn serve_internally(&self) -> Result<()> {
         let mut deployments = self.load_deployments();
         let mut load_completed = false;
@@ -402,7 +401,7 @@ impl RangeTabletDeployer {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(self.shard = %self.shard_id, self.tablet = %self.tablet_id))]
+    #[instrument(skip(self), fields(shard = %self.shard_id, tablet = %self.tablet_id))]
     async fn serve(&self) {
         if let Err(err) = self.serve_internally().await {
             debug!("fail to serve range tablet deployer: {err}");
