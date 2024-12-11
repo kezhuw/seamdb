@@ -265,7 +265,8 @@ impl LogClient for KafkaLogClient {
     }
 
     async fn create_log(&self, name: &str, retention: ByteSize) -> Result<()> {
-        let retention_bytes = retention.0.to_compact_string();
+        let retention_bytes =
+            if retention == ByteSize::default() { "-1".to_compact_string() } else { retention.0.to_compact_string() };
         let topics = [new_topic_config(name, self.replication, &retention_bytes)];
         let mut results = self.client.create_topics(&topics, &AdminOptions::default()).await?;
         let topic_result = results.pop().ok_or_else(|| anyhow!("no topic results in topic creation"))?;
