@@ -179,7 +179,7 @@ pub trait ByteLogProducer: Send + std::fmt::Debug + 'static {
 /// Subscriber to read byte message from log.
 #[async_trait]
 pub trait ByteLogSubscriber: Send + Sync + std::fmt::Debug {
-    async fn read(&mut self) -> Result<(LogPosition, &[u8])>;
+    async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])>;
 
     async fn seek(&mut self, offset: LogOffset) -> Result<()>;
 

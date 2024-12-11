@@ -130,7 +130,7 @@ struct MemoryLogSubscriber {
 
 #[async_trait]
 impl ByteLogSubscriber for MemoryLogSubscriber {
-    async fn read(&mut self) -> Result<(LogPosition, &[u8])> {
+    async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])> {
         loop {
             match self.log.read(self.offset)? {
                 Either::Left(data) => {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod env;
-mod etcd;
+pub mod etcd;
 mod meta;
 mod node;
 

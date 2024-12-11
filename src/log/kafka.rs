@@ -22,7 +22,7 @@ use anyhow::{anyhow, Error, Result};
 use async_trait::async_trait;
 use bytesize::ByteSize;
 use compact_str::ToCompactString;
-use derivative::Derivative;
+use derive_where::derive_where;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::{ClientConfig, FromClientConfig};
@@ -36,15 +36,14 @@ use tokio::time;
 use crate::endpoint::{Endpoint, Params};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogClient, LogFactory, LogOffset, LogPosition};
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive_where(Debug)]
 struct KafkaPartitionProducer {
     topic: String,
     partition: i32,
     queue: VecDeque<Vec<u8>>,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     producer: FutureProducer,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     deliveries: VecDeque<DeliveryFuture>,
 }
 
@@ -131,19 +130,17 @@ impl ByteLogProducer for KafkaPartitionProducer {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive_where(Debug)]
 struct PartitionConsumer {
     topic: String,
     partition: i32,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     consumer: StreamConsumer,
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive_where(Debug)]
 struct KafkaPartitionConsumer {
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     message: Option<BorrowedMessage<'static>>,
     consumer: Arc<PartitionConsumer>,
 }
@@ -156,7 +153,7 @@ impl KafkaPartitionConsumer {
 
 #[async_trait]
 impl ByteLogSubscriber for KafkaPartitionConsumer {
-    async fn read(&mut self) -> Result<(LogPosition, &[u8])> {
+    async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])> {
         self.message = None;
         let message = self.consumer.consumer.recv().await?;
         let payload = message.payload().unwrap_or(Default::default());
@@ -190,11 +187,10 @@ impl ByteLogSubscriber for KafkaPartitionConsumer {
     }
 }
 
-#[derive(Derivative)]
-#[derivative(Debug)]
+#[derive_where(Debug)]
 pub struct KafkaLogClient {
     config: ClientConfig,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip(Debug))]
     client: AdminClient<DefaultClientContext>,
     replication: i32,
 }

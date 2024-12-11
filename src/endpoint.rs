@@ -443,7 +443,7 @@ pub struct Params<'a> {
 /// Owned version of [Params].
 pub type OwnedParams = Params<'static>;
 
-impl<'a> Params<'a> {
+impl Params<'_> {
     fn new(map: LinkedHashMap<CompactString, CompactString>) -> Self {
         Self { map, _marker: std::marker::PhantomData }
     }

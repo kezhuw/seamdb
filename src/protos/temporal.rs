@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering::{self, *};
+use std::fmt::{Display, Formatter, Result};
 use std::time::Duration;
 
 use super::*;
@@ -49,6 +50,11 @@ impl Temporal {
 
 impl Transaction {
     pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+    pub fn new(key: Vec<u8>, start_ts: Timestamp) -> Self {
+        let meta = TxnMeta { id: Uuid::new_random(), key, epoch: 0, start_ts, priority: 0 };
+        Transaction { meta, ..Default::default() }
+    }
 
     pub fn comparer() -> impl Fn(&Transaction, &Transaction) -> Ordering {
         let comparer = TxnMeta::comparer();
@@ -199,6 +205,37 @@ impl TxnMeta {
     }
 }
 
+impl Display for TxnMeta {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(
+            f,
+            "txn(id={},epoch={},key:{:?},start_ts={},priority={})",
+            self.id(),
+            self.epoch(),
+            self.key(),
+            self.start_ts,
+            self.priority
+        )
+    }
+}
+
+impl Display for Transaction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(
+            f,
+            "txn(id={},epoch={},key:{:?},start_ts={},priority={},status={:?},commit_ts={},heartbeat_ts={})",
+            self.id(),
+            self.epoch(),
+            self.key(),
+            self.meta.start_ts,
+            self.meta.priority,
+            self.status,
+            self.commit_ts(),
+            self.heartbeat_ts,
+        )
+    }
+}
+
 impl From<TxnMeta> for Transaction {
     fn from(meta: TxnMeta) -> Self {
         Self {
@@ -220,9 +257,33 @@ impl From<Transaction> for TxnMeta {
     }
 }
 
+impl From<Transaction> for Temporal {
+    fn from(txn: Transaction) -> Self {
+        Temporal::Transaction(txn)
+    }
+}
+
 impl From<Timestamp> for Temporal {
     fn from(t: Timestamp) -> Self {
         Temporal::Timestamp(t)
+    }
+}
+
+impl From<Transaction> for Transient {
+    fn from(txn: Transaction) -> Self {
+        Self::Transaction(txn.meta)
+    }
+}
+
+impl From<TxnMeta> for Transient {
+    fn from(txn: TxnMeta) -> Self {
+        Self::Transaction(txn)
+    }
+}
+
+impl From<Timestamp> for Transient {
+    fn from(t: Timestamp) -> Self {
+        Self::Timestamp(t)
     }
 }
 

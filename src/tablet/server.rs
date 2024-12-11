@@ -73,6 +73,17 @@ impl TabletServiceImpl {
     ) -> Result<T, Status> {
         self.request(request, receiver).await?.map_err(|e| Status::invalid_argument(e.to_string()))
     }
+
+    async fn request_message_result<T, E: prost::Message + std::error::Error>(
+        &self,
+        request: TabletServiceRequest,
+        receiver: oneshot::Receiver<Result<T, E>>,
+    ) -> Result<T, Status> {
+        match self.request(request, receiver).await? {
+            Ok(response) => Ok(response),
+            Err(err) => Err(Status::with_details(tonic::Code::Internal, err.to_string(), err.encode_to_vec().into())),
+        }
+    }
 }
 
 #[async_trait]
@@ -104,7 +115,10 @@ impl TabletService for TabletServiceImpl {
     async fn batch(&self, request: Request<BatchRequest>) -> Result<Response<BatchResponse>, Status> {
         let (sender, receiver) = oneshot::channel();
         let response = self
-            .request_result(TabletServiceRequest::Batch { batch: request.into_inner(), responser: sender }, receiver)
+            .request_message_result(
+                TabletServiceRequest::Batch { batch: request.into_inner(), responser: sender },
+                receiver,
+            )
             .await?;
         Ok(Response::new(response))
     }

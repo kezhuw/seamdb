@@ -35,7 +35,11 @@ lint:
 	cargo clippy --no-deps -- -D clippy::all
 
 build:
-	cargo build --tests
+	cargo build --tests --bins
+release:
+	cargo build --tests --bins --release
 
 test:
 	cargo test
+clean:
+	cargo clean

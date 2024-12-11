@@ -17,7 +17,7 @@ use std::collections::btree_map::{BTreeMap, Entry as BTreeEntry};
 use std::collections::VecDeque;
 use std::ops::Bound;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use hashbrown::hash_map::{Entry as HashEntry, HashMap};
 use ignore_result::Ignore;
 use tokio::sync::{mpsc, oneshot};
@@ -38,7 +38,9 @@ use crate::clock::Clock;
 use crate::keys::Key;
 use crate::protos::{
     self,
+    BatchError,
     BatchResponse,
+    DataError,
     DataOperation,
     DataRequest,
     DataResponse,
@@ -122,19 +124,34 @@ impl Default for Writes {
     }
 }
 
+impl Writes {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Write(_) => false,
+            Self::Batch(batch) => batch.is_empty(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for DataError {
+    fn from(err: anyhow::Error) -> Self {
+        DataError::internal(err.to_string())
+    }
+}
+
 #[derive(Debug)]
 pub enum BatchResult {
     Read {
         temporal: Temporal,
         responses: Vec<ShardResponse>,
-        responser: oneshot::Sender<Result<BatchResponse>>,
+        responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
 
         blocker: ReplicationWatcher,
     },
     Write {
         temporal: Temporal,
         responses: Vec<ShardResponse>,
-        responser: oneshot::Sender<Result<BatchResponse>>,
+        responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
 
         writes: Vec<protos::Write>,
         replication: ReplicationTracker,
@@ -142,8 +159,8 @@ pub enum BatchResult {
         requests: Vec<Request>,
     },
     Error {
-        error: anyhow::Error,
-        responser: oneshot::Sender<Result<BatchResponse>>,
+        error: BatchError,
+        responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
     },
 }
 
@@ -177,8 +194,13 @@ impl ShardStore {
         self.store.get(key, ts)
     }
 
-    pub fn get_timestamped(&self, context: &BatchContext, ts: Timestamp, key: &[u8]) -> Result<TimestampedValue> {
-        self.get(context, ts, key).map(|value| value.into_client())
+    pub fn get_timestamped(
+        &self,
+        context: &BatchContext,
+        ts: Timestamp,
+        key: &[u8],
+    ) -> Result<TimestampedValue, DataError> {
+        self.get(context, ts, key).map(|value| value.into_client()).map_err(|e| DataError::internal(e.to_string()))
     }
 
     pub fn find(&self, context: &BatchContext, ts: Timestamp, key: &[u8]) -> Result<(Vec<u8>, TimestampedValue)> {
@@ -210,24 +232,16 @@ impl ShardStore {
         limit: u32,
     ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         let mut resume_key = range.start;
-        let end_key = if range.end <= self.range.end {
-            range.end
-        } else {
-            let mut end = range.end;
-            end.clone_from(&self.range.end);
-            end
-        };
-        trace!("end key: {end_key:?}");
         let mut rows = vec![];
         while limit == 0 || rows.len() < limit as usize {
             trace!("find key: {resume_key:?}");
             let (key, value) = self.find_timestamped(context, ts, &resume_key)?;
             trace!("found: {key:?}, {value:?}");
             if key.is_empty() {
-                resume_key.clone_from(&self.range.end);
+                resume_key = self.range.resume_from(range.end);
                 break;
-            } else if key >= end_key {
-                resume_key = end_key;
+            } else if key >= range.end {
+                resume_key = Vec::default();
                 break;
             }
             resume_key.clone_from(&key);
@@ -238,11 +252,16 @@ impl ShardStore {
         Ok((resume_key, rows))
     }
 
-    fn check_timestamped_write(&self, context: &BatchContext, ts: Timestamp, key: &[u8]) -> Result<TimestampedValue> {
+    fn check_timestamped_write(
+        &self,
+        context: &BatchContext,
+        ts: Timestamp,
+        key: &[u8],
+    ) -> Result<TimestampedValue, DataError> {
         let value = self.get(context, ts, key)?;
         // FIXME: allow equal timestamp for now to gain write-your-write.
         if ts < value.timestamp {
-            return Err(anyhow!("write@{} encounters newer timestamp {}", ts, value.timestamp));
+            return Err(DataError::conflict_write(key.to_vec(), value.timestamp));
         }
         Ok(value.into_client())
     }
@@ -268,10 +287,10 @@ impl ShardStore {
         key: &[u8],
         value: Option<protos::Value>,
         expect_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
+    ) -> Result<Timestamp, DataError> {
         let existing_value = self.check_timestamped_write(context, ts, key)?;
-        if let Some(expect_ts) = expect_ts.filter(|ts| *ts != existing_value.timestamp) {
-            bail!("mismatch timestamp check: existing ts {}, expect ts {:}", existing_value.timestamp, expect_ts)
+        if expect_ts.filter(|ts| *ts != existing_value.timestamp).is_some() {
+            return Err(DataError::timestamp_mismatch(key, existing_value.timestamp));
         }
         self.add_timestamped_write(context, ts, key.to_owned(), value);
         Ok(ts)
@@ -283,7 +302,7 @@ impl ShardStore {
         ts: Timestamp,
         key: &[u8],
         increment: i64,
-    ) -> Result<i64> {
+    ) -> Result<i64, DataError> {
         let value = self.check_timestamped_write(context, ts, key)?;
         let i = value.value.read_int(key, "increment")?;
         let incremented = i + increment;
@@ -298,41 +317,30 @@ impl ShardStore {
         ts: Timestamp,
         span: KeySpan,
         from: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>, DataError> {
         if span.end.is_empty() {
             let found = self.get(context, ts, &span.key)?;
             if found.timestamp <= from {
-                return Ok(());
+                return Ok(Vec::default());
             }
-            bail!(
-                "fail to refresh key {:?} from {} to {} due to write at timestamp {:?}",
-                span.key,
-                from,
-                ts,
-                found.timestamp
-            );
+            return Err(DataError::conflict_write(span.key, found.timestamp));
         }
         let mut start = span.key;
-        let end = span.end;
         loop {
             let (key, value) = self.find(context, ts, &start)?;
-            if key.is_empty() || key >= end {
+            if key.is_empty() {
+                return Ok(self.range.resume_from(span.end));
+            } else if key >= span.end {
                 break;
             }
             if value.timestamp > from {
-                bail!(
-                    "fail to refresh key {:?} from {:?} to {:?} due to write at timestamp {:?}",
-                    key,
-                    from,
-                    ts,
-                    value.timestamp
-                );
+                return Err(DataError::conflict_write(key, value.timestamp));
             }
             start.clear();
             start.extend(&key);
             start.push(0);
         }
-        Ok(())
+        Ok(Vec::default())
     }
 
     fn add_transactional_write(
@@ -373,7 +381,7 @@ impl ShardStore {
         txn: &TxnRecord,
         key: &[u8],
         sequence: u32,
-    ) -> Result<TimestampedValue> {
+    ) -> Result<TimestampedValue, DataError> {
         if let Some(intent) = provision.get_intent(context, key) {
             assert!(intent.txn.is_same(txn));
             if let Some(value) = intent.get_value(sequence) {
@@ -391,7 +399,7 @@ impl ShardStore {
         txn: &TxnRecord,
         key: &[u8],
         sequence: u32,
-    ) -> Result<(Vec<u8>, TimestampedValue)> {
+    ) -> Result<(Vec<u8>, TimestampedValue), DataError> {
         let (found, value) = self.find_timestamped(context, txn.commit_ts(), key)?;
         let mut start = key.to_owned();
         let end = found.as_slice();
@@ -416,21 +424,14 @@ impl ShardStore {
         sequence: u32,
     ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         let mut resume_key = range.start;
-        let end_key = if range.end <= self.range.end {
-            range.end
-        } else {
-            let mut end = range.end;
-            end.clone_from(&self.range.end);
-            end
-        };
         let mut rows = vec![];
         while limit == 0 || rows.len() < limit as usize {
             let (key, value) = self.find_transactional(context, provision, txn, &resume_key, sequence)?;
             if key.is_empty() {
-                resume_key.clone_from(&self.range.end);
+                resume_key = self.range.resume_from(range.end);
                 break;
-            } else if key >= end_key {
-                resume_key = end_key;
+            } else if key >= range.end {
+                resume_key = Vec::default();
                 break;
             }
             resume_key.clone_from(&key);
@@ -461,10 +462,13 @@ impl ShardStore {
         value: ValueExtractor<F>,
         sequence: u32,
         existing_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
+    ) -> Result<Timestamp, DataError> {
         if sequence <= intent.value.sequence {
             let Some(intent_value) = intent.get_value(sequence) else {
-                bail!("txn {:?} key {:?}: can't find written value for old sequence {}", intent.txn, key, sequence);
+                return Err(DataError::internal(format!(
+                    "txn {:?} key {:?}: can't find written value for old sequence {}",
+                    intent.txn, key, sequence
+                )));
             };
             let writting = match value {
                 ValueExtractor::Plain(value) => value,
@@ -475,14 +479,10 @@ impl ShardStore {
             };
             let written = intent_value.value.value;
             if writting != written {
-                bail!(
+                return Err(DataError::internal(format!(
                     "txn {:?} key {:?}: non idempotent write at sequence {}, old write {:?}, new write {:?}",
-                    intent.txn,
-                    key,
-                    sequence,
-                    written,
-                    writting
-                );
+                    intent.txn, key, sequence, written, writting
+                )));
             }
             return Ok(Timestamp::txn_sequence(sequence));
         }
@@ -493,13 +493,7 @@ impl ShardStore {
         };
         if let Some(expected_ts) = existing_ts {
             if expected_ts != existing_value.client_ts() {
-                bail!(
-                    "txn {:?} key {:?}: expect value at {:?}, but got value at {:?}",
-                    intent.txn.meta,
-                    key,
-                    expected_ts,
-                    existing_value.client_ts()
-                )
+                return Err(DataError::timestamp_mismatch(key, existing_value.client_ts()));
             }
         }
         let value = match value {
@@ -520,7 +514,7 @@ impl ShardStore {
         value: ValueExtractor<F>,
         sequence: u32,
         existing_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
+    ) -> Result<Timestamp, DataError> {
         if let Some(intent) = provision.get_intent(context, &key) {
             assert!(intent.txn.is_same(txn));
             return self.rewrite_txn_intent(context, intent.clone(), key, value, sequence, existing_ts);
@@ -528,17 +522,12 @@ impl ShardStore {
         let commit_ts = txn.commit_ts();
         let found = self.get(context, Timestamp::MAX, &key)?;
         if commit_ts <= found.timestamp {
-            return Err(anyhow!(
-                "key {:?}: try to write txn at {:?}, but got value at {:?}",
-                key,
-                commit_ts,
-                found.timestamp
-            ));
+            return Err(DataError::conflict_write(key, found.timestamp));
         }
         if let Some(expected_ts) = existing_ts {
             let client_ts = found.client_ts();
             if expected_ts != client_ts {
-                return Err(anyhow!("key {:?}: expect timestamp at {:?}, but got {:?}", key, expected_ts, client_ts));
+                return Err(DataError::timestamp_mismatch(key, client_ts));
             }
         }
         let value = match value {
@@ -559,7 +548,7 @@ impl ShardStore {
         value: Option<protos::Value>,
         sequence: u32,
         expect_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
+    ) -> Result<Timestamp, DataError> {
         self.put_transactional_with_value_extractor(
             context,
             provision,
@@ -600,29 +589,24 @@ impl ShardStore {
         txn: &TxnRecord,
         span: KeySpan,
         from: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>, DataError> {
         if span.end.is_empty() {
             if let Some(intent) = provision.get_intent(context, &span.key) {
                 if intent.txn.is_same(txn) || intent.txn.commit_ts() > txn.commit_ts() {
-                    return Ok(());
+                    return Ok(Vec::default());
                 }
-                bail!("txn {:?} fail to refresh key {:?} due to write from txn {:?}", txn.meta, span.key, intent.txn);
+                return Err(DataError::conflict_write(span.key, intent.txn.get().clone()));
             }
             let found = self.get(context, txn.commit_ts(), &span.key)?;
             if found.timestamp <= from {
-                return Ok(());
+                return Ok(Vec::default());
             }
-            bail!(
-                "txn {:?} fail to refresh key {:?} due to write at timestamp {:?}",
-                txn.meta,
-                span.key,
-                found.timestamp
-            );
+            return Err(DataError::conflict_write(span.key, found.timestamp));
         }
         let mut start = span.key.clone();
         while let Some((found, intent)) = provision.find_intent(context, &start, &span.end) {
             if !intent.txn.is_same(txn) && intent.txn.commit_ts() <= txn.commit_ts() {
-                bail!("txn {:?} fail to refresh key {:?} due to write from txn {:?}", txn.meta, span.key, intent.txn);
+                return Err(DataError::conflict_write(span.key, intent.txn.get().clone()));
             }
             start.clear();
             start.extend(found);
@@ -632,22 +616,118 @@ impl ShardStore {
         start.extend(&span.key);
         loop {
             let (key, value) = self.find(context, txn.commit_ts(), &start)?;
-            if key.is_empty() || key >= span.end {
+            if key.is_empty() {
+                return Ok(self.range.resume_from(span.end));
+            } else if key >= span.end {
                 break;
             }
             if value.timestamp > from {
-                bail!(
-                    "txn {:?} fail to refresh span {:?} due to write at timestamp {:?}",
-                    txn.meta,
-                    span,
-                    value.timestamp
-                );
+                return Err(DataError::conflict_write(key, value.timestamp));
             }
             start.clear();
             start.extend(&key);
             start.push(0);
         }
-        Ok(())
+        Ok(Vec::default())
+    }
+
+    fn handle_transactional_request(
+        &mut self,
+        context: &mut BatchContext,
+        provision: &mut TxnProvision,
+        txn: &TxnRecord,
+        request: DataRequest,
+    ) -> Result<DataResponse, DataError> {
+        Ok(match request {
+            DataRequest::Get(get) => {
+                let value = self.get_transactional(context, provision, txn, &get.key, get.sequence)?;
+                context.reads.watch(&value.value);
+                let response = GetResponse { value: value.into() };
+                DataResponse::Get(response)
+            },
+            DataRequest::Find(find) => {
+                let (key, value) = self.find_transactional(context, provision, txn, &find.key, find.sequence)?;
+                context.reads.watch(&value.value);
+                let response = FindResponse { key, value: value.into() };
+                DataResponse::Find(response)
+            },
+            DataRequest::Scan(scan) => {
+                let (resume_key, rows) =
+                    self.scan_transactional(context, provision, txn, scan.range, scan.limit, scan.sequence)?;
+                rows.iter().for_each(|row| {
+                    context.reads.watch(&row.value.value);
+                });
+                let response = ScanResponse { resume_key, rows: rows.into_iter().map(Into::into).collect() };
+                DataResponse::Scan(response)
+            },
+            DataRequest::Put(put) => {
+                let ts =
+                    self.put_transactional(context, provision, txn, put.key, put.value, put.sequence, put.expect_ts)?;
+                let response = PutResponse { write_ts: ts };
+                DataResponse::Put(response)
+            },
+            DataRequest::Increment(increment) => {
+                let incremented = self.increment_transactional(
+                    context,
+                    provision,
+                    txn,
+                    increment.key,
+                    increment.increment,
+                    increment.sequence,
+                )?;
+                let response = IncrementResponse { value: incremented };
+                DataResponse::Increment(response)
+            },
+            DataRequest::RefreshRead(refresh) => {
+                let resume_key =
+                    self.refresh_read_transactional(context, provision, txn, refresh.span, refresh.from)?;
+                DataResponse::RefreshRead(RefreshReadResponse { resume_key })
+            },
+        })
+    }
+
+    fn handle_timestamped_request(
+        &mut self,
+        context: &mut BatchContext,
+        ts: Timestamp,
+        request: DataRequest,
+    ) -> Result<DataResponse, DataError> {
+        Ok(match request {
+            DataRequest::Get(get) => {
+                let value = self.get_timestamped(context, ts, &get.key)?;
+                context.reads.watch(&value.value);
+                let response = GetResponse { value: value.into() };
+                DataResponse::Get(response)
+            },
+            DataRequest::Find(find) => {
+                let (key, value) = self.find_timestamped(context, ts, &find.key)?;
+                context.reads.watch(&value.value);
+                let response = FindResponse { key, value: value.into() };
+                DataResponse::Find(response)
+            },
+            DataRequest::Scan(scan) => {
+                let (resume_key, rows) = self.scan_timestamped(context, ts, scan.range, scan.limit)?;
+                rows.iter().for_each(|row| {
+                    context.reads.watch(&row.value.value);
+                });
+                let response = ScanResponse { resume_key, rows: rows.into_iter().map(Into::into).collect() };
+                DataResponse::Scan(response)
+            },
+            DataRequest::Put(put) => {
+                let ts = self.put_timestamped(context, ts, &put.key, put.value, put.expect_ts)?;
+                let response = PutResponse { write_ts: ts };
+                DataResponse::Put(response)
+            },
+            DataRequest::Increment(increment) => {
+                let incremented = self.increment_timestamped(context, ts, &increment.key, increment.increment)?;
+                let response = IncrementResponse { value: incremented };
+                DataResponse::Increment(response)
+            },
+            DataRequest::RefreshRead(refresh_read) => {
+                let resume_key = self.refresh_read_timestamped(context, ts, refresh_read.span, refresh_read.from)?;
+                DataResponse::RefreshRead(RefreshReadResponse { resume_key })
+            },
+        })
     }
 }
 
@@ -689,18 +769,19 @@ impl DataStore {
         self.stores.iter_mut().find(|shard| shard.range.contains(key))
     }
 
-    fn find_shard_store_mut(&mut self, id: ShardId, key: &[u8]) -> Result<&mut ShardStore> {
+    fn find_shard_store_mut(&mut self, id: ShardId, key: &[u8]) -> Result<&mut ShardStore, DataError> {
         if let Some(store) = self.get_shard_store_mut(id) {
             return Ok(unsafe { std::mem::transmute(store) });
         }
-        self.locate_shard_store_mut(key).ok_or_else(|| anyhow!("shard {id} not found for key {key:?}"))
+        self.locate_shard_store_mut(key).ok_or_else(|| DataError::shard_not_found(key, id))
     }
 
-    fn put(&mut self, key: Vec<u8>, ts: Timestamp, value: Value) -> Result<()> {
+    fn put(&mut self, key: Vec<u8>, ts: Timestamp, value: Value) -> Result<(), DataError> {
         let Some(store) = self.locate_shard_store_mut(&key) else {
-            bail!("key {:?} does not reside in tablet {} with shards {:?}", key, self.id, self.shards)
+            return Err(DataError::shard_not_found(key, ShardId(0)));
         };
-        store.put(key, ts, value)
+        store.put(key, ts, value)?;
+        Ok(())
     }
 
     fn put_if_located(&mut self, key: Vec<u8>, ts: Timestamp, value: Value) -> Result<()> {
@@ -708,7 +789,7 @@ impl DataStore {
         store.put(key, ts, value)
     }
 
-    fn promote(&mut self, context: &mut BatchContext) -> Result<()> {
+    fn promote(&mut self, context: &mut BatchContext) -> Result<(), DataError> {
         for (key, values) in context.cache.timestamped.take().into_iter() {
             let (ts, value) = values.into_iter().next_back().unwrap();
             self.put(key, ts, value)?;
@@ -732,14 +813,27 @@ impl TxnProvision {
             return entry.get().clone();
         }
         let outdated_txn = entry.remove();
-        self.remove_intents(&outdated_txn.write_set);
+        self.remove_intents(&outdated_txn.take_write_set());
         TxnRecord::new(txn.clone())
     }
 
     fn add_txn_writes(&mut self, txn: TxnRecord, writes: Writes) {
+        if writes.is_empty() {
+            return;
+        }
+        let txn = self.transactions.entry(txn.id()).or_insert(txn);
         for write in writes {
+            txn.add_write_span(KeySpan::new_key(write.key.clone()));
             match self.intents.entry(write.key) {
                 BTreeEntry::Occupied(mut entry) => {
+                    trace!(
+                        "txn {} write key {:?} to intent {} with value {:?}, sequence {}",
+                        txn.meta(),
+                        entry.key(),
+                        entry.get().meta(),
+                        write.value,
+                        write.sequence
+                    );
                     let intent = entry.get_mut();
                     intent.push_replicated(write.value, write.sequence);
                 },
@@ -751,45 +845,12 @@ impl TxnProvision {
         }
     }
 
-    fn apply_txn(&mut self, store: &mut DataStore, txn: TxnRecord, writes: Writes) {
-        match txn.status {
-            TxnStatus::Pending => self.add_txn_writes(txn, writes),
-            TxnStatus::Aborted => {
-                let id = txn.id();
-                let Some(existing_txn) = self.transactions.remove(&id) else {
-                    return;
-                };
-                for span in &existing_txn.write_set {
-                    self.intents.remove(&span.key);
-                }
-                if !txn.commit_set.is_empty() {
-                    assert!(txn.write_set.is_empty());
-                    self.transactions.insert(id, txn);
-                }
-            },
-            TxnStatus::Committed => {
-                self.add_txn_writes(txn.clone(), writes);
-                let id = txn.id();
-                let commit_ts = txn.commit_ts();
-                let Some(existing_txn) = self.transactions.remove(&id) else {
-                    return;
-                };
-                for span in &existing_txn.write_set {
-                    let Some((key, intent)) = self.intents.remove_entry(&span.key) else {
-                        continue;
-                    };
-                    let Some(latest) = intent.into_latest(&txn) else {
-                        continue;
-                    };
-                    let value = Value::new_replicated(latest.into_value());
-                    store.put(key, commit_ts, value).unwrap();
-                }
-                if !txn.commit_set.is_empty() {
-                    assert!(txn.write_set.is_empty());
-                    self.transactions.insert(id, txn);
-                }
-            },
-        }
+    fn apply_txn(&mut self, store: &mut DataStore, txn: Transaction, writes: Writes) {
+        let record = self.prepare_txn(&txn);
+        self.add_txn_writes(record, writes);
+        let mut replication = ReplicationTracker::default();
+        self.resolve(store, &mut replication, &txn, true);
+        replication.commit();
     }
 
     fn remove_intents(&mut self, spans: &[KeySpan]) {
@@ -815,6 +876,8 @@ impl TxnProvision {
     ) -> Option<(&'a [u8], &'a TxnIntent)> {
         let bounds = if end.is_empty() {
             (Bound::Included(key.to_owned()), Bound::Unbounded)
+        } else if key >= end {
+            return None;
         } else {
             (Bound::Included(key.to_owned()), Bound::Included(end.to_owned()))
         };
@@ -844,7 +907,7 @@ impl TxnProvision {
         if txn.status == TxnStatus::Pending {
             if txn.epoch() > entry.get().epoch() {
                 let record = entry.remove();
-                self.remove_intents(&record.write_set);
+                self.remove_intents(&record.take_write_set());
             }
             return;
         }
@@ -864,6 +927,7 @@ impl TxnProvision {
         } else {
             current.update(txn);
         }
+        trace!("resolving {} write set {:?}", txn.meta(), write_set.iter().take(10));
         if txn.status == TxnStatus::Aborted {
             for span in write_set {
                 self.intents.remove(&span.key);
@@ -949,6 +1013,7 @@ impl TabletStore {
     }
 
     pub fn apply(&mut self, mut message: protos::DataMessage) -> Result<()> {
+        trace!("apply {message:?}");
         let cursor = MessageId::new(message.epoch, message.sequence);
         self.update_cursor(cursor);
         if let (Some(closed_timestamp), Some(leader_expiration)) =
@@ -968,7 +1033,6 @@ impl TabletStore {
             Temporal::Transaction(txn) => txn,
         };
 
-        let txn = self.prepare_txn(&txn);
         self.apply_txn(txn, message.operation.take().into());
         Ok(())
     }
@@ -992,11 +1056,7 @@ impl TabletStore {
         }
     }
 
-    fn prepare_txn(&mut self, txn: &Transaction) -> TxnRecord {
-        self.provision.prepare_txn(txn)
-    }
-
-    fn apply_txn(&mut self, txn: TxnRecord, writes: Writes) {
+    fn apply_txn(&mut self, txn: Transaction, writes: Writes) {
         self.provision.apply_txn(&mut self.store, txn, writes)
     }
 
@@ -1009,66 +1069,58 @@ impl TabletStore {
         }
     }
 
+    fn handle_timestamped_request(
+        &mut self,
+        context: &mut BatchContext,
+        ts: Timestamp,
+        request: ShardRequest,
+    ) -> Result<ShardResponse, DataError> {
+        let ShardRequest { shard_id, request } = request;
+        let shard_store = self.store.find_shard_store_mut(shard_id.into(), request.key())?;
+        let response = shard_store.handle_timestamped_request(context, ts, request)?;
+        let shard = if shard_id == shard_store.id.into_raw() {
+            None
+        } else {
+            Some(ShardDescriptor { id: shard_id, range: shard_store.range.clone(), tablet_id: self.store.id.into() })
+        };
+        Ok(ShardResponse { response, shard })
+    }
+
     pub fn batch_timestamped(
         &mut self,
         context: &mut BatchContext,
         ts: Timestamp,
         requests: Vec<ShardRequest>,
-    ) -> Result<Vec<ShardResponse>> {
+    ) -> Result<Vec<ShardResponse>, BatchError> {
         let mut responses = Vec::with_capacity(requests.len());
-        for ShardRequest { shard_id, request } in requests.into_iter() {
-            let key = request.key();
-            let shard_store = self.store.find_shard_store_mut(shard_id.into(), key)?;
-            let response = match request {
-                DataRequest::Get(get) => {
-                    let value = shard_store.get_timestamped(context, ts, &get.key)?;
-                    context.reads.watch(&value.value);
-                    let response = GetResponse { value: value.into() };
-                    DataResponse::Get(response)
-                },
-                DataRequest::Find(find) => {
-                    let (key, value) = shard_store.find_timestamped(context, ts, &find.key)?;
-                    context.reads.watch(&value.value);
-                    let response = FindResponse { key, value: value.into() };
-                    DataResponse::Find(response)
-                },
-                DataRequest::Scan(scan) => {
-                    let (resume_key, rows) = shard_store.scan_timestamped(context, ts, scan.range, scan.limit)?;
-                    rows.iter().for_each(|row| {
-                        context.reads.watch(&row.value.value);
-                    });
-                    let response = ScanResponse { resume_key, rows: rows.into_iter().map(Into::into).collect() };
-                    DataResponse::Scan(response)
-                },
-                DataRequest::Put(put) => {
-                    let ts = shard_store.put_timestamped(context, ts, &put.key, put.value, put.expect_ts)?;
-                    let response = PutResponse { write_ts: ts };
-                    DataResponse::Put(response)
-                },
-                DataRequest::Increment(increment) => {
-                    let incremented =
-                        shard_store.increment_timestamped(context, ts, &increment.key, increment.increment)?;
-                    let response = IncrementResponse { value: incremented };
-                    DataResponse::Increment(response)
-                },
-                DataRequest::RefreshRead(refresh_read) => {
-                    shard_store.refresh_read_timestamped(context, ts, refresh_read.span, refresh_read.from)?;
-                    DataResponse::RefreshRead(RefreshReadResponse {})
-                },
+        for (i, request) in requests.into_iter().enumerate() {
+            let response = match self.handle_timestamped_request(context, ts, request) {
+                Ok(response) => response,
+                Err(err) => return Err(BatchError::with_index(i, err)),
             };
-            let shard = if shard_id == shard_store.id.into_raw() {
-                None
-            } else {
-                Some(ShardDescriptor {
-                    id: shard_id,
-                    range: shard_store.range.clone(),
-                    tablet_id: self.store.id.into(),
-                })
-            };
-            responses.push(ShardResponse { response, shard });
+            responses.push(response);
         }
-        self.store.promote(context)?;
+        if let Err(err) = self.store.promote(context) {
+            return Err(BatchError::new(err));
+        }
         Ok(responses)
+    }
+
+    fn handle_transactional_request(
+        &mut self,
+        context: &mut BatchContext,
+        txn: &TxnRecord,
+        request: ShardRequest,
+    ) -> Result<ShardResponse, DataError> {
+        let ShardRequest { shard_id, request } = request;
+        let shard_store = self.store.find_shard_store_mut(shard_id.into(), request.key())?;
+        let response = shard_store.handle_transactional_request(context, &mut self.provision, txn, request)?;
+        let shard = if shard_id == shard_store.id.into_raw() {
+            None
+        } else {
+            Some(ShardDescriptor { id: shard_id, range: shard_store.range.clone(), tablet_id: self.store.id.into() })
+        };
+        Ok(ShardResponse { response, shard })
     }
 
     pub fn batch_transactional(
@@ -1076,90 +1128,17 @@ impl TabletStore {
         context: &mut BatchContext,
         txn: &Transaction,
         requests: Vec<ShardRequest>,
-    ) -> Result<Vec<ShardResponse>> {
+    ) -> Result<Vec<ShardResponse>, BatchError> {
         let txn = self.provision.prepare_txn(txn);
         let mut responses = Vec::with_capacity(requests.len());
-        for ShardRequest { shard_id, request } in requests.into_iter() {
-            let key = request.key();
-            let shard_store = self.store.find_shard_store_mut(shard_id.into(), key)?;
-            let response = match request {
-                DataRequest::Get(get) => {
-                    let value =
-                        shard_store.get_transactional(context, &self.provision, &txn, &get.key, get.sequence)?;
-                    context.reads.watch(&value.value);
-                    let response = GetResponse { value: value.into() };
-                    DataResponse::Get(response)
-                },
-                DataRequest::Find(find) => {
-                    let (key, value) =
-                        shard_store.find_transactional(context, &self.provision, &txn, &find.key, find.sequence)?;
-                    context.reads.watch(&value.value);
-                    let response = FindResponse { key, value: value.into() };
-                    DataResponse::Find(response)
-                },
-                DataRequest::Scan(scan) => {
-                    let (resume_key, rows) = shard_store.scan_transactional(
-                        context,
-                        &self.provision,
-                        &txn,
-                        scan.range,
-                        scan.limit,
-                        scan.sequence,
-                    )?;
-                    rows.iter().for_each(|row| {
-                        context.reads.watch(&row.value.value);
-                    });
-                    let response = ScanResponse { resume_key, rows: rows.into_iter().map(Into::into).collect() };
-                    DataResponse::Scan(response)
-                },
-                DataRequest::Put(put) => {
-                    let ts = shard_store.put_transactional(
-                        context,
-                        &mut self.provision,
-                        &txn,
-                        put.key,
-                        put.value,
-                        put.sequence,
-                        put.expect_ts,
-                    )?;
-                    let response = PutResponse { write_ts: ts };
-                    DataResponse::Put(response)
-                },
-                DataRequest::Increment(increment) => {
-                    let incremented = shard_store.increment_transactional(
-                        context,
-                        &mut self.provision,
-                        &txn,
-                        increment.key,
-                        increment.increment,
-                        increment.sequence,
-                    )?;
-                    let response = IncrementResponse { value: incremented };
-                    DataResponse::Increment(response)
-                },
-                DataRequest::RefreshRead(refresh) => {
-                    shard_store.refresh_read_transactional(
-                        context,
-                        &mut self.provision,
-                        &txn,
-                        refresh.span,
-                        refresh.from,
-                    )?;
-                    DataResponse::RefreshRead(RefreshReadResponse {})
-                },
+        for (i, request) in requests.into_iter().enumerate() {
+            let response = match self.handle_transactional_request(context, &txn, request) {
+                Ok(response) => response,
+                Err(err) => return Err(BatchError::with_index(i, err)),
             };
-            let shard = if shard_id == shard_store.id.into_raw() {
-                None
-            } else {
-                Some(ShardDescriptor {
-                    id: shard_id,
-                    range: shard_store.range.clone(),
-                    tablet_id: self.store.id.into(),
-                })
-            };
-            responses.push(ShardResponse { response, shard });
+            responses.push(response);
         }
-        self.provision.promote(context)?;
+        self.provision.promote(context).unwrap();
         Ok(responses)
     }
 
@@ -1168,7 +1147,7 @@ impl TabletStore {
         context: &mut BatchContext,
         temporal: &Temporal,
         requests: Vec<ShardRequest>,
-    ) -> Result<Vec<ShardResponse>> {
+    ) -> Result<Vec<ShardResponse>, BatchError> {
         match temporal {
             Temporal::Timestamp(ts) => self.batch_timestamped(context, *ts, requests),
             Temporal::Transaction(txn) => self.batch_transactional(context, txn, requests),

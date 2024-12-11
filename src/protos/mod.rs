@@ -16,7 +16,9 @@
 
 #[rustfmt::skip]
 mod generated;
+mod errors;
 mod span;
+mod sql;
 mod temporal;
 mod uuid;
 
@@ -30,6 +32,7 @@ pub use temporal::{HasTxnMeta, HasTxnStatus};
 pub use self::data_message::Operation as DataOperation;
 pub use self::generated::*;
 pub use self::span::*;
+pub use self::sql::*;
 pub use self::tablet_service_client::TabletServiceClient;
 pub use self::tablet_service_server::{TabletService, TabletServiceServer};
 pub use crate::keys;
@@ -382,6 +385,10 @@ impl TimestampedValue {
     pub fn read_bytes(&self, key: &[u8], operation: &str) -> Result<&[u8]> {
         self.value.read_bytes(key, operation)
     }
+
+    pub fn into_parts(self) -> (Timestamp, Value) {
+        (self.timestamp, self.value)
+    }
 }
 
 impl TimestampedKeyValue {
@@ -491,6 +498,19 @@ impl DataResponse {
             Self::Increment(increment) => Ok(increment),
             _ => Err(self),
         }
+    }
+
+    pub fn into_refresh_read(self) -> Result<RefreshReadResponse, Self> {
+        match self {
+            Self::RefreshRead(refresh_read) => Ok(refresh_read),
+            _ => Err(self),
+        }
+    }
+}
+
+impl ScanResponse {
+    pub fn into_parts(self) -> (Vec<u8>, Vec<TimestampedKeyValue>) {
+        (self.resume_key, self.rows)
     }
 }
 

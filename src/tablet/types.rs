@@ -21,6 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::protos::{
+    BatchError,
     BatchRequest,
     BatchResponse,
     ParticipateTxnRequest,
@@ -97,7 +98,7 @@ impl<T> StreamingRequester<T> {
 pub enum TabletRequest {
     Batch {
         batch: BatchRequest,
-        responser: oneshot::Sender<Result<BatchResponse>>,
+        responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
     },
     Deploy {
         epoch: u64,
@@ -125,7 +126,7 @@ pub enum TabletServiceRequest {
     },
     Batch {
         batch: BatchRequest,
-        responser: oneshot::Sender<Result<BatchResponse>>,
+        responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
     },
     UnloadTablet {
         deployment: TabletDeployment,

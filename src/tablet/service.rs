@@ -30,6 +30,7 @@ use crate::clock::Clock;
 use crate::cluster::{ClusterEnv, NodeId};
 use crate::protos::{
     self,
+    BatchError,
     BatchRequest,
     BatchResponse,
     DataMessage,
@@ -62,7 +63,7 @@ use crate::utils::{self, DropOwner};
 struct BatchResponser {
     temporal: Temporal,
     responses: Vec<ShardResponse>,
-    responser: oneshot::Sender<Result<BatchResponse>>,
+    responser: oneshot::Sender<Result<BatchResponse, BatchError>>,
 }
 
 impl BatchResponser {
@@ -245,7 +246,7 @@ impl TabletServiceState {
                                     Ok(BatchResponse { temporal, responses, deployments: Default::default() })
                                 } else {
                                     assert!(stage == ReplicationStage::Failed);
-                                    Err(anyhow!("replication failed"))
+                                    Err(BatchError::with_message("replication failed".to_string()))
                                 };
                                 responser.send(result).ignore();
                             })
@@ -304,6 +305,7 @@ impl TabletServiceState {
                     }
                 },
                 Some(mut txn) = tablet.store.store.updated_txns().recv() => {
+                    trace!("update txn {:?}", txn);
                     let (replication, requests) = tablet.store.store.update_txn(&mut txn);
                     trace!("unblock txn {}(epoch:{}, {:?}) requests {:?}", txn.id(), txn.epoch(), txn.status(), requests);
                     unblocking_requests.extend(requests.into_iter());
@@ -496,14 +498,14 @@ impl TabletServiceManager {
         responser.send(Ok(())).ignore();
     }
 
-    fn apply_batch(&mut self, batch: BatchRequest, responser: oneshot::Sender<Result<BatchResponse>>) {
+    fn apply_batch(&mut self, batch: BatchRequest, responser: oneshot::Sender<Result<BatchResponse, BatchError>>) {
         if let Some((_, requester)) = self.tablets.get(&batch.tablet_id) {
             let request = TabletRequest::Batch { batch, responser };
             if let Err(mpsc::error::SendError(TabletRequest::Batch { batch, responser })) = requester.send(request) {
-                responser.send(Err(anyhow!("tablet {} closed", batch.tablet_id))).ignore();
+                responser.send(Err(BatchError::with_message(format!("tablet {} closed", batch.tablet_id)))).ignore();
             }
         } else {
-            responser.send(Err(anyhow!("tablet {} not found", batch.tablet_id))).ignore();
+            responser.send(Err(BatchError::with_message(format!("tablet {} not found", batch.tablet_id)))).ignore();
         }
     }
 

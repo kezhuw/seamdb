@@ -1,0 +1,132 @@
+// Copyright 2023 The SeamDB Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package sql;
+
+import "seamdb.proto";
+
+message DescriptorMeta {
+    uint64 id = 1;
+    string name = 2;
+    uint64 database_id = 3;
+    uint64 parent_id = 4;
+    seamdb.Timestamp timestamp = 5;
+    bytes blob = 6;
+}
+
+message DatabaseDescriptor {
+    uint64 id = 1;
+    string name = 2;
+
+    // Populated from kv layer.
+    seamdb.Timestamp timestamp = 3;
+}
+
+message SchemaDescriptor {
+    uint64 id = 1;
+    string name = 2;
+    uint64 database_id = 3;
+
+    // Populated from kv layer.
+    seamdb.Timestamp timestamp = 4;
+}
+
+message TableDescriptor {
+    uint64 id = 1;
+    string name = 2;
+
+    uint64 database_id = 3;
+    uint64 schema_id = 4;
+
+    // Populated from kv layer.
+    seamdb.Timestamp timestamp = 5;
+
+    uint32 last_column_id = 7;
+    repeated ColumnDescriptor columns = 8;
+    uint32 last_index_id = 9;
+    repeated IndexDescriptor indices = 10;
+}
+
+message ColumnType {
+    ColumnTypeKind kind = 1;
+    ColumnTypeDeclaration declaration = 2;
+}
+
+enum ColumnTypeKind {
+    Boolean = 0;
+    Int16 = 1;
+    Int32 = 2;
+    Int64 = 3;
+    Float32 = 4;
+    Float64 = 5;
+    Bytes = 6;
+    String = 7;
+}
+
+message NumericTypeDeclaration {
+    uint32 precision = 1;
+    uint32 scale = 2;
+}
+
+message CharacterTypeDeclaration {
+    uint32 max_length = 1;
+}
+
+message ColumnTypeDeclaration {
+    oneof value {
+        NumericTypeDeclaration numeric = 1;
+        CharacterTypeDeclaration character = 2;
+    }
+}
+
+message StoringFloat32 {
+    float value = 1;
+}
+
+message StoringFloat64 {
+    double value = 1;
+}
+
+message ColumnValue {
+    oneof value {
+        bool boolean = 1;
+        int32 int16 = 2;
+        int32 int32 = 3;
+        int64 int64 = 4;
+        StoringFloat32 float32 = 5;
+        StoringFloat64 float64 = 6;
+        bytes bytes = 7;
+        string string = 8;
+    }
+}
+
+message ColumnDescriptor {
+    uint32 id = 1;
+    string name = 2;
+    bool nullable = 3;
+    bool serial = 4;
+    ColumnTypeKind type_kind = 5;
+    ColumnTypeDeclaration type_declaration = 6;
+    ColumnValue default_value = 7;
+}
+
+message IndexDescriptor {
+    uint32 id = 1;
+    string name = 2;
+    bool unique = 3;
+    repeated uint32 column_ids = 4;
+    repeated uint32 storing_column_ids = 5;
+}

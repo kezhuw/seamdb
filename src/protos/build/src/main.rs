@@ -24,7 +24,6 @@ fn main() {
     let protos: Vec<_> = protos_dir
         .read_dir()
         .unwrap()
-        .into_iter()
         .map(|entry| entry.unwrap().path())
         .filter(|p| p.file_name().unwrap().to_str().unwrap().ends_with(".proto"))
         .collect();
@@ -37,15 +36,39 @@ fn main() {
     let mut config = prost_build::Config::new();
     config
         .skip_debug(std::iter::once("Uuid"))
-        .type_attribute("Timestamp", "#[derive(Eq, PartialOrd, Ord)]")
+        .type_attribute("Timestamp", "#[derive(Eq, Hash, PartialOrd, Ord)]")
         .type_attribute("MessageId", "#[derive(Eq, PartialOrd, Ord)]")
+        .type_attribute("KeySpan", "#[derive(Eq, PartialOrd, Ord)]")
+        .type_attribute("KeyRange", "#[derive(Eq, PartialOrd, Ord)]")
         .type_attribute("Uuid", "#[derive(Eq, Hash, PartialOrd, Ord)]")
+        .type_attribute("ColumnDescriptor", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("IndexDescriptor", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("TableDescriptor", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("ColumnValue", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("ColumnTypeDeclaration", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("NumericTypeDeclaration", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("CharacterTypeDeclaration", "#[derive(Eq, Hash, PartialOrd)]")
+        .type_attribute("StoringFloat32", "#[derive(PartialOrd)]")
+        .type_attribute("StoringFloat64", "#[derive(PartialOrd)]")
+        .require_field("DescriptorMeta.timestamp")
+        .require_field("TableDescriptor.timestamp")
+        .require_field("SchemaDescriptor.timestamp")
+        .require_field("DatabaseDescriptor.timestamp")
+        .oneof_enum("ColumnTypeDeclaration")
         .oneof_enum("Value")
         .oneof_enum("Temporal")
+        .oneof_enum("Transient")
         .oneof_enum("DataRequest")
+        .oneof_enum("ColumnValue")
         .oneof_enum("DataResponse")
+        .oneof_enum("DataError")
         .enumerate_field(".seamdb")
+        .enumerate_field(".sql")
         .require_field(".seamdb.TabletWatermark")
+        .require_field("RefreshReadError.temporal")
+        .require_field("ConflictWriteError.transient")
+        .require_field("TimestampMismatchError.actual")
+        .require_field("BatchError.error")
         .require_field("ShardRequest.request")
         .require_field("ShardResponse.response")
         .require_field("BatchRequest.temporal")
@@ -88,7 +111,7 @@ fn main() {
             file.write_all(b"\n").unwrap();
         }
         file.write_all(b"#[rustfmt::skip]\n").unwrap();
-        write!(&mut file, "mod {};\n", module).unwrap();
-        write!(&mut file, "pub use self::{}::*;\n", module).unwrap();
+        writeln!(&mut file, "mod {};", module).unwrap();
+        writeln!(&mut file, "pub use self::{}::*;", module).unwrap();
     }
 }

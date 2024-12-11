@@ -17,26 +17,35 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use enum_dispatch::enum_dispatch;
 use prost::Message as _;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::cluster::{ClusterEnv, NodeId};
 use crate::keys;
 use crate::protos::{
+    BatchError,
     BatchRequest,
+    BatchResponse,
+    DataError,
     DataRequest,
     DataResponse,
     FindRequest,
     FindResponse,
     GetRequest,
+    GetResponse,
     IncrementRequest,
+    KeyRange,
+    KeySpan,
     ParticipateTxnRequest,
     ParticipateTxnResponse,
     PutRequest,
+    RefreshReadRequest,
+    ScanRequest,
     ShardDescriptor,
     ShardId,
     ShardRequest,
@@ -46,7 +55,7 @@ use crate::protos::{
     TabletServiceClient,
     Temporal,
     Timestamp,
-    TimestampedValue,
+    TimestampedKeyValue,
     Transaction,
     TxnMeta,
     Uuid,
@@ -54,12 +63,297 @@ use crate::protos::{
 };
 
 // TODO: cache and invalidate on error
-#[derive(Clone)]
-pub struct TabletClient {
+struct RootTabletClient {
     root: Arc<ShardDescriptor>,
     descriptor: Arc<ShardDescriptor>,
     deployment: Arc<ShardDescriptor>,
     cluster: ClusterEnv,
+}
+
+#[derive(Clone)]
+struct ScopedTabletClient {
+    prefix: Vec<u8>,
+    client: Arc<RootTabletClient>,
+}
+
+#[enum_dispatch]
+#[derive(Clone)]
+enum InnerTabletClient {
+    Root(Arc<RootTabletClient>),
+    Scoped(ScopedTabletClient),
+}
+
+#[enum_dispatch(InnerTabletClient)]
+trait TabletClientTrait {
+    fn now(&self) -> Timestamp;
+
+    fn prefix(&self) -> &[u8];
+
+    fn root(&self) -> &RootTabletClient;
+
+    #[allow(clippy::uninit_vec)]
+    fn prefix_key<'a>(&self, key: impl Into<Cow<'a, [u8]>>) -> Vec<u8> {
+        let key = key.into();
+        let prefix = self.prefix();
+        if prefix.is_empty() {
+            return key.into_owned();
+        }
+        match key {
+            Cow::Borrowed(key) => {
+                let mut prefixed_key = Vec::with_capacity(prefix.len() + key.len());
+                prefixed_key.extend_from_slice(prefix);
+                prefixed_key.extend_from_slice(key);
+                prefixed_key
+            },
+            Cow::Owned(mut key) => {
+                let key_len = key.len();
+                let prefix_len = prefix.len();
+                key.reserve(prefix_len);
+                unsafe {
+                    key.set_len(key_len + prefix_len);
+                    std::ptr::copy(key.as_ptr(), key.as_mut_ptr().wrapping_add(prefix_len), key_len);
+                    std::ptr::copy_nonoverlapping(prefix.as_ptr(), key.as_mut_ptr(), prefix.len());
+                }
+                key
+            },
+        }
+    }
+
+    fn prefix_span(&self, span: KeySpan) -> KeySpan {
+        let key = self.prefix_key(span.key);
+        let end = if span.end.is_empty() { span.end } else { self.prefix_key(span.end) };
+        KeySpan { key, end }
+    }
+
+    fn prefix_range(&self, range: KeyRange) -> KeyRange {
+        let start = self.prefix_key(range.start);
+        let end = self.prefix_key(range.end);
+        KeyRange { start, end }
+    }
+
+    fn unprefix_key(&self, mut key: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+        let Some(stripped) = key.strip_prefix(self.prefix()) else {
+            return Err(key);
+        };
+        let (ptr, len) = (stripped.as_ptr(), stripped.len());
+        unsafe {
+            std::ptr::copy(ptr, key.as_mut_ptr(), len);
+            key.set_len(len);
+        }
+        Ok(key)
+    }
+
+    fn new_transaction(&self, key: Vec<u8>) -> Transaction {
+        let key = self.prefix_key(key);
+        let meta = TxnMeta { id: Uuid::new_random(), key, epoch: 0, start_ts: self.now(), priority: 0 };
+        Transaction { meta, ..Default::default() }
+    }
+
+    async fn heartbeat_txn(&self, txn: Transaction) -> Result<Transaction> {
+        self.root().heartbeat_txn(txn).await
+    }
+
+    async fn get_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
+        sequence: u32,
+    ) -> Result<(Temporal, Option<GetResponse>)> {
+        let key = self.prefix_key(key);
+        self.root().get_directly(temporal, key, sequence).await
+    }
+
+    async fn get(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
+        match self.get_directly(Temporal::default(), key, 0).await? {
+            (_temporal, None) => Err(TabletClientError::unexpected("timestamp get get no response")),
+            (_temporal, Some(response)) => Ok(response.value.map(|v| v.into_parts())),
+        }
+    }
+
+    async fn put_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+        sequence: u32,
+    ) -> Result<(Temporal, Option<Timestamp>)> {
+        let key = self.prefix_key(key);
+        self.root().put_directly(temporal, key, value, expect_ts, sequence).await
+    }
+
+    async fn put(
+        &self,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
+        match self.put_directly(Temporal::default(), key, value, expect_ts, 0).await? {
+            (_temporal, None) => Err(TabletClientError::unexpected("timestamp put get aborted")),
+            (_temporal, Some(write_ts)) => Ok(write_ts),
+        }
+    }
+
+    async fn refresh_read(
+        &self,
+        temporal: Temporal,
+        span: KeySpan,
+        from: Timestamp,
+    ) -> Result<(Temporal, Option<Vec<u8>>)> {
+        let span = self.prefix_span(span);
+        let (temporal, resume_key) = self.root().refresh_read(temporal, span, from).await?;
+        let resume_key = match resume_key {
+            Some(resume_key) if !resume_key.is_empty() => Some(self.unprefix_key(resume_key).unwrap()),
+            _ => resume_key,
+        };
+        Ok((temporal, resume_key))
+    }
+
+    async fn increment_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
+        increment: i64,
+        sequence: u32,
+    ) -> Result<(Temporal, Option<i64>)> {
+        let key = self.prefix_key(key);
+        self.root().increment_directly(temporal, key, increment, sequence).await
+    }
+
+    async fn increment(&self, key: impl Into<Cow<'_, [u8]>>, increment: i64) -> Result<i64> {
+        match self.increment_directly(Temporal::default(), key, increment, 0).await? {
+            (_temporal, None) => Err(TabletClientError::unexpected("timestamp increment get aborted")),
+            (_temporal, Some(incremented)) => Ok(incremented),
+        }
+    }
+
+    async fn scan_directly(
+        &self,
+        temporal: Temporal,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Temporal, Option<(Vec<u8>, Vec<TimestampedKeyValue>)>)> {
+        let start = self.prefix_key(start);
+        let end = self.prefix_key(end);
+        match self.root().scan_directly(temporal, start, end, limit).await? {
+            (temporal, None) => Ok((temporal, None)),
+            (temporal, Some((resume_key, mut rows))) => {
+                let resume_key =
+                    if resume_key.is_empty() { resume_key } else { self.unprefix_key(resume_key).unwrap() };
+                for row in rows.iter_mut() {
+                    row.key = self.unprefix_key(std::mem::take(&mut row.key)).unwrap();
+                }
+                Ok((temporal, Some((resume_key, rows))))
+            },
+        }
+    }
+
+    async fn scan(
+        &self,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        match self.scan_directly(Temporal::default(), start, end, limit).await? {
+            (_temporal, None) => Err(TabletClientError::unexpected("no scan response")),
+            (_temporal, Some(response)) => Ok(response),
+        }
+    }
+
+    async fn locate(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<ShardDeployment> {
+        let key = self.prefix_key(key);
+        self.root().locate(key).await
+    }
+
+    async fn participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        coordinator: bool,
+    ) -> Result<(mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>)> {
+        self.root().participate_txn(request, coordinator).await
+    }
+
+    async fn open_participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        coordinator: bool,
+    ) -> (mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>) {
+        self.root().open_participate_txn(request, coordinator).await
+    }
+
+    async fn service(&self, key: &[u8]) -> Result<(ShardDeployment, TabletServiceClient<tonic::transport::Channel>)> {
+        let key = self.prefix_key(key);
+        self.root().service(&key).await
+    }
+
+    async fn batch(&self, mut requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
+        if self.prefix().is_empty() {
+            return self.root().batch(requests).await;
+        }
+        for request in requests.iter_mut() {
+            match request {
+                DataRequest::Get(get) => {
+                    get.key = self.prefix_key(Cow::Owned(std::mem::take(&mut get.key)));
+                },
+                DataRequest::Put(put) => {
+                    put.key = self.prefix_key(Cow::Owned(std::mem::take(&mut put.key)));
+                },
+                DataRequest::Increment(increment) => {
+                    increment.key = self.prefix_key(Cow::Owned(std::mem::take(&mut increment.key)));
+                },
+                DataRequest::Find(find) => {
+                    find.key = self.prefix_key(Cow::Owned(std::mem::take(&mut find.key)));
+                },
+                DataRequest::Scan(scan) => {
+                    scan.range = self.prefix_range(std::mem::take(&mut scan.range));
+                },
+                DataRequest::RefreshRead(refresh_read) => {
+                    refresh_read.span = self.prefix_span(std::mem::take(&mut refresh_read.span));
+                },
+            }
+        }
+        let mut responses = self.root().batch(requests).await?;
+        for response in responses.iter_mut() {
+            match response {
+                DataResponse::Get(_) => {},
+                DataResponse::Put(_) => {},
+                DataResponse::Increment(_) => {},
+                DataResponse::Find(find) => {
+                    if !find.key.is_empty() {
+                        find.key = self.unprefix_key(std::mem::take(&mut find.key)).unwrap();
+                    }
+                },
+                DataResponse::Scan(scan) => {
+                    if !scan.resume_key.is_empty() {
+                        scan.resume_key = self.unprefix_key(std::mem::take(&mut scan.resume_key)).unwrap();
+                    }
+                    for row in scan.rows.iter_mut() {
+                        row.key = self.unprefix_key(std::mem::take(&mut row.key)).unwrap();
+                    }
+                },
+                DataResponse::RefreshRead(refresh_read) => {
+                    if !refresh_read.resume_key.is_empty() {
+                        refresh_read.resume_key =
+                            self.unprefix_key(std::mem::take(&mut refresh_read.resume_key)).unwrap();
+                    }
+                },
+            }
+        }
+        Ok(responses)
+    }
+
+    async fn find(&self, key: &[u8]) -> Result<Option<(Timestamp, Vec<u8>, Value)>> {
+        let key = self.prefix_key(key);
+        let Some((ts, key, value)) = self.root().find(key).await? else {
+            return Ok(None);
+        };
+        Ok(Some((ts, self.unprefix_key(key).unwrap(), value)))
+    }
+
+    async fn get_tablet_descriptor(&self, id: TabletId) -> Result<(Timestamp, TabletDescriptor)> {
+        self.root().get_tablet_descriptor(id).await
+    }
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +378,10 @@ pub enum TabletClientError {
     ShardNotFound { tablet_id: TabletId, shard_id: ShardId, key: Vec<u8> },
     #[error("data corruption: {message}")]
     DataCorruption { message: String },
+    #[error("key {key:?} already exist")]
+    KeyAlreadyExists { key: Vec<u8> },
+    #[error("key {key:?} get overwritten at {actual}")]
+    KeyTimestampMismatch { key: Vec<u8>, actual: Timestamp },
     #[error("invalid argument: {message}")]
     InvalidArgument { message: String },
     #[error(transparent)]
@@ -113,6 +411,7 @@ impl From<TabletClientError> for tonic::Status {
                 Status::internal(err.to_string())
             },
             TabletClientError::UnexpectedError { .. } => Status::unknown(err.to_string()),
+            TabletClientError::KeyAlreadyExists { .. } | TabletClientError::KeyTimestampMismatch { .. } => todo!(),
         }
     }
 }
@@ -169,7 +468,35 @@ impl ShardDeployment {
     }
 }
 
-impl TabletClient {
+impl TabletClientTrait for RootTabletClient {
+    fn now(&self) -> Timestamp {
+        self.cluster.clock().now()
+    }
+
+    fn prefix(&self) -> &[u8] {
+        Default::default()
+    }
+
+    fn root(&self) -> &RootTabletClient {
+        self
+    }
+}
+
+impl TabletClientTrait for Arc<RootTabletClient> {
+    fn now(&self) -> Timestamp {
+        self.cluster.clock().now()
+    }
+
+    fn prefix(&self) -> &[u8] {
+        Default::default()
+    }
+
+    fn root(&self) -> &RootTabletClient {
+        self.as_ref()
+    }
+}
+
+impl RootTabletClient {
     pub fn new(cluster: ClusterEnv) -> Self {
         Self {
             cluster,
@@ -177,15 +504,6 @@ impl TabletClient {
             descriptor: Arc::new(ShardDescriptor::descriptor()),
             deployment: Arc::new(ShardDescriptor::deployment()),
         }
-    }
-
-    pub fn now(&self) -> Timestamp {
-        self.cluster.clock().now()
-    }
-
-    pub fn new_transaction(&self, key: Vec<u8>) -> Transaction {
-        let meta = TxnMeta { id: Uuid::new_random(), key, epoch: 0, start_ts: self.cluster.clock().now(), priority: 0 };
-        Transaction { meta, ..Default::default() }
     }
 
     fn get_cluster_descriptor(&self) -> Result<(Timestamp, TabletDescriptor)> {
@@ -266,34 +584,26 @@ impl TabletClient {
     }
 
     async fn get_shard(&self, deployment: &ShardDeployment, key: impl Into<Vec<u8>>) -> Result<Arc<ShardDescriptor>> {
-        let Some(node) = deployment.node_id() else {
-            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
-        };
-        let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
-            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
-        };
-        let mut client = TabletServiceClient::connect(addr.to_string())
-            .await
-            .map_err(|e| TabletClientError::NodeNotConnectable { node: node.clone(), message: e.to_string() })?;
         let key = key.into();
-        let batch = BatchRequest {
-            tablet_id: deployment.tablet_id().into(),
-            uncertainty: None,
-            temporal: Temporal::default(),
-            requests: vec![ShardRequest {
-                shard_id: deployment.shard_id().into(),
-                request: DataRequest::Find(FindRequest { key, sequence: 0 }),
-            }],
-        };
-        let response = client.batch(batch).await?.into_inner();
-        let find = response
+        let find = self
+            .batch_request(deployment, BatchRequest {
+                tablet_id: deployment.tablet_id().into(),
+                uncertainty: None,
+                temporal: Temporal::default(),
+                requests: vec![ShardRequest {
+                    shard_id: deployment.shard_id().into(),
+                    request: DataRequest::Find(FindRequest { key: key.clone(), sequence: 0 }),
+                }],
+            })
+            .await?
             .into_find()
             .map_err(|r| TabletClientError::unexpected(format!("unexpected find response: {:?}", r)))?;
+
         let FindResponse { key: located_key, value: Some(value) } = find else {
             return Err(TabletClientError::ShardNotFound {
                 tablet_id: deployment.tablet_id(),
                 shard_id: deployment.shard_id(),
-                key: find.key,
+                key,
             });
         };
         let bytes = value
@@ -350,9 +660,9 @@ impl TabletClient {
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
             return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
-        let service =
-            TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
-        Ok(service)
+        TabletServiceClient::connect(addr.to_string())
+            .await
+            .map_err(|e| TabletClientError::NodeNotConnectable { node: node.clone(), message: e.to_string() })
     }
 
     pub async fn service(
@@ -364,21 +674,33 @@ impl TabletClient {
         Ok((deployment, service))
     }
 
-    async fn request(&self, deployment: &ShardDeployment, request: DataRequest) -> Result<DataResponse> {
+    async fn batch_request(&self, deployment: &ShardDeployment, request: BatchRequest) -> Result<BatchResponse> {
+        let tablet_id = request.tablet_id;
         let mut service = self.connect(deployment).await?;
-        let tablet_id = deployment.tablet_id().into();
-        let shard_id = deployment.shard_id().into();
-        let batch = BatchRequest {
-            tablet_id,
-            uncertainty: None,
-            temporal: Temporal::default(),
-            requests: vec![ShardRequest { shard_id, request }],
-        };
-        let response = service.batch(batch).await?.into_inner();
-        let response = response
-            .into_one()
-            .map_err(|r| TabletClientError::unexpected(format!("expect one response, got {:?}", r)))?;
-        Ok(response.response)
+        match service.batch(request).await {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) => {
+                let details = status.details();
+                if !details.is_empty() {
+                    let err = BatchError::decode(details).unwrap();
+                    trace!("batch error: {err:?}");
+                    let err = match err.error {
+                        DataError::ConflictWrite(err) => TabletClientError::KeyAlreadyExists { key: err.key },
+                        DataError::ShardNotFound(err) => TabletClientError::ShardNotFound {
+                            tablet_id: tablet_id.into(),
+                            shard_id: err.shard_id.into(),
+                            key: err.key,
+                        },
+                        DataError::TimestampMismatch(err) => {
+                            TabletClientError::KeyTimestampMismatch { key: err.key, actual: err.actual }
+                        },
+                        err => TabletClientError::Internal(anyhow!("{err}")),
+                    };
+                    return Err(err);
+                }
+                Err(TabletClientError::from(status))
+            },
+        }
     }
 
     async fn request_batch(
@@ -386,14 +708,6 @@ impl TabletClient {
         deployment: &ShardDeployment,
         requests: Vec<ShardRequest>,
     ) -> Result<Vec<DataResponse>> {
-        let Some(node) = deployment.node_id() else {
-            return Err(TabletClientError::TabletNotDeployed { id: deployment.tablet_id() });
-        };
-        let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
-            return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
-        };
-        let mut client =
-            TabletServiceClient::connect(addr.to_string()).await.map_err(|e| Status::unavailable(e.to_string()))?;
         let n = requests.len();
         let batch = BatchRequest {
             tablet_id: deployment.tablet.id,
@@ -401,7 +715,7 @@ impl TabletClient {
             temporal: Temporal::default(),
             requests,
         };
-        let response = client.batch(batch).await?.into_inner();
+        let response = self.batch_request(deployment, batch).await?;
         if response.responses.len() != n {
             return Err(TabletClientError::unexpected(format!("unexpected responses: {:?}", response)));
         }
@@ -429,152 +743,217 @@ impl TabletClient {
         self.request_batch(&deployment, requests).await
     }
 
+    async fn get_internally(
+        &self,
+        deployment: &ShardDeployment,
+        temporal: Temporal,
+        key: Vec<u8>,
+        sequence: u32,
+    ) -> Result<(Temporal, GetResponse)> {
+        let mut response = self
+            .batch_request(deployment, BatchRequest {
+                tablet_id: deployment.tablet_id().into(),
+                uncertainty: None,
+                temporal,
+                requests: vec![ShardRequest {
+                    shard_id: deployment.shard_id().into(),
+                    request: DataRequest::Get(GetRequest { key, sequence }),
+                }],
+            })
+            .await?;
+        let get_response = response
+            .responses
+            .remove(0)
+            .response
+            .into_get()
+            .map_err(|r| TabletClientError::unexpected(format!("expect get response, got {r:?}")))?;
+        Ok((response.temporal, get_response))
+    }
+
     async fn raw_get(
         &self,
         deployment: &ShardDeployment,
         key: impl Into<Vec<u8>>,
     ) -> Result<Option<(Timestamp, Value)>> {
-        let get = GetRequest { key: key.into(), sequence: 0 };
-        let response = self.request(deployment, DataRequest::Get(get)).await?;
-        let response = response.into_get().map_err(|r| anyhow!("expect get response, get {:?}", r))?;
+        let (_, response) = self.get_internally(deployment, Temporal::default(), key.into(), 0).await?;
         Ok(response.value.map(|v| (v.timestamp, v.value)))
     }
 
-    pub async fn get(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
-        let key = key.into().into_owned();
-        let deployment = self.locate(&key).await?;
-        let get = GetRequest { key, sequence: 0 };
-        let response = self.request(&deployment, DataRequest::Get(get)).await?;
-        let response = response.into_get().map_err(|r| anyhow!("expect get response, get {:?}", r))?;
-        Ok(response.value.map(|v| (v.timestamp, v.value)))
+    pub async fn heartbeat_txn(&self, txn: Transaction) -> Result<Transaction> {
+        let (shard, mut service) = self.service(&txn.meta.key).await?;
+        let response = service
+            .batch(BatchRequest {
+                tablet_id: shard.tablet_id().into(),
+                temporal: Temporal::Transaction(txn),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        Ok(response.temporal.into_transaction())
     }
 
-    async fn put_internally(
+    pub async fn get_directly(
         &self,
-        key: Cow<'_, [u8]>,
-        value: Option<Value>,
-        expect_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
-        let key = key.into_owned();
-        let deployment = self.locate(&key).await?;
-        let put = PutRequest { key, value, sequence: 0, expect_ts };
-        let response = self.request(&deployment, DataRequest::Put(put)).await?;
-        let response = response.into_put().map_err(|r| anyhow!("expect put response, get {:?}", r))?;
-        Ok(response.write_ts)
-    }
-
-    pub async fn delete(&self, key: impl Into<Cow<'_, [u8]>>, expect_ts: Option<Timestamp>) -> Result<()> {
-        self.put_internally(key.into(), None, expect_ts).await?;
-        Ok(())
-    }
-
-    pub async fn put(
-        &self,
+        temporal: Temporal,
         key: impl Into<Cow<'_, [u8]>>,
-        value: Value,
-        expect_ts: Option<Timestamp>,
-    ) -> Result<Timestamp> {
-        self.put_internally(key.into(), Some(value), expect_ts).await
+        sequence: u32,
+    ) -> Result<(Temporal, Option<GetResponse>)> {
+        let key = key.into().into_owned();
+        let shard = self.locate(&key).await?;
+        self.get_internally(&shard, temporal, key, sequence)
+            .await
+            .map(|(temporal, response)| (temporal, Some(response)))
     }
 
-    pub async fn increment(&self, key: impl Into<Cow<'_, [u8]>>, increment: i64) -> Result<i64> {
-        let key = key.into();
-        let deployment = self.locate(key.as_ref()).await?;
-        let increment = IncrementRequest { key: key.to_vec(), increment, sequence: 0 };
-        let response = self.request(&deployment, DataRequest::Increment(increment)).await?;
-        let response = response.into_increment().map_err(|r| anyhow!("expect increment response, get {:?}", r))?;
-        Ok(response.value)
-    }
-
-    pub async fn find(&self, key: &[u8]) -> Result<Option<(Timestamp, Vec<u8>, Value)>> {
-        let user_key = keys::user_key(key);
-        let deployment = self.locate(&user_key).await?;
-        let find = FindRequest { key: user_key, sequence: 0 };
-        let response = self.request(&deployment, DataRequest::Find(find)).await?;
-        let response = response.into_find().map_err(|r| anyhow!("expect find response, get {:?}", r))?;
-        match response.value {
-            None => Ok(None),
-            Some(value) => {
-                let mut key = response.key;
-                key.drain(0..keys::USER_KEY_PREFIX.len());
-                Ok(Some((value.timestamp, key, value.value)))
-            },
+    async fn find(&self, key: Vec<u8>) -> Result<Option<(Timestamp, Vec<u8>, Value)>> {
+        let shard = self.locate(&key).await?;
+        let batch = BatchRequest {
+            tablet_id: shard.tablet_id().into(),
+            uncertainty: None,
+            temporal: Temporal::default(),
+            requests: vec![ShardRequest {
+                shard_id: shard.shard_id().into(),
+                request: DataRequest::Find(FindRequest { key, sequence: 0 }),
+            }],
+        };
+        let mut response = self.batch_request(&shard, batch).await?;
+        if response.responses.is_empty() {
+            return Err(TabletClientError::unexpected("find get no response"));
         }
+        let find_response = response
+            .responses
+            .remove(0)
+            .response
+            .into_find()
+            .map_err(|r| TabletClientError::unexpected(format!("expect find response, got {r:?}")))?;
+        Ok(find_response.value.map(|v| (v.timestamp, find_response.key, v.value)))
     }
 
-    pub async fn transactional_get(
+    pub async fn put_directly(
         &self,
-        txn: Transaction,
-        key: &[u8],
-        sequence: u32,
-    ) -> Result<(Transaction, Option<TimestampedValue>)> {
-        let (shard, mut service) = self.service(key).await?;
-        let mut response = service
-            .batch(BatchRequest {
-                tablet_id: shard.tablet_id().into(),
-                temporal: Temporal::Transaction(txn),
-                requests: vec![ShardRequest {
-                    shard_id: shard.shard_id().into(),
-                    request: DataRequest::Get(GetRequest { key: key.to_owned(), sequence }),
-                }],
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
-        let txn = std::mem::take(&mut response.temporal).into_transaction();
-        let get = response.into_get().map_err(|r| anyhow!("expect get response, get {r:?}"))?;
-        Ok((txn, get.value))
-    }
-
-    pub async fn transactional_put(
-        &self,
-        txn: Transaction,
-        key: &[u8],
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
         value: Option<Value>,
-        sequence: u32,
         expect_ts: Option<Timestamp>,
-    ) -> Result<Transaction> {
-        let (shard, mut service) = self.service(key).await?;
-        let mut response = service
-            .batch(BatchRequest {
-                tablet_id: shard.tablet_id().into(),
-                temporal: Temporal::Transaction(txn),
-                requests: vec![ShardRequest {
-                    shard_id: shard.shard_id().into(),
-                    request: DataRequest::Put(PutRequest { key: key.to_owned(), value, sequence, expect_ts }),
-                }],
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
-        let txn = std::mem::take(&mut response.temporal).into_transaction();
-        response.into_put().map_err(|r| anyhow!("expect put response, get {r:?}"))?;
-        Ok(txn)
+        sequence: u32,
+    ) -> Result<(Temporal, Option<Timestamp>)> {
+        let key = key.into().into_owned();
+        let shard = self.locate(&key).await?;
+        let batch = BatchRequest {
+            tablet_id: shard.tablet_id().into(),
+            uncertainty: None,
+            temporal,
+            requests: vec![ShardRequest {
+                shard_id: shard.shard_id().into(),
+                request: DataRequest::Put(PutRequest { key, value, expect_ts, sequence }),
+            }],
+        };
+        let mut response = self.batch_request(&shard, batch).await?;
+        if response.responses.is_empty() {
+            return Ok((response.temporal, None));
+        }
+        let put_response = response
+            .responses
+            .remove(0)
+            .response
+            .into_put()
+            .map_err(|r| TabletClientError::unexpected(format!("expect put response, got {r:?}")))?;
+        Ok((response.temporal, Some(put_response.write_ts)))
     }
 
-    pub async fn transactional_increment(
+    pub async fn refresh_read(
         &self,
-        txn: Transaction,
-        key: &[u8],
+        temporal: Temporal,
+        span: KeySpan,
+        from: Timestamp,
+    ) -> Result<(Temporal, Option<Vec<u8>>)> {
+        let shard = self.locate(&span.key).await?;
+        let batch = BatchRequest {
+            tablet_id: shard.tablet_id().into(),
+            uncertainty: None,
+            temporal,
+            requests: vec![ShardRequest {
+                shard_id: shard.shard_id().into(),
+                request: DataRequest::RefreshRead(RefreshReadRequest { span, from }),
+            }],
+        };
+        let mut response = self.batch_request(&shard, batch).await?;
+        if response.responses.is_empty() {
+            return Ok((response.temporal, None));
+        }
+        let refresh_read_response = response
+            .responses
+            .remove(0)
+            .response
+            .into_refresh_read()
+            .map_err(|r| TabletClientError::unexpected(format!("expect refresh read response, got {r:?}")))?;
+        Ok((response.temporal, Some(refresh_read_response.resume_key)))
+    }
+
+    pub async fn increment_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
         increment: i64,
         sequence: u32,
-    ) -> Result<(Transaction, i64)> {
-        let (shard, mut service) = self.service(key).await?;
-        let mut response = service
-            .batch(BatchRequest {
-                tablet_id: shard.tablet_id().into(),
-                temporal: Temporal::Transaction(txn),
-                requests: vec![ShardRequest {
-                    shard_id: shard.shard_id().into(),
-                    request: DataRequest::Increment(IncrementRequest { key: key.to_owned(), increment, sequence }),
-                }],
-                ..Default::default()
-            })
-            .await?
-            .into_inner();
-        let txn = std::mem::take(&mut response.temporal).into_transaction();
-        let increment = response.into_increment().map_err(|r| anyhow!("expect increment response, get {r:?}"))?;
-        Ok((txn, increment.value))
+    ) -> Result<(Temporal, Option<i64>)> {
+        let key = key.into().into_owned();
+        let shard = self.locate(&key).await?;
+        let batch = BatchRequest {
+            tablet_id: shard.tablet_id().into(),
+            uncertainty: None,
+            temporal,
+            requests: vec![ShardRequest {
+                shard_id: shard.shard_id().into(),
+                request: DataRequest::Increment(IncrementRequest { key, increment, sequence }),
+            }],
+        };
+        let mut response = self.batch_request(&shard, batch).await?;
+        if response.responses.is_empty() {
+            return Ok((response.temporal, None));
+        }
+        let increment_response = response
+            .responses
+            .remove(0)
+            .response
+            .into_increment()
+            .map_err(|r| TabletClientError::unexpected(format!("expect put response, got {r:?}")))?;
+        Ok((response.temporal, Some(increment_response.value)))
+    }
+
+    pub async fn scan_directly(
+        &self,
+        temporal: Temporal,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Temporal, Option<(Vec<u8>, Vec<TimestampedKeyValue>)>)> {
+        let start = start.into().into_owned();
+        let shard = self.locate(&start).await?;
+        let batch = BatchRequest {
+            tablet_id: shard.tablet_id().into(),
+            uncertainty: None,
+            temporal,
+            requests: vec![ShardRequest {
+                shard_id: shard.shard_id().into(),
+                request: DataRequest::Scan(ScanRequest {
+                    range: KeyRange { start, end: end.into().into_owned() },
+                    limit,
+                    sequence: 0,
+                }),
+            }],
+        };
+        let mut response = self.batch_request(&shard, batch).await?;
+        if response.responses.is_empty() {
+            return Ok((response.temporal, None));
+        }
+        let scan_response = response
+            .responses
+            .remove(0)
+            .response
+            .into_scan()
+            .map_err(|r| TabletClientError::unexpected(format!("expect scan response, got {r:?}")))?;
+        Ok((response.temporal, Some(scan_response.into_parts())))
     }
 
     pub async fn open_participate_txn(
@@ -609,6 +988,200 @@ impl TabletClient {
         metadata.insert("seamdb-txn-coordinator", coordinator.to_string().parse().unwrap());
         let responses = service.participate_txn(request).await?.into_inner();
         Ok((sender, responses))
+    }
+}
+
+impl TabletClientTrait for ScopedTabletClient {
+    fn now(&self) -> Timestamp {
+        self.client.now()
+    }
+
+    fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    fn root(&self) -> &RootTabletClient {
+        &self.client
+    }
+}
+
+impl ScopedTabletClient {
+    pub fn scope(mut self, prefix: &[u8]) -> Self {
+        self.prefix.extend_from_slice(prefix);
+        self
+    }
+}
+
+impl From<ScopedTabletClient> for TabletClient {
+    fn from(client: ScopedTabletClient) -> Self {
+        Self { inner: InnerTabletClient::Scoped(client) }
+    }
+}
+
+impl From<Arc<RootTabletClient>> for ScopedTabletClient {
+    fn from(client: Arc<RootTabletClient>) -> Self {
+        ScopedTabletClient { prefix: Default::default(), client }
+    }
+}
+
+#[derive(Clone)]
+pub struct TabletClient {
+    inner: InnerTabletClient,
+}
+
+impl TabletClient {
+    pub fn new(cluster: ClusterEnv) -> Self {
+        let client = RootTabletClient::new(cluster);
+        Self { inner: InnerTabletClient::Root(client.into()) }
+    }
+
+    fn scoped_client(self) -> ScopedTabletClient {
+        match self.inner {
+            InnerTabletClient::Root(client) => ScopedTabletClient { prefix: vec![], client },
+            InnerTabletClient::Scoped(client) => client,
+        }
+    }
+
+    pub fn scope(self, prefix: &[u8]) -> Self {
+        self.scoped_client().scope(prefix).into()
+    }
+
+    pub fn now(&self) -> Timestamp {
+        self.inner.now()
+    }
+
+    pub fn prefix(&self) -> &[u8] {
+        self.inner.prefix()
+    }
+
+    pub fn prefix_key<'a>(&self, key: impl Into<Cow<'a, [u8]>>) -> Vec<u8> {
+        self.inner.prefix_key(key)
+    }
+
+    pub fn unprefix_key(&self, key: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+        self.inner.unprefix_key(key)
+    }
+
+    pub fn new_transaction(&self, key: Vec<u8>) -> Transaction {
+        self.inner.new_transaction(key)
+    }
+
+    pub async fn heartbeat_txn(&self, txn: Transaction) -> Result<Transaction> {
+        self.inner.heartbeat_txn(txn).await
+    }
+
+    pub async fn get_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
+        sequence: u32,
+    ) -> Result<(Temporal, Option<GetResponse>)> {
+        self.inner.get_directly(temporal, key, sequence).await
+    }
+
+    pub async fn put_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+        sequence: u32,
+    ) -> Result<(Temporal, Option<Timestamp>)> {
+        self.inner.put_directly(temporal, key, value, expect_ts, sequence).await
+    }
+
+    pub async fn refresh_read(
+        &self,
+        temporal: Temporal,
+        span: KeySpan,
+        from: Timestamp,
+    ) -> Result<(Temporal, Option<Vec<u8>>)> {
+        self.inner.refresh_read(temporal, span, from).await
+    }
+
+    pub async fn increment_directly(
+        &self,
+        temporal: Temporal,
+        key: impl Into<Cow<'_, [u8]>>,
+        increment: i64,
+        sequence: u32,
+    ) -> Result<(Temporal, Option<i64>)> {
+        self.inner.increment_directly(temporal, key, increment, sequence).await
+    }
+
+    pub async fn scan_directly(
+        &self,
+        temporal: Temporal,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Temporal, Option<(Vec<u8>, Vec<TimestampedKeyValue>)>)> {
+        self.inner.scan_directly(temporal, start, end, limit).await
+    }
+
+    pub async fn get(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
+        self.inner.get(key).await
+    }
+
+    pub async fn put(
+        &self,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
+        self.inner.put(key, value, expect_ts).await
+    }
+
+    pub async fn increment(&self, key: impl Into<Cow<'_, [u8]>>, increment: i64) -> Result<i64> {
+        self.inner.increment(key, increment).await
+    }
+
+    pub async fn scan(
+        &self,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        self.inner.scan(start, end, limit).await
+    }
+
+    pub async fn locate(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<ShardDeployment> {
+        self.inner.locate(key).await
+    }
+
+    pub async fn participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        coordinator: bool,
+    ) -> Result<(mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>)> {
+        self.inner.participate_txn(request, coordinator).await
+    }
+
+    pub async fn open_participate_txn(
+        &self,
+        request: ParticipateTxnRequest,
+        coordinator: bool,
+    ) -> (mpsc::Sender<ParticipateTxnRequest>, tonic::Streaming<ParticipateTxnResponse>) {
+        self.inner.open_participate_txn(request, coordinator).await
+    }
+
+    pub async fn service(
+        &self,
+        key: &[u8],
+    ) -> Result<(ShardDeployment, TabletServiceClient<tonic::transport::Channel>)> {
+        self.inner.service(key).await
+    }
+
+    pub async fn batch(&self, requests: Vec<DataRequest>) -> Result<Vec<DataResponse>> {
+        self.inner.batch(requests).await
+    }
+
+    pub async fn find(&self, key: &[u8]) -> Result<Option<(Timestamp, Vec<u8>, Value)>> {
+        self.inner.find(key).await
+    }
+
+    pub async fn get_tablet_descriptor(&self, id: TabletId) -> Result<(Timestamp, TabletDescriptor)> {
+        self.inner.get_tablet_descriptor(id).await
     }
 }
 
@@ -675,29 +1248,26 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(20)).await;
 
-        let client = TabletClient::new(cluster_env);
+        let client = TabletClient::new(cluster_env).scope(keys::USER_KEY_PREFIX);
 
-        let count = client.increment(keys::user_key(b"count"), 5).await.unwrap();
+        let count = client.increment(b"count", 5).await.unwrap();
         assert_eq!(count, 5);
-        let count = client.increment(keys::user_key(b"count"), 5).await.unwrap();
+        let count = client.increment(b"count", 5).await.unwrap();
         assert_eq!(count, 10);
 
-        let put_ts = client.put(keys::user_key(b"k1"), Value::Bytes(b"v1_1".to_vec()), None).await.unwrap();
-        let (get_ts, value) = client.get(keys::user_key(b"k1")).await.unwrap().unwrap();
+        let put_ts = client.put(b"k1", Some(Value::Bytes(b"v1_1".to_vec())), None).await.unwrap();
+        let (get_ts, value) = client.get(b"k1").await.unwrap().unwrap();
         assert_that!(get_ts).is_equal_to(put_ts);
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_1".to_vec());
 
-        let put_ts = client.put(keys::user_key(b"k1"), Value::Bytes(b"v1_2".to_vec()), Some(put_ts)).await.unwrap();
-        let (get_ts, value) = client.get(keys::user_key(b"k1")).await.unwrap().unwrap();
+        let put_ts = client.put(b"k1", Some(Value::Bytes(b"v1_2".to_vec())), Some(put_ts)).await.unwrap();
+        let (get_ts, value) = client.get(b"k1").await.unwrap().unwrap();
         assert_that!(get_ts).is_equal_to(put_ts);
         assert_that!(value.into_bytes().unwrap()).is_equal_to(b"v1_2".to_vec());
 
-        client.delete(keys::user_key(b"k1"), Some(put_ts)).await.unwrap();
-        assert_that!(client.get(keys::user_key(b"k1")).await.unwrap().is_none()).is_true();
-        let put_ts = client
-            .put(keys::user_key(b"k1"), Value::Bytes(b"v1_3".to_vec()), Some(Timestamp::default()))
-            .await
-            .unwrap();
+        client.put(b"k1", None, Some(put_ts)).await.unwrap();
+        assert_that!(client.get(b"k1").await.unwrap().is_none()).is_true();
+        let put_ts = client.put(b"k1", Some(Value::Bytes(b"v1_3".to_vec())), Some(Timestamp::default())).await.unwrap();
 
         let (ts, key, value) = client.find(b"k").await.unwrap().unwrap();
         assert_that!(ts).is_equal_to(put_ts);
@@ -733,15 +1303,15 @@ mod tests {
         let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
         let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
         let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
-        let client = TabletClient::new(cluster_env);
+        let client = TabletClient::new(cluster_env).scope(keys::USER_KEY_PREFIX);
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let requests = vec![
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
-            DataRequest::Get(GetRequest { key: keys::user_key(b"count"), sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".into(), increment: 5, sequence: 0 }),
+            DataRequest::Get(GetRequest { key: b"count".into(), sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".into(), increment: 5, sequence: 0 }),
             DataRequest::Put(PutRequest {
-                key: keys::user_key(b"k1"),
+                key: b"k1".into(),
                 value: Some(Value::String("v1_1".to_owned())),
                 expect_ts: None,
                 sequence: 0,
@@ -755,9 +1325,9 @@ mod tests {
         assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(5);
 
         let requests = vec![
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".into(), increment: 5, sequence: 0 }),
             DataRequest::Put(PutRequest {
-                key: keys::user_key(b"k1"),
+                key: b"k1".into(),
                 value: Some(Value::String("v1_1".to_owned())),
                 expect_ts: Some(Timestamp::ZERO),
                 sequence: 0,
@@ -766,9 +1336,9 @@ mod tests {
         client.batch(requests).await.unwrap_err();
 
         let requests = vec![
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count"), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count".into(), increment: 5, sequence: 0 }),
             DataRequest::Put(PutRequest {
-                key: keys::user_key(b"k1"),
+                key: b"k1".into(),
                 value: Some(Value::String("v1_2".to_owned())),
                 expect_ts: Some(put_ts),
                 sequence: 0,
@@ -779,15 +1349,15 @@ mod tests {
         assert_that!(responses.pop().unwrap().into_increment().unwrap().value).is_equal_to(15);
 
         let requests = vec![
-            DataRequest::Get(GetRequest { key: keys::user_key(b"k1"), sequence: 0 }),
-            DataRequest::Find(FindRequest { key: keys::user_key(b"k1"), sequence: 0 }),
+            DataRequest::Get(GetRequest { key: b"k1".into(), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"k1".into(), sequence: 0 }),
         ];
         let mut responses = client.batch(requests).await.unwrap();
 
         let expect_value = TimestampedValue { value: Value::String("v1_2".to_owned()), timestamp: put_ts };
 
         let find = responses.pop().unwrap().into_find().unwrap();
-        assert_that!(find.key).is_equal_to(keys::user_key(b"k1"));
+        assert_that!(find.key).is_equal_to(b"k1".to_vec());
         assert_that!(find.value.unwrap()).is_equal_to(&expect_value);
 
         let get = responses.pop().unwrap().into_get().unwrap();
@@ -815,15 +1385,15 @@ mod tests {
         let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
         let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
         let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
-        let client = TabletClient::new(cluster_env);
+        let client = TabletClient::new(cluster_env).scope(keys::USER_KEY_PREFIX);
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let requests = vec![
-            DataRequest::Find(FindRequest { key: keys::user_key(b"count"), sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count0"), increment: 5, sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count1"), increment: 10, sequence: 0 }),
-            DataRequest::Find(FindRequest { key: keys::user_key(b"count"), sequence: 0 }),
-            DataRequest::Find(FindRequest { key: keys::user_key(b"count01"), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"count".into(), sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count0".into(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count1".into(), increment: 10, sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"count".into(), sequence: 0 }),
+            DataRequest::Find(FindRequest { key: b"count01".into(), sequence: 0 }),
         ];
         let mut responses = client.batch(requests).await.unwrap();
         let find = responses.remove(0).into_find().unwrap();
@@ -834,12 +1404,12 @@ mod tests {
         responses.remove(0);
 
         let find0 = responses.remove(0).into_find().unwrap();
-        assert_that!(find0.key).is_equal_to(keys::user_key(b"count0"));
+        assert_that!(find0.key).is_equal_to(b"count0".to_vec());
         assert_that!(find0.value).is_some();
         assert_that!(find0.value.unwrap().value).is_equal_to(Value::Int(5));
 
         let find1 = responses.remove(0).into_find().unwrap();
-        assert_that!(find1.key).is_equal_to(keys::user_key(b"count1"));
+        assert_that!(find1.key).is_equal_to(b"count1".to_vec());
         assert_that!(find1.value.unwrap().value).is_equal_to(Value::Int(10));
     }
 
@@ -864,20 +1434,20 @@ mod tests {
         let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
         let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
         let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
-        let client = TabletClient::new(cluster_env);
+        let client = TabletClient::new(cluster_env).scope(keys::USER_KEY_PREFIX);
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let requests = vec![
             DataRequest::Scan(ScanRequest {
-                range: KeyRange { start: keys::user_key(b"count"), end: keys::user_key(b"counu") },
+                range: KeyRange { start: b"count".into(), end: b"counu".into() },
                 limit: 0,
                 sequence: 0,
             }),
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count0"), increment: 5, sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count1"), increment: 10, sequence: 0 }),
-            DataRequest::Increment(IncrementRequest { key: keys::user_key(b"count2"), increment: 15, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count0".into(), increment: 5, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count1".into(), increment: 10, sequence: 0 }),
+            DataRequest::Increment(IncrementRequest { key: b"count2".into(), increment: 15, sequence: 0 }),
             DataRequest::Scan(ScanRequest {
-                range: KeyRange { start: keys::user_key(b"count"), end: keys::user_key(b"counu") },
+                range: KeyRange { start: b"count".into(), end: b"counu".into() },
                 limit: 2,
                 sequence: 0,
             }),
@@ -894,9 +1464,9 @@ mod tests {
         let scan = responses.remove(0).into_scan().unwrap();
         debug!("resume key: {:?}", scan.resume_key);
         assert_that!(scan.rows).has_length(2);
-        assert_that!(scan.rows[0].key).is_equal_to(keys::user_key(b"count0"));
+        assert_that!(scan.rows[0].key).is_equal_to(b"count0".to_vec());
         assert_that!(scan.rows[0].value).is_equal_to(Value::Int(5));
-        assert_that!(scan.rows[1].key).is_equal_to(keys::user_key(b"count1"));
+        assert_that!(scan.rows[1].key).is_equal_to(b"count1".to_vec());
         assert_that!(scan.rows[1].value).is_equal_to(Value::Int(10));
     }
 
@@ -1702,7 +2272,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_that!(status.message()).contains("fail to refresh key");
+        assert_that!(status.message()).contains("conflict with write to key");
     }
 
     #[test_log::test(tokio::test)]

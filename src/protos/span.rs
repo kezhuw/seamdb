@@ -31,6 +31,16 @@ impl KeyRange {
             Equal
         }
     }
+
+    pub fn resume_from(&self, mut end: Vec<u8>) -> Vec<u8> {
+        match self.end < end {
+            true => {
+                end.clone_from(&self.end);
+                end
+            },
+            false => Vec::default(),
+        }
+    }
 }
 
 impl From<KeyRange> for KeySpan {
