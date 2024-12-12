@@ -326,7 +326,7 @@ pub mod tests {
 
     #[async_trait]
     impl ByteLogSubscriber for TestLogSubscriber {
-        async fn read(&mut self) -> Result<(LogPosition, &[u8])> {
+        async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])> {
             let mut receiver = self.log.len.subscribe();
             receiver.wait_for(|l| *l > self.offset).await.unwrap();
             let position = self.offset;
