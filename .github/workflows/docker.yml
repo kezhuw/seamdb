@@ -1,0 +1,53 @@
+# Copyright 2023 The SeamDB Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: docker
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      dockerhub_org: ${{ vars.DOCKERHUB_ORG || vars.DOCKERHUB_USERNAME || 'anonymous' }}
+    steps:
+      - name: Login to Docker Hub
+        if: github.event_name == 'push' && vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Generate tag for version
+        id: generate-tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: echo "VERSION_TAG=,${{ env.dockerhub_org }}/seamdb:$GITHUB_REF_NAME" >> $GITHUB_OUTPUT
+      - name: More platforms on push
+        id: more-platforms
+        if: github.event_name == 'push'
+        run: echo "MORE_PLATFORMS=,linux/arm64,darwin/amd64,darwin/arm64" >> $GITHUB_OUTPUT
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64${{ steps.more-platforms.outputs.MORE_PLATFORMS }}
+          push: ${{ github.event_name == 'push' && vars.DOCKERHUB_USERNAME != '' }}
+          tags: ${{ env.dockerhub_org }}/seamdb:latest${{ steps.generate-tag.outputs.VERSION_TAG }}
