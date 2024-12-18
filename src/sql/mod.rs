@@ -13,13 +13,13 @@
 // limitations under the License.
 
 mod client;
+mod context;
 mod descriptor;
 mod error;
 mod plan;
-pub mod postgres;
+pub mod postgresql;
 mod shared;
 mod traits;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::plan_datafusion_err;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream};
 use datafusion::logical_expr::logical_plan::dml::InsertOp;
 use datafusion::logical_expr::{CreateCatalog, DdlStatement, DmlStatement, DropTable, LogicalPlan, WriteOp};
 use datafusion::physical_plan::ExecutionPlan;
@@ -35,10 +35,11 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::sql::{ResolvedTableReference, TableReference};
 
 use self::client::SqlClient;
+use self::context::SqlContext;
 use self::descriptor::TableDescriptorFetcher;
 pub use self::error::SqlError;
 use self::plan::{CreateDatabaseExec, DropTableExec};
-use self::postgres::PostgresPlanner;
+use self::postgresql::PostgresPlanner;
 use self::traits::*;
 use crate::kv::{KvClient, KvSemantics};
 
@@ -72,12 +73,17 @@ impl PlannerContext for PostgreSqlExecutor {
 }
 
 impl PostgreSqlExecutor {
-    pub fn new(client: Arc<dyn KvClient>, database: String) -> Self {
+    pub fn new(context: Arc<SqlContext>) -> Self {
         let mut config = SessionConfig::default();
         config.options_mut().catalog.create_default_catalog_and_schema = false;
-        config.options_mut().catalog.default_catalog = database;
+        config.options_mut().catalog.default_catalog = context.current_catalog().unwrap().to_string();
         config.options_mut().catalog.information_schema = true;
-        let state = SessionStateBuilder::new().with_default_features().with_config(config).build();
+        let client = Arc::new(context.client().clone());
+        let mut state = SessionStateBuilder::new().with_default_features().with_config(config).build();
+        let scalar_functions = postgresql::create_all_scalar_functions(&context);
+        scalar_functions.into_iter().for_each(|f| {
+            state.register_udf(f).unwrap();
+        });
         let planner = DefaultPhysicalPlanner::with_extension_planners(plan::get_extension_planners());
         Self { client, state, planner }
     }
@@ -149,7 +155,6 @@ impl PostgreSqlExecutor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use datafusion::common::arrow::array::{Array, Int32Array, Int64Array, StringArray, UInt64Array};
@@ -163,6 +168,7 @@ mod tests {
     use crate::fs::MemoryFileSystemFactory;
     use crate::log::{LogManager, MemoryLogFactory};
     use crate::protos::TableDescriptor;
+    use crate::sql::context::SqlContext;
     use crate::tablet::{TabletClient, TabletNode};
 
     #[test_log::test(tokio::test)]
@@ -188,7 +194,9 @@ mod tests {
         let client = TabletClient::new(cluster_env).scope(TableDescriptor::POSTGRESQL_DIALECT_PREFIX);
         tokio::time::sleep(Duration::from_secs(20)).await;
 
-        let executor = PostgreSqlExecutor::new(Arc::new(client), "test1".to_string());
+        let executor = PostgreSqlExecutor::new(
+            SqlContext::new_unconnected(client, Some("test1".to_string()), "user1".to_string()).into(),
+        );
         let mut stream = executor.execute_sql("CREATE DATABASE test1").await.unwrap();
         while let Some(_record) = stream.next().await {}
 

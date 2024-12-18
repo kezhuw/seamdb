@@ -23,7 +23,7 @@ use seamdb::endpoint::{Endpoint, ServiceUri};
 use seamdb::fs::MemoryFileSystemFactory;
 use seamdb::log::{KafkaLogFactory, LogManager, MemoryLogFactory};
 use seamdb::protos::TableDescriptor;
-use seamdb::sql::postgres::PostgresqlHandlerFactory;
+use seamdb::sql::postgresql::PostgresqlHandlerFactory;
 use seamdb::tablet::{TabletClient, TabletNode};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, instrument};

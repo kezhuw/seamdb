@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod functions;
+
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -51,7 +54,7 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
-use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type, METADATA_DATABASE};
+use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type, METADATA_DATABASE, METADATA_USER};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::PgWireBackendMessage;
@@ -64,8 +67,17 @@ use super::plan::*;
 use super::shared::*;
 use super::traits::*;
 use crate::protos::{CharacterTypeDeclaration, ColumnTypeDeclaration, ColumnTypeKind};
+use crate::sql::context::{SqlClientInfo, SqlContext};
 use crate::sql::PostgreSqlExecutor;
 use crate::tablet::TabletClient;
+
+pub fn create_all_scalar_functions(context: &Arc<SqlContext>) -> Vec<Arc<ScalarUDF>> {
+    vec![
+        Arc::new(ScalarUDF::new_from_impl(self::functions::CurrentCatalog::new(context.clone()))),
+        Arc::new(ScalarUDF::new_from_impl(self::functions::CurrentUser::new(context.clone()))),
+        Arc::new(ScalarUDF::new_from_impl(self::functions::InetClientPort::new(context.clone()))),
+    ]
+}
 
 pub struct PostgresPlanner<'a> {
     context: &'a (dyn PlannerContext + Sync),
@@ -469,6 +481,23 @@ fn convert_data_type(data_type: &datatypes::DataType) -> Type {
     }
 }
 
+impl<T> SqlClientInfo for T
+where
+    T: ClientInfo,
+{
+    fn database(&self) -> Option<&str> {
+        self.metadata().get(METADATA_DATABASE).map(|s| s.as_str())
+    }
+
+    fn user(&self) -> &str {
+        self.metadata().get(METADATA_USER).unwrap().as_str()
+    }
+
+    fn socket_addr(&self) -> SocketAddr {
+        self.socket_addr()
+    }
+}
+
 #[async_trait::async_trait]
 impl SimpleQueryHandler for PostgresqlQueryProcessor {
     async fn do_query<'a, C>(&self, client: &mut C, query: &'a str) -> PgWireResult<Vec<Response<'a>>>
@@ -477,8 +506,8 @@ impl SimpleQueryHandler for PostgresqlQueryProcessor {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>, {
         debug!("SQL: {query}");
-        let database = client.metadata().get(METADATA_DATABASE).cloned().unwrap_or_else(|| "default".to_string());
-        let executor = PostgreSqlExecutor::new(Arc::new(self.client.clone()), database);
+        let context = SqlContext::new(self.client.clone(), client);
+        let executor = PostgreSqlExecutor::new(context.into());
         let mut stream = executor.execute_sql(query).await?;
         let schema = stream.schema();
         if schema.fields.is_empty() {
