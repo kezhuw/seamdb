@@ -16,8 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::catalog_common::ResolvedTableReference;
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 
 use super::client::SqlClient;
 use super::error::SqlError;

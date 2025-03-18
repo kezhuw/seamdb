@@ -24,7 +24,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::catalog_common::ResolvedTableReference;
 use datafusion::common::plan_datafusion_err;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
@@ -33,7 +32,7 @@ use datafusion::logical_expr::logical_plan::dml::InsertOp;
 use datafusion::logical_expr::{CreateCatalog, DdlStatement, DmlStatement, DropTable, LogicalPlan, WriteOp};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 
 use self::client::SqlClient;
 use self::descriptor::TableDescriptorFetcher;
@@ -58,7 +57,7 @@ impl PlannerContext for PostgreSqlExecutor {
     async fn fetch_table_references(
         &self,
         table_references: Vec<ResolvedTableReference>,
-    ) -> Result<HashMap<TableReference, Arc<dyn TableProvider>>, SqlError> {
+    ) -> Result<HashMap<ResolvedTableReference, Arc<dyn TableProvider>>, SqlError> {
         let mut tables = HashMap::with_capacity(table_references.len());
         let client = SqlClient::new(self.client.clone(), KvSemantics::Snapshot);
         let mut fetcher = TableDescriptorFetcher::new(&client);
@@ -66,7 +65,7 @@ impl PlannerContext for PostgreSqlExecutor {
             let Some(table) = fetcher.get_table(&table_ref).await? else {
                 continue;
             };
-            tables.insert(TableReference::from(table_ref), table);
+            tables.insert(table_ref, table);
         }
         Ok(tables)
     }
@@ -92,7 +91,7 @@ impl PostgreSqlExecutor {
     async fn create_physical_plan(
         &self,
         plan: LogicalPlan,
-        tables: &HashMap<TableReference, Arc<dyn TableProvider>>,
+        tables: &HashMap<ResolvedTableReference, Arc<dyn TableProvider>>,
     ) -> Result<Arc<dyn ExecutionPlan>, SqlError> {
         let execution_plan: Arc<dyn ExecutionPlan> = match plan {
             LogicalPlan::Ddl(DdlStatement::CreateExternalTable(_)) => {
@@ -120,7 +119,7 @@ impl PostgreSqlExecutor {
             },
             LogicalPlan::Ddl(DdlStatement::DropFunction(_)) => return Err(SqlError::unimplemented("drop function")),
             LogicalPlan::Dml(DmlStatement { table_name, op: WriteOp::Insert(InsertOp::Append), input, .. }) => {
-                let table_name = TableReference::from(self.resolve_table_reference(table_name));
+                let table_name = self.resolve_table_reference(table_name);
                 let table = tables.get(&table_name).ok_or_else(|| plan_datafusion_err!("no table {table_name}"))?;
                 let input_exec = Box::pin(self.create_physical_plan(Arc::unwrap_or_clone(input), tables)).await?;
                 table.insert_into(&self.state, input_exec, InsertOp::Append).await?
@@ -137,7 +136,7 @@ impl PostgreSqlExecutor {
     async fn execute_plan(
         &self,
         plan: LogicalPlan,
-        tables: HashMap<TableReference, Arc<dyn TableProvider>>,
+        tables: HashMap<ResolvedTableReference, Arc<dyn TableProvider>>,
     ) -> Result<SendableRecordBatchStream, SqlError> {
         let execution_plan = self.create_physical_plan(plan, &tables).await?;
         let mut state = self.state.clone();

@@ -36,16 +36,9 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::logical_plan::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableSource, TableType};
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::project_schema;
+use datafusion::physical_plan::execution_plan::{project_schema, Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
-use datafusion::physical_plan::{
-    DisplayAs,
-    DisplayFormatType,
-    ExecutionMode,
-    ExecutionPlan,
-    Partitioning,
-    PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
 use tokio::sync::mpsc;
 
 use super::insert::InsertExec;
@@ -193,7 +186,8 @@ impl SqlTableScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self { table, schema, properties }
     }

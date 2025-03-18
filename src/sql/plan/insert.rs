@@ -34,15 +34,9 @@ use datafusion::common::arrow::record_batch::RecordBatch;
 use datafusion::common::{plan_err, DataFusionError, Result as DFResult, SchemaExt};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
-use datafusion::physical_plan::{
-    DisplayAs,
-    DisplayFormatType,
-    ExecutionMode,
-    ExecutionPlan,
-    Partitioning,
-    PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
 use futures::prelude::stream::StreamExt;
 use ignore_result::Ignore;
 use lazy_static::lazy_static;
@@ -70,7 +64,8 @@ impl InsertExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(table.schema().clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self { table, input, properties }
     }
@@ -94,7 +89,7 @@ impl ExecutionPlan for InsertExec {
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        if !self.table.schema().logically_equivalent_names_and_types(&self.input.schema()) {
+        if self.table.schema().logically_equivalent_names_and_types(&self.input.schema()).is_err() {
             return plan_err!("insert expect schema {:?}, but get {:?}", self.table.schema(), self.input.schema());
         }
         let client = context

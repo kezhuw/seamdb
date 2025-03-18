@@ -16,7 +16,6 @@ use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
-use datafusion::catalog_common::ResolvedTableReference;
 use datafusion::common::arrow::array::array::StringArray;
 use datafusion::common::arrow::datatypes::{self, Field, Schema};
 use datafusion::common::arrow::record_batch::RecordBatch;
@@ -24,16 +23,10 @@ use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
-use datafusion::physical_plan::{
-    DisplayAs,
-    DisplayFormatType,
-    ExecutionMode,
-    ExecutionPlan,
-    Partitioning,
-    PlanProperties,
-};
-use datafusion::sql::TableReference;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use ignore_result::Ignore;
 use lazy_static::lazy_static;
 use prost::Message;
@@ -113,7 +106,8 @@ impl CreateTableExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Schema::empty().into()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Final,
+            Boundedness::Bounded,
         );
         Self { table_ref, descriptor, if_not_exists, properties }
     }

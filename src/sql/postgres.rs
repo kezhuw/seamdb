@@ -44,7 +44,7 @@ use datafusion::sql::planner::{object_name_to_table_reference, ContextProvider, 
 use datafusion::sql::sqlparser::ast::{ColumnOption, DataType};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use futures::prelude::stream::StreamExt;
 use futures::{Sink, Stream};
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -79,7 +79,7 @@ impl<'a> PostgresPlanner<'a> {
     pub async fn plan(
         &self,
         sql: &str,
-    ) -> Result<(LogicalPlan, HashMap<TableReference, Arc<dyn TableProvider>>), SqlError> {
+    ) -> Result<(LogicalPlan, HashMap<ResolvedTableReference, Arc<dyn TableProvider>>), SqlError> {
         let dialect = PostgreSqlDialect {};
         let mut statements = Parser::parse_sql(&dialect, sql)?;
         let statement = match statements.len() {
@@ -93,7 +93,7 @@ impl<'a> PostgresPlanner<'a> {
     async fn plan_statement(
         &self,
         statement: Statement,
-    ) -> Result<(LogicalPlan, HashMap<TableReference, Arc<dyn TableProvider>>), SqlError> {
+    ) -> Result<(LogicalPlan, HashMap<ResolvedTableReference, Arc<dyn TableProvider>>), SqlError> {
         let resolved_table_references = self.context.collect_table_references(&statement)?;
         let tables = self.context.fetch_table_references(resolved_table_references).await?;
         let provider = PostgresContextProvider::new(self.context.state(), &tables);
@@ -124,10 +124,7 @@ impl<'a> PostgresPlanner<'a> {
                     return Err(SqlError::invalid(format!("no columns in creating table {table_ref}")));
                 }
                 let mut table_descriptor_builder = TableDescriptorBuilder::new();
-                for ColumnDef { name, data_type, collation, options } in columns {
-                    if collation.is_some() {
-                        return Err(SqlError::unsupported("CREATE TABLE table_name (column_name .. COLLATE .."));
-                    }
+                for ColumnDef { name, data_type, options } in columns {
                     let column_name = name.value;
                     let (serial, type_kind, type_declaration) = match data_type {
                         DataType::Boolean | DataType::Bool => (false, ColumnTypeKind::Boolean, None),
@@ -201,12 +198,18 @@ impl<'a> PostgresPlanner<'a> {
                             ColumnOption::DialectSpecific(_) => {},
                             ColumnOption::CharacterSet(_) => {},
                             ColumnOption::Comment(_) => {},
+                            ColumnOption::Collation(_) => {
+                                return Err(SqlError::unsupported(
+                                    "CREATE TABLE table_name (column_name .. COLLATE ..",
+                                ));
+                            },
                             ColumnOption::Generated { .. } => {
                                 return Err(SqlError::unsupported("CREATE TABLE .. (column_name .. GENERATED ..)"))
                             },
                             ColumnOption::Options(_) => {
                                 return Err(SqlError::unsupported("CREATE TABLE .. (column_name .. OPTIONS(..) ..)"))
                             },
+                            option => return Err(SqlError::unsupported(format!("option: {option}"))),
                         }
                     }
                     column_builder.set_serial(serial);
@@ -248,18 +251,18 @@ impl<'a> PostgresPlanner<'a> {
 
 struct PostgresContextProvider<'a> {
     state: &'a SessionState,
-    tables: &'a HashMap<TableReference, Arc<dyn TableProvider>>,
+    tables: &'a HashMap<ResolvedTableReference, Arc<dyn TableProvider>>,
 }
 
 impl<'a> PostgresContextProvider<'a> {
-    pub fn new(state: &'a SessionState, tables: &'a HashMap<TableReference, Arc<dyn TableProvider>>) -> Self {
+    pub fn new(state: &'a SessionState, tables: &'a HashMap<ResolvedTableReference, Arc<dyn TableProvider>>) -> Self {
         Self { state, tables }
     }
 }
 
 impl ContextProvider for PostgresContextProvider<'_> {
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>, DataFusionError> {
-        let resolved = self.state.resolve_table_reference(name).into();
+        let resolved = self.state.resolve_table_reference(name);
         let Some(table) = self.tables.get(&resolved) else {
             return Err(DataFusionError::Plan(format!("no table source for {}", resolved)));
         };

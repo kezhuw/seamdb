@@ -17,12 +17,11 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
-use datafusion::catalog_common::ResolvedTableReference;
 use datafusion::common::DataFusionError;
 use datafusion::execution::session_state::SessionState;
 use datafusion::sql::planner::object_name_to_table_reference;
 use datafusion::sql::sqlparser::ast::{visit_relations, Statement};
-use datafusion::sql::TableReference;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 
 use super::error::SqlError;
 use crate::protos::{ColumnDescriptor, IndexDescriptor, TableDescriptor};
@@ -93,7 +92,7 @@ pub trait PlannerContext {
     async fn fetch_table_references(
         &self,
         table_references: Vec<ResolvedTableReference>,
-    ) -> Result<HashMap<TableReference, Arc<dyn TableProvider>>, SqlError> {
+    ) -> Result<HashMap<ResolvedTableReference, Arc<dyn TableProvider>>, SqlError> {
         let catalogs = self.state().catalog_list();
         let mut tables = HashMap::new();
         for table_ref in table_references {
@@ -106,7 +105,7 @@ pub trait PlannerContext {
             let Some(table) = schema.table(&table_ref.table).await? else {
                 continue;
             };
-            tables.insert(table_ref.into(), table);
+            tables.insert(table_ref, table);
         }
         Ok(tables)
     }

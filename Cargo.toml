@@ -54,7 +54,7 @@ bytemuck = { version = "1.13.1", features = ["derive"] }
 futures = "0.3.28"
 thiserror = "1.0.48"
 tokio-stream = "0.1.15"
-datafusion = "43.0.0"
+datafusion = "47.0.0"
 pgwire = "0.27.0"
 derive-where = "1.2.7"
 asyncs = { version = "0.3.0", features = ["tokio"] }

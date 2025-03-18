@@ -16,22 +16,15 @@ use std::any::Any;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
-use datafusion::catalog_common::ResolvedTableReference;
 use datafusion::common::arrow::datatypes::Schema;
 use datafusion::common::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
-use datafusion::physical_plan::{
-    DisplayAs,
-    DisplayFormatType,
-    ExecutionMode,
-    ExecutionPlan,
-    Partitioning,
-    PlanProperties,
-};
-use datafusion::sql::TableReference;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::sql::{ResolvedTableReference, TableReference};
 use ignore_result::Ignore;
 use tokio::sync::mpsc;
 
@@ -53,7 +46,8 @@ impl DropTableExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self { name, if_exists, schema, properties }
     }
