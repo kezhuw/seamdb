@@ -253,7 +253,7 @@ impl<'a> ResourceUri<'a> {
 
     pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
         let uri = ServiceUri::parse(str)?;
-        if uri.path().len() <= 1 {
+        if uri.path().is_empty() {
             return Err(anyhow!("{name} expect path: {uri}"));
         } else if !uri.params().is_empty() {
             return Err(anyhow!("{name} expect no params: {uri}"));
@@ -264,7 +264,7 @@ impl<'a> ResourceUri<'a> {
     fn is_valid_path(s: &str) -> bool {
         if s.is_empty() {
             return true;
-        } else if !s.starts_with('/') {
+        } else if s.ends_with('/') || !s.starts_with('/') {
             return false;
         }
         for segment in s[1..].split('/') {
@@ -852,6 +852,7 @@ mod tests {
         ServiceUri::parse(uri).unwrap();
     }
 
+    #[test_case("a://host/"; "trailing root path")]
     #[test_case("a://host/%"; "")]
     #[test_case("a://host/a/"; "trailing separator")]
     #[test_case("a://host/a//b"; "double separator")]
