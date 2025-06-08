@@ -75,7 +75,7 @@ pub trait PlannerContext {
 
     fn collect_table_references(&self, statement: &Statement) -> Result<Vec<ResolvedTableReference>, DataFusionError> {
         let mut relations = HashSet::new();
-        visit_relations(statement, |relation| {
+        let _ = visit_relations(statement, |relation| {
             relations.insert(relation.clone());
             ControlFlow::<()>::Continue(())
         });

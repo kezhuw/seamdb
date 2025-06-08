@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #![allow(clippy::missing_transmute_annotations)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
 
 pub mod clock;
 pub mod cluster;

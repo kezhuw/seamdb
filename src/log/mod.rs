@@ -117,10 +117,7 @@ impl LogPosition {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Offset(offset) if *offset <= u64::MAX as u128 => Some(*offset as u64),
-            Self::Cursor(str) => match str.parse() {
-                Ok(offset) => Some(offset),
-                _ => None,
-            },
+            Self::Cursor(str) => str.parse().ok(),
             _ => None,
         }
     }

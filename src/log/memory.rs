@@ -44,7 +44,7 @@ struct MemoryLogContent {
 
 impl MemoryLogContent {
     fn check_retention(&mut self) {
-        if self.expiration.filter(|e| *e <= Instant::now()).take().is_some() {
+        if self.expiration.take_if(|e| *e <= Instant::now()).is_some() {
             while self.start < self.earliest {
                 self.messages.pop_front();
                 self.start += 1;

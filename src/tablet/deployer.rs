@@ -119,7 +119,7 @@ pub trait TabletDeployer {
                     let Some((node, addr)) = self.nodes().select_node() else {
                         continue;
                     };
-                    if !deployment.servers.iter().any(|s| *s == node.0) {
+                    if !deployment.servers.contains(&node.0) {
                         if deployment.servers.is_empty() {
                             deployment.epoch += 1;
                         } else {
@@ -211,7 +211,7 @@ pub trait TabletDeployServant {
             select! {
                 _ = receiver.changed() => {
                     let deployment = receiver.consume();
-                    let is_member = deployment.servers.iter().any(|s| *s == node.0);
+                    let is_member = deployment.servers.contains(&node.0);
                     let request = TabletDeployRequest { deployment: deployment.clone() };
                     client.deploy_tablet(request).await?;
                     if !is_member {

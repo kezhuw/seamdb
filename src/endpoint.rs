@@ -925,9 +925,9 @@ mod tests {
         let uri = ServiceUri::parse(str).unwrap();
         assert_that!(uri).is_equal_to(ServiceUri {
             str: str.into(),
-            scheme: "scheme".into(),
-            address: "server1,server2:9090".into(),
-            path: "/path/xyz".into(),
+            scheme: "scheme",
+            address: "server1,server2:9090",
+            path: "/path/xyz",
             params: {
                 let mut params = LinkedHashMap::new();
                 params.insert("key1".into(), "value1".into());
@@ -941,9 +941,9 @@ mod tests {
         let uri = ServiceUri::parse(str).unwrap();
         assert_that!(uri).is_equal_to(ServiceUri {
             str: str.into(),
-            scheme: "scheme".into(),
-            address: "address".into(),
-            path: "/path".into(),
+            scheme: "scheme",
+            address: "address",
+            path: "/path",
             params: Default::default(),
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());
@@ -952,9 +952,9 @@ mod tests {
         let uri = ServiceUri::parse(str).unwrap();
         assert_that!(uri).is_equal_to(ServiceUri {
             str: str.into(),
-            scheme: "scheme+a".into(),
-            address: "address".into(),
-            path: "".into(),
+            scheme: "scheme+a",
+            address: "address",
+            path: "",
             params: Default::default(),
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());
@@ -963,9 +963,9 @@ mod tests {
         let uri = ServiceUri::parse(str).unwrap();
         assert_that!(uri).is_equal_to(ServiceUri {
             str: str.into(),
-            scheme: "scheme-b".into(),
-            address: "address".into(),
-            path: "".into(),
+            scheme: "scheme-b",
+            address: "address",
+            path: "",
             params: Default::default(),
         });
         assert_that!(uri.to_string()).is_equal_to(str.to_string());

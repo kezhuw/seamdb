@@ -371,12 +371,12 @@ mod tests {
         assert_that!(statistics2.changed().await.unwrap()).is_equal_to(NodeStatistics::new(1));
         assert_that!(statistics2.latest()).is_equal_to(NodeStatistics::new(1));
 
-        while let Some(_) = statistics1.changed().await {}
+        while statistics1.changed().await.is_some() {}
         assert_that!(statistics1.latest()).is_equal_to(NodeStatistics::new_offline());
 
         drop(lease2);
 
-        while let Some(_) = statistics2.changed().await {}
+        while statistics2.changed().await.is_some() {}
         assert_that!(statistics2.latest()).is_equal_to(NodeStatistics::new_offline());
     }
 }

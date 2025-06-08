@@ -32,7 +32,7 @@ protos:
 	cargo run --manifest-path src/protos/build/Cargo.toml
 
 lint:
-	cargo clippy --no-deps -- -D clippy::all
+	cargo clippy --no-deps --tests --bins -- -D clippy::all
 
 build:
 	cargo build --tests --bins

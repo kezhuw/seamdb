@@ -87,7 +87,7 @@ jobs:
           override: true
           components: clippy
     - name: Lint code
-      run: cargo clippy --no-deps -- -D clippy::all
+      run: cargo clippy --no-deps --tests --bins -- -D clippy::all
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [license, build, test, lint]
