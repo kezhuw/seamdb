@@ -24,7 +24,7 @@ use tracing::trace;
 use super::store::{BatchContext, BatchResult, TabletStore, TxnTabletStore};
 use super::types::{MessageId, TabletWatermark};
 use crate::clock::{Clock, Timestamp};
-use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogManager, LogOffset, LogPosition};
+use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogManager, LogOffset, LogPosition, LogUri};
 use crate::protos::{
     BatchError,
     BatchRequest,
@@ -667,8 +667,8 @@ impl TabletLoader {
         assert!(epoch > tablet.store.cursor.epoch);
         let uri = uri.try_into()?;
         let manifest = self.lead_manifest(epoch, &uri, tablet.manifest).await?;
-        let store_uri = manifest.manifest.tablet.data_log.as_str().try_into()?;
-        let store = self.lead_store(clock, client, epoch, &store_uri, tablet.store).await?;
+        let store_uri = LogUri::try_from(manifest.manifest.tablet.data_log.as_str())?;
+        let store = self.lead_store(clock, client, epoch, &store_uri.address(), tablet.store).await?;
         Ok(LeadingTablet { manifest, store })
     }
 
@@ -696,9 +696,9 @@ impl TabletLoader {
         if tablet.shards.iter().any(|r| !r.segments.is_empty()) {
             return Err(anyhow!("do not support file compaction and transaction rotation for now"));
         }
-        let uri = tablet.data_log.as_str().try_into()?;
+        let uri = LogUri::try_from(tablet.data_log.as_str())?;
         trace!("subscribing log {uri}");
-        let mut consumer: Box<dyn ByteLogSubscriber> = self.log.subscribe_log(&uri, LogOffset::Earliest).await?;
+        let mut consumer: Box<dyn ByteLogSubscriber> = self.log.subscribe_log(&uri.address(), uri.offset()).await?;
         let limit = match limit {
             None => consumer.latest().await?,
             Some(limit) => limit,
@@ -747,8 +747,8 @@ impl TabletLoader {
         epoch: u64,
         tablet: &TabletDescription,
     ) -> Result<LeadingTabletStore> {
-        let uri = tablet.data_log.as_str().try_into()?;
-        let mut producer = BufMessageProducer::new(self.log.produce_log(&uri).await?);
+        let uri = LogUri::try_from(tablet.data_log.as_str())?;
+        let mut producer = BufMessageProducer::new(self.log.produce_log(&uri.address()).await?);
         let position = producer.send_message(&DataMessage::new_fenced(epoch)).await?;
         let store = self.load_store(tablet, Some(position)).await?;
         if store.cursor != MessageId::new_fenced(epoch) {

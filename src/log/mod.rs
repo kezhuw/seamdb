@@ -19,6 +19,7 @@ mod manager;
 mod memory;
 
 use std::borrow::Cow;
+use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -29,9 +30,46 @@ use compact_str::CompactString;
 pub use self::kafka::KafkaLogFactory;
 pub use self::manager::{LogManager, LogRegistry};
 pub use self::memory::MemoryLogFactory;
-use super::endpoint::{Endpoint, Params, ResourceUri};
+use super::endpoint::{Endpoint, Params, ResourceUri, ServiceUri};
 
 pub type OwnedLogAddress = LogAddress<'static>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LogUri<'a> {
+    uri: ServiceUri<'a>,
+}
+
+impl<'a> TryFrom<&'a str> for LogUri<'a> {
+    type Error = anyhow::Error;
+
+    fn try_from(str: &'a str) -> Result<Self> {
+        let uri = ServiceUri::parse_named("log uri", str)?;
+        Ok(Self { uri })
+    }
+}
+
+impl Display for LogUri<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+        f.write_str(self.uri.as_str())
+    }
+}
+
+impl LogUri<'_> {
+    pub fn address(&self) -> LogAddress<'_> {
+        LogAddress { uri: self.uri.resource() }
+    }
+
+    pub fn params(&self) -> &Params<'_> {
+        self.uri.params()
+    }
+
+    pub fn offset(&self) -> LogOffset {
+        if let Some(offset) = self.params().query("offset") {
+            return LogOffset::from(offset);
+        }
+        LogOffset::Earliest
+    }
+}
 
 /// Address to a log.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,8 +99,8 @@ impl PartialEq<&str> for LogAddress<'_> {
     }
 }
 
-impl std::fmt::Display for LogAddress<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for LogAddress<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(&self.uri)
     }
 }
@@ -133,11 +171,20 @@ impl LogPosition {
     }
 }
 
-impl std::fmt::Display for LogPosition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for LogPosition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             LogPosition::Offset(offset) => f.write_fmt(format_args!("{}", offset)),
             LogPosition::Cursor(cursor) => f.write_str(cursor),
+        }
+    }
+}
+
+impl From<&str> for LogPosition {
+    fn from(s: &str) -> Self {
+        match s.parse::<u128>() {
+            Ok(offset) => Self::Offset(offset),
+            Err(_) => Self::Cursor(CompactString::from(s)),
         }
     }
 }
@@ -156,9 +203,29 @@ impl From<LogPosition> for LogOffset {
     }
 }
 
+impl Display for LogOffset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Earliest => f.write_str("earliest"),
+            Self::Latest => f.write_str("latest"),
+            Self::Position(position) => write!(f, "{position}"),
+        }
+    }
+}
+
+impl From<&str> for LogOffset {
+    fn from(s: &str) -> Self {
+        match s {
+            "earliest" => Self::Earliest,
+            "latest" => Self::Latest,
+            _ => Self::Position(LogPosition::from(s)),
+        }
+    }
+}
+
 /// Producer to write byte message to log.
 #[async_trait]
-pub trait ByteLogProducer: Send + std::fmt::Debug + 'static {
+pub trait ByteLogProducer: Send + fmt::Debug + 'static {
     fn exclusive(&self) -> bool {
         false
     }
@@ -175,7 +242,7 @@ pub trait ByteLogProducer: Send + std::fmt::Debug + 'static {
 
 /// Subscriber to read byte message from log.
 #[async_trait]
-pub trait ByteLogSubscriber: Send + Sync + std::fmt::Debug {
+pub trait ByteLogSubscriber: Send + Sync + fmt::Debug {
     async fn read<'a>(&'a mut self) -> Result<(LogPosition, &'a [u8])>;
 
     async fn seek(&mut self, offset: LogOffset) -> Result<()>;
@@ -185,7 +252,7 @@ pub trait ByteLogSubscriber: Send + Sync + std::fmt::Debug {
 
 /// Client to a log cluster.
 #[async_trait]
-pub trait LogClient: Send + Sync + std::fmt::Debug + 'static {
+pub trait LogClient: Send + Sync + fmt::Debug + 'static {
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>>;
 
     async fn subscribe_log(&self, name: &str, offset: LogOffset) -> Result<Box<dyn ByteLogSubscriber>>;
@@ -197,7 +264,7 @@ pub trait LogClient: Send + Sync + std::fmt::Debug + 'static {
 
 /// Factory to open [LogClient].
 #[async_trait]
-pub trait LogFactory: Send + Sync + std::fmt::Debug + 'static {
+pub trait LogFactory: Send + Sync + fmt::Debug + 'static {
     fn scheme(&self) -> &'static str;
 
     async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>>;

@@ -252,7 +252,7 @@ impl<'a> ResourceUri<'a> {
     }
 
     pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
-        let uri = ServiceUri::parse(str)?;
+        let uri = ServiceUri::parse_named(name, str)?;
         if uri.path().is_empty() {
             return Err(anyhow!("{name} expect path: {uri}"));
         } else if !uri.params().is_empty() {
@@ -539,13 +539,17 @@ impl<'a> ServiceUri<'a> {
     }
 
     pub fn parse(s: impl Into<Cow<'a, str>>) -> Result<Self> {
+        Self::parse_named("service uri", s)
+    }
+
+    pub fn parse_named(name: &'_ str, s: impl Into<Cow<'a, str>>) -> Result<Self> {
         let s = s.into();
         let Some((scheme, trailing)) = s.split_once("://") else {
-            return Err(anyhow!("invalid service uri: {}", s));
+            return Err(anyhow!("invalid {name}: {s}"));
         };
         match Scheme::try_from(scheme) {
-            Err(SchemeError::Empty) => return Err(anyhow!("no scheme in service uri: {s}")),
-            Err(_) => return Err(anyhow!("invalid scheme in service uri: {s}")),
+            Err(SchemeError::Empty) => return Err(anyhow!("no scheme in {name}: {s}")),
+            Err(_) => return Err(anyhow!("invalid scheme in {name}: {s}")),
             _ => {},
         };
 
@@ -554,14 +558,14 @@ impl<'a> ServiceUri<'a> {
             Some(i) => (&trailing[..i], &trailing[i..]),
         };
         if address.is_empty() {
-            return Err(anyhow!("no address in service uri: {}", s));
+            return Err(anyhow!("no address in {name}: {s}"));
         }
         for server in address.split(',') {
             let Ok(authority) = Authority::try_from(server) else {
-                return Err(anyhow!("invalid address in service uri: {}", s));
+                return Err(anyhow!("invalid address in {name}: {s}"));
             };
             if authority.has_username() {
-                return Err(anyhow!("unsupported username in service uri: {s}"));
+                return Err(anyhow!("unsupported username in {name}: {s}"));
             }
         }
 
@@ -570,12 +574,12 @@ impl<'a> ServiceUri<'a> {
             None => (trailing, None),
         };
         if !ResourceUri::is_valid_path(path) {
-            return Err(anyhow!("invalid path in service uri: {}", s));
+            return Err(anyhow!("invalid path in {name}: {s}"));
         }
 
         let params = match trailing {
-            Some("") => return Err(anyhow!("empty params in service uri: {s}")),
-            Some(trailing) => parse_params(trailing).ok_or_else(|| anyhow!("invalid params in service uri: {s}"))?,
+            Some("") => return Err(anyhow!("empty params in {name}: {s}")),
+            Some(trailing) => parse_params(trailing).ok_or_else(|| anyhow!("invalid params in {name}: {s}"))?,
             None => Default::default(),
         };
         // Safety: they are pointing to what cow holds
