@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +25,7 @@ use hashbrown::hash_map::HashMap;
 use tokio::sync::futures::Notified;
 use tokio::sync::Notify;
 
-use crate::endpoint::{Endpoint, Params};
+use crate::endpoint::{ResourceUri, ServiceUri};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogClient, LogFactory, LogOffset, LogPosition};
 
 #[cfg(test)]
@@ -216,22 +217,15 @@ impl LogClient for MemoryLogClient {
     }
 }
 
-#[derive(Debug)]
-pub struct MemoryLogFactory {
-    client: Arc<dyn LogClient>,
-}
+#[derive(Default, Debug)]
+pub struct MemoryLogFactory;
 
 impl MemoryLogFactory {
-    pub const ENDPOINT: Endpoint<'static> = unsafe { Endpoint::new_unchecked("memory", "memory") };
+    pub const URI: ResourceUri<'static> =
+        unsafe { ResourceUri::new_unchecked(Cow::Borrowed("memory://logs"), "memory", "logs", "") };
 
     pub fn new() -> Self {
-        Self { client: Arc::new(MemoryLogClient::default()) }
-    }
-}
-
-impl Default for MemoryLogFactory {
-    fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -241,16 +235,14 @@ impl LogFactory for MemoryLogFactory {
         "memory"
     }
 
-    async fn open_client(&self, endpoint: &Endpoint, _params: &Params) -> Result<Arc<dyn LogClient>> {
-        assert_eq!(endpoint.scheme(), "memory", "invalid scheme: expect \"memory\", got \"{}\"", endpoint.scheme());
-        assert_eq!(endpoint.address(), "memory", "invalid address: expect \"memory\", got \"{}\"", endpoint.address());
-        Ok(self.client.clone())
+    async fn open_client(&self, uri: &ServiceUri) -> Result<Arc<dyn LogClient>> {
+        assert_eq!(uri.scheme(), "memory", "invalid scheme: expect \"memory\", got \"{}\"", uri.scheme());
+        Ok(Arc::new(MemoryLogClient::default()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use assertor::*;
@@ -258,7 +250,7 @@ mod tests {
     use tokio::select;
 
     use super::RETENTION_TIMEOUT;
-    use crate::endpoint::{Endpoint, Params};
+    use crate::endpoint::ServiceUri;
     use crate::log::{LogFactory, LogOffset, LogPosition, MemoryLogFactory};
 
     #[test]
@@ -271,29 +263,14 @@ mod tests {
     #[should_panic(expected = "invalid scheme")]
     async fn test_memory_log_open_client_invalid_scheme() {
         let factory = MemoryLogFactory::new();
-        factory.open_client(&Endpoint::try_from("test://memory").unwrap(), &Params::default()).await.unwrap();
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "invalid address")]
-    async fn test_memory_log_open_client_invalid_address() {
-        let factory = MemoryLogFactory::new();
-        factory.open_client(&Endpoint::try_from("memory://test").unwrap(), &Params::default()).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_memory_log_open_client_same() {
-        let factory = MemoryLogFactory::new();
-        let client1 = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
-        let client2 = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
-        assert!(Arc::ptr_eq(&client1, &client2));
+        factory.open_client(&ServiceUri::try_from("test://memory").unwrap()).await.unwrap();
     }
 
     #[tokio::test]
     #[should_panic(expected = "log test1 already exists")]
     async fn test_memory_log_create_log_alreay_exists() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::parse("memory://logs").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
     }
@@ -302,7 +279,7 @@ mod tests {
     #[should_panic(expected = "no log named test1")]
     async fn test_memory_log_delete_log() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::parse("memory://logs").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
         client.delete_log("test1").await.unwrap();
         client.delete_log("test1").await.unwrap();
@@ -313,14 +290,14 @@ mod tests {
     #[should_panic(expected = "no log named test1")]
     async fn test_memory_log_produce_no_log() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::parse("memory://logs").unwrap()).await.unwrap();
         client.produce_log("test1").await.unwrap();
     }
 
     #[tokio::test]
     async fn test_memory_log_produce() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::parse("memory://logs").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
         let mut producer = client.produce_log("test1").await.unwrap();
         let position1 = producer.send(b"message1").await.unwrap();
@@ -332,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_log_produce_interleaving() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::try_from("memory://test").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
         let mut producer_a = client.produce_log("test1").await.unwrap();
         let mut producer_b = client.produce_log("test1").await.unwrap();
@@ -349,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_log_produce_queue() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::try_from("memory://test").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
         let mut producer = client.produce_log("test1").await.unwrap();
 
@@ -372,14 +349,14 @@ mod tests {
     #[should_panic(expected = "no log named test1")]
     async fn test_memory_log_subscribe_no_log() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::try_from("memory://test").unwrap()).await.unwrap();
         client.subscribe_log("test1", LogOffset::Earliest).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_memory_log_subscribe() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::try_from("memory://test").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
         let mut producer = client.produce_log("test1").await.unwrap();
         producer.send(b"message1").await.unwrap();
@@ -414,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_log_subscribe_wait() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::try_from("memory://test").unwrap()).await.unwrap();
         client.create_log("test1", Default::default()).await.unwrap();
 
         let mut subscriber1 = client.subscribe_log("test1", LogOffset::Earliest).await.unwrap();
@@ -439,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_log_retention() {
         let factory = MemoryLogFactory::new();
-        let client = factory.open_client(&MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let client = factory.open_client(&ServiceUri::try_from("memory://test").unwrap()).await.unwrap();
         client.create_log("test1", ByteSize::kb(1)).await.unwrap();
 
         let mut producer = client.produce_log("test1").await.unwrap();

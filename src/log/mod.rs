@@ -30,7 +30,7 @@ use compact_str::CompactString;
 pub use self::kafka::KafkaLogFactory;
 pub use self::manager::{LogManager, LogRegistry};
 pub use self::memory::MemoryLogFactory;
-use super::endpoint::{Endpoint, Params, ResourceUri, ServiceUri};
+use super::endpoint::{Params, ResourceUri, ServiceUri};
 
 pub type OwnedLogAddress = LogAddress<'static>;
 
@@ -44,6 +44,7 @@ impl<'a> TryFrom<&'a str> for LogUri<'a> {
 
     fn try_from(str: &'a str) -> Result<Self> {
         let uri = ServiceUri::parse_named("log uri", str)?;
+        LogAddress::try_from(uri.resource())?;
         Ok(Self { uri })
     }
 }
@@ -111,14 +112,21 @@ impl From<LogAddress<'_>> for String {
     }
 }
 
+impl<'a> TryFrom<ResourceUri<'a>> for LogAddress<'a> {
+    type Error = anyhow::Error;
+
+    fn try_from(uri: ResourceUri<'a>) -> Result<Self> {
+        if uri.path().is_empty() {
+            bail!("log address expect path: {uri}")
+        }
+        Ok(Self { uri })
+    }
+}
+
 impl<'a> LogAddress<'a> {
     pub fn new(str: impl Into<Cow<'a, str>>) -> Result<Self> {
         let uri = ResourceUri::parse_named("log address", str)?;
-        if unsafe { uri.path().get_unchecked(1..) }.find('/').is_some() {
-            bail!("log address invalid log name: {uri}")
-        }
-        let uri: ResourceUri<'a> = unsafe { std::mem::transmute(uri) };
-        Ok(Self { uri })
+        Self::try_from(uri)
     }
 
     pub fn uri(&self) -> &ResourceUri<'_> {
@@ -267,7 +275,7 @@ pub trait LogClient: Send + Sync + fmt::Debug + 'static {
 pub trait LogFactory: Send + Sync + fmt::Debug + 'static {
     fn scheme(&self) -> &'static str;
 
-    async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>>;
+    async fn open_client(&self, uri: &ServiceUri) -> Result<Arc<dyn LogClient>>;
 }
 
 #[cfg(test)]
@@ -284,7 +292,7 @@ pub mod tests {
     use test_case::test_case;
     use tokio::sync::watch;
 
-    use crate::endpoint::{Endpoint, OwnedEndpoint, OwnedParams, Params};
+    use crate::endpoint::{OwnedResourceUri, OwnedServiceUri, Params, ResourceUri, ServiceUri};
     use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset, LogPosition};
 
     #[derive(Clone, Debug)]
@@ -412,22 +420,21 @@ pub mod tests {
 
     #[derive(Debug)]
     pub struct TestLogClient {
-        endpoint: OwnedEndpoint,
-        params: OwnedParams,
+        uri: OwnedServiceUri,
         logs: Arc<Mutex<HashMap<String, TestLog>>>,
     }
 
     impl TestLogClient {
-        fn new(endpoint: &Endpoint, params: &Params) -> Self {
-            Self { endpoint: endpoint.to_owned(), params: params.to_owned(), logs: Default::default() }
+        fn new(uri: &ServiceUri) -> Self {
+            Self { uri: uri.to_owned(), logs: Default::default() }
         }
 
-        pub fn endpoint(&self) -> Endpoint<'_> {
-            self.endpoint.as_ref()
+        pub fn resource_uri(&self) -> ResourceUri<'_> {
+            self.uri.resource()
         }
 
         pub fn params(&self) -> &Params {
-            &self.params
+            self.uri.params()
         }
 
         pub fn get_log(&self, name: &str) -> Option<TestLog> {
@@ -464,7 +471,7 @@ pub mod tests {
     #[derive(Clone, Debug)]
     pub struct TestLogFactory {
         scheme: &'static str,
-        clients: Arc<Mutex<HashMap<OwnedEndpoint, Arc<TestLogClient>>>>,
+        clients: Arc<Mutex<HashMap<OwnedResourceUri, Arc<TestLogClient>>>>,
     }
 
     impl TestLogFactory {
@@ -472,12 +479,12 @@ pub mod tests {
             Self { scheme, clients: Arc::new(Mutex::new(HashMap::default())) }
         }
 
-        fn add_client(&self, endpoint: &Endpoint, client: Arc<TestLogClient>) {
-            self.clients.lock().unwrap().insert(endpoint.to_owned(), client);
+        fn add_client(&self, uri: ResourceUri<'_>, client: Arc<TestLogClient>) {
+            self.clients.lock().unwrap().insert(uri.into_owned(), client);
         }
 
-        pub fn get_client(&self, endpoint: &Endpoint) -> Option<Arc<TestLogClient>> {
-            self.clients.lock().unwrap().get(endpoint).cloned()
+        pub fn get_client(&self, uri: &ResourceUri) -> Option<Arc<TestLogClient>> {
+            self.clients.lock().unwrap().get(uri).cloned()
         }
     }
 
@@ -487,9 +494,9 @@ pub mod tests {
             self.scheme
         }
 
-        async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>> {
-            let client = Arc::new(TestLogClient::new(endpoint, params));
-            self.add_client(endpoint, client.clone());
+        async fn open_client(&self, uri: &ServiceUri) -> Result<Arc<dyn LogClient>> {
+            let client = Arc::new(TestLogClient::new(uri));
+            self.add_client(uri.resource(), client.clone());
             Ok(client)
         }
     }
@@ -498,12 +505,6 @@ pub mod tests {
     #[should_panic(expected = "log address expect path")]
     fn test_log_address_no_name() {
         LogAddress::new("kafka://localhost:9092").unwrap();
-    }
-
-    #[test]
-    #[should_panic(expected = "log address invalid log name")]
-    fn test_log_address_invalid_path() {
-        LogAddress::new("kafka://localhost:9092/a/b").unwrap();
     }
 
     #[test]
@@ -533,5 +534,10 @@ pub mod tests {
         assert_that!(address).is_equal_to(LogAddress::new(uri.to_string()).unwrap());
         assert_that!(address).is_equal_to(address.to_owned());
         assert_that!(address.into_owned().as_str()).is_equal_to(uri);
+    }
+
+    #[test]
+    fn test_log_address_namespaced() {
+        LogAddress::new("kafka://localhost:9092/a/b").unwrap();
     }
 }

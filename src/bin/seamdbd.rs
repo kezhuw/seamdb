@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use pgwire::tokio::process_socket;
 use seamdb::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
-use seamdb::endpoint::{Endpoint, Params, ServiceUri};
+use seamdb::endpoint::{Endpoint, ServiceUri};
 use seamdb::log::{KafkaLogFactory, LogManager, MemoryLogFactory};
 use seamdb::protos::TableDescriptor;
 use seamdb::sql::postgres::PostgresqlHandlerFactory;
@@ -31,8 +31,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 async fn new_log_manager(uri: ServiceUri<'_>) -> Result<LogManager> {
     match uri.scheme() {
-        "memory" => LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await,
-        "kafka" => LogManager::new(KafkaLogFactory {}, &uri.endpoint(), uri.params()).await,
+        "memory" => LogManager::new(MemoryLogFactory::new(), &uri).await,
+        "kafka" => LogManager::new(KafkaLogFactory {}, &uri).await,
         scheme => Err(anyhow!("unsupported log schema: {}, supported: memory, kafka", scheme)),
     }
 }

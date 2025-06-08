@@ -625,7 +625,7 @@ mod tests {
     use super::Txn;
     use crate::cluster::tests::etcd_container;
     use crate::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
-    use crate::endpoint::{Endpoint, Params};
+    use crate::endpoint::Endpoint;
     use crate::keys;
     use crate::kv::KvClient;
     use crate::log::{LogManager, MemoryLogFactory};
@@ -644,8 +644,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager =
-            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
@@ -684,8 +683,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager =
-            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
@@ -725,8 +723,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager =
-            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
@@ -774,8 +771,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager =
-            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
@@ -826,8 +822,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager =
-            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
@@ -863,8 +858,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager =
-            LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::ENDPOINT, &Params::default()).await.unwrap();
+        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();

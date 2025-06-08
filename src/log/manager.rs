@@ -18,20 +18,21 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use bytesize::ByteSize;
+use either::Either;
 use hashbrown::hash_map::{Entry, HashMap};
 use rand::prelude::*;
 use smallvec::SmallVec;
 
 use super::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset, OwnedLogAddress};
-use crate::endpoint::{Endpoint, OwnedEndpoint, Params};
+use crate::endpoint::{OwnedResourceUri, ResourceUri, ServiceUri};
 
 #[derive(Debug)]
 pub struct LogManager {
     registry: LogRegistry,
     active_client: Arc<dyn LogClient>,
-    active_address: OwnedEndpoint,
-    cluster_clients: HashMap<OwnedEndpoint, Arc<dyn LogClient>>,
-    balanced_clients: HashMap<OwnedEndpoint, Vec<Arc<dyn LogClient>>>,
+    active_address: OwnedResourceUri,
+    cluster_clients: HashMap<OwnedResourceUri, Arc<dyn LogClient>>,
+    balanced_clients: HashMap<OwnedResourceUri, Vec<Arc<dyn LogClient>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -55,33 +56,32 @@ impl LogRegistry {
         self.factories.get(scheme).map(|f| f.as_ref())
     }
 
-    async fn new_client(&self, endpoint: &Endpoint<'_>, params: &Params<'_>) -> Result<Arc<dyn LogClient>> {
-        let scheme = endpoint.scheme();
-        let Some(factory) = self.find_factory(scheme) else {
-            bail!("no log factory for scheme of endpoint {}", endpoint)
+    async fn new_client(&self, uri: &ServiceUri<'_>) -> Result<Arc<dyn LogClient>> {
+        let Some(factory) = self.find_factory(uri.scheme()) else {
+            bail!("no log factory for scheme of endpoint {}", uri.endpoint())
         };
-        factory.open_client(endpoint, params).await
+        factory.open_client(uri).await
     }
 
-    pub async fn into_manager(self, endpoint: &Endpoint<'_>, params: &Params<'_>) -> Result<LogManager> {
-        let client = self.new_client(endpoint, params).await?;
+    pub async fn into_manager(self, uri: &ServiceUri<'_>) -> Result<LogManager> {
+        let client = self.new_client(uri).await?;
         let mut manager = LogManager {
             registry: self,
             active_client: client,
-            active_address: endpoint.to_owned(),
+            active_address: uri.resource().into_owned(),
             cluster_clients: Default::default(),
             balanced_clients: Default::default(),
         };
-        manager.add_balanced_client(endpoint, unsafe { std::mem::transmute(&manager.active_client) });
+        manager.add_balanced_client(uri.resource(), unsafe { std::mem::transmute(&manager.active_client) });
         Ok(manager)
     }
 }
 
 impl LogManager {
-    pub async fn new(factory: impl LogFactory, endpoint: &Endpoint<'_>, params: &Params<'_>) -> Result<LogManager> {
+    pub async fn new(factory: impl LogFactory, uri: &ServiceUri<'_>) -> Result<LogManager> {
         let mut registry = LogRegistry::default();
         registry.register(factory).unwrap();
-        registry.into_manager(endpoint, params).await
+        registry.into_manager(uri).await
     }
 
     /// Open a client to produce, subscribe and delete existing logs.
@@ -89,49 +89,46 @@ impl LogManager {
     /// This will create a new client if the endpoint is new to any existing clients, otherwise it
     /// will return client opened for same endpoint.
     #[allow(invalid_reference_casting)]
-    pub async fn open_client<'a>(
-        &'a mut self,
-        endpoint: &Endpoint<'_>,
-        params: &Params<'_>,
-    ) -> Result<&'a Arc<dyn LogClient>> {
-        if let Some(client) = self.get_cluster_client(endpoint) {
+    pub async fn open_client<'a>(&'a mut self, uri: &ServiceUri<'_>) -> Result<&'a Arc<dyn LogClient>> {
+        if let Some(client) = self.get_cluster_client(&uri.resource()) {
             return Ok(client);
         }
-        let client = self.registry.new_client(endpoint, params).await?;
+        let client = self.registry.new_client(uri).await?;
         // https://github.com/rust-lang/rust/issues/74068
         // `last_or_push` of https://blog.rust-lang.org/2022/08/05/nll-by-default.html
         let manager = unsafe { &mut *(self as *const Self as *mut Self) };
-        Ok(manager.add_client(endpoint, client))
+        Ok(manager.add_client(uri.resource(), client))
     }
 
-    fn add_client<'a>(&'a mut self, endpoint: &Endpoint, client: Arc<dyn LogClient>) -> &'a Arc<dyn LogClient> {
-        self.add_balanced_client(endpoint, &client);
-        self.cluster_clients.entry(endpoint.to_owned()).insert(client).into_mut()
+    fn add_client<'a>(&'a mut self, uri: ResourceUri<'_>, client: Arc<dyn LogClient>) -> &'a Arc<dyn LogClient> {
+        self.add_balanced_client(uri.clone(), &client);
+        self.cluster_clients.entry(uri.into_owned()).insert(client).into_mut()
     }
 
-    fn add_balanced_client(&mut self, endpoint: &Endpoint, client: &Arc<dyn LogClient>) {
-        let Some((server, remainings)) = endpoint.split_once() else {
-            return;
-        };
-        self.add_single_balanced_client(&server, client.clone());
-        for server in remainings.split() {
-            self.add_single_balanced_client(&server, client.clone());
+    fn add_balanced_client(&mut self, uri: ResourceUri<'_>, client: &Arc<dyn LogClient>) {
+        if let Either::Right(iter) = uri.split() {
+            for uri in iter {
+                self.add_single_balanced_client(uri, client.clone());
+            }
         }
     }
 
-    fn add_single_balanced_client(&mut self, server: &Endpoint, client: Arc<dyn LogClient>) {
-        self.balanced_clients.entry(server.to_owned()).or_default().push(client.clone());
+    fn add_single_balanced_client(&mut self, uri: OwnedResourceUri, client: Arc<dyn LogClient>) {
+        self.balanced_clients.entry(uri).or_default().push(client.clone());
     }
 
-    fn get_cluster_client<'a>(&'a self, endpoint: &Endpoint) -> Option<&'a Arc<dyn LogClient>> {
-        if self.active_address == *endpoint {
+    fn get_cluster_client<'a>(&'a self, uri: &ResourceUri<'_>) -> Option<&'a Arc<dyn LogClient>> {
+        if self.active_address == *uri {
             return Some(&self.active_client);
         }
-        self.cluster_clients.get(endpoint)
+        self.cluster_clients.get(uri.as_str())
     }
 
-    fn get_balanced_client(&self, endpoint: &Endpoint) -> Option<&dyn LogClient> {
-        let mut servers: SmallVec<[_; 10]> = endpoint.split().collect();
+    fn get_balanced_client(&self, uri: &ResourceUri) -> Option<&dyn LogClient> {
+        let mut servers: SmallVec<[_; 10]> = match uri.clone().split() {
+            Either::Left(uri) => std::iter::once(uri.into_owned()).collect(),
+            Either::Right(iter) => iter.collect(),
+        };
         let rng = &mut thread_rng();
         servers.shuffle(rng);
         for server in servers {
@@ -142,17 +139,18 @@ impl LogManager {
         None
     }
 
-    fn get_client(&self, endpoint: &Endpoint) -> Option<&dyn LogClient> {
-        if let Some(client) = self.get_cluster_client(endpoint) {
+    fn get_client(&self, uri: &ResourceUri<'_>) -> Option<&dyn LogClient> {
+        if let Some(client) = self.get_cluster_client(uri) {
             return Some(client.as_ref());
         }
-        self.get_balanced_client(endpoint)
+        self.get_balanced_client(uri)
     }
 
     fn find_client<'a, 'b>(&'a self, address: &'b LogAddress) -> Result<(&'a dyn LogClient, &'b str)> {
         let uri = address.uri();
-        if let Some(client) = self.get_client(&uri.endpoint()) {
-            return Ok((client, &uri.path()[1..]));
+        let parent = uri.parent().unwrap();
+        if let Some(client) = self.get_client(&parent) {
+            return Ok((client, &uri.path()[parent.path().len() + 1..]));
         };
         bail!("no client for log address: {address}")
     }
@@ -195,7 +193,7 @@ mod tests {
     use assertor::*;
     use bytesize::ByteSize;
 
-    use crate::endpoint::{Endpoint, Params, ServiceUri};
+    use crate::endpoint::{ResourceUri, ServiceUri};
     use crate::log::tests::*;
     use crate::log::{LogAddress, LogClient, LogOffset, LogRegistry};
 
@@ -219,10 +217,9 @@ mod tests {
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
         let uri = ServiceUri::parse("scheme1://address?param1=value1").unwrap();
-        let endpoint = uri.endpoint();
-        let client = registry.new_client(&endpoint, uri.params()).await.unwrap();
-        let created_client = factory1.get_client(&endpoint).unwrap();
-        assert_that!(created_client.endpoint()).is_equal_to(endpoint);
+        let client = registry.new_client(&uri).await.unwrap();
+        let created_client = factory1.get_client(&uri.resource()).unwrap();
+        assert_that!(created_client.resource_uri()).is_equal_to(uri.resource());
         assert_that!(created_client.params()).is_equal_to(uri.params());
         assert!(Arc::ptr_eq(&client, &(created_client as Arc<dyn LogClient>)));
     }
@@ -233,7 +230,7 @@ mod tests {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1).unwrap();
-        registry.new_client(&Endpoint::try_from("scheme2://address").unwrap(), &Params::default()).await.unwrap();
+        registry.new_client(&ServiceUri::try_from("scheme2://address").unwrap()).await.unwrap();
     }
 
     #[tokio::test]
@@ -242,35 +239,34 @@ mod tests {
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
         let uri = ServiceUri::parse("scheme1://server1,server2:2222?param1=value1").unwrap();
-        let endpoint = uri.endpoint();
-        let manager = registry.into_manager(&endpoint, uri.params()).await.unwrap();
-        let created_client: Arc<dyn LogClient> = factory1.get_client(&endpoint).unwrap();
-        assert_that!(manager.active_address.as_ref()).is_equal_to(endpoint);
+        let manager = registry.into_manager(&uri).await.unwrap();
+        let created_client: Arc<dyn LogClient> = factory1.get_client(&uri.resource()).unwrap();
+        assert_that!(manager.active_address).is_equal_to(uri.resource());
         assert!(Arc::ptr_eq(&manager.active_client, &created_client));
 
         // https://github.com/rust-lang/rust/issues/106447
         assert_eq!(
-            manager.get_client(&Endpoint::try_from("scheme1://server1").unwrap()).unwrap() as *const dyn LogClient
+            manager.get_client(&ResourceUri::try_from("scheme1://server1").unwrap()).unwrap() as *const dyn LogClient
                 as *const (),
             created_client.as_ref() as *const dyn LogClient as *const (),
         );
         assert_eq!(
-            manager.get_client(&Endpoint::try_from("scheme1://server1,server3").unwrap()).unwrap()
+            manager.get_client(&ResourceUri::try_from("scheme1://server1,server3").unwrap()).unwrap()
                 as *const dyn LogClient as *const (),
             created_client.as_ref() as *const dyn LogClient as *const ()
         );
         assert_eq!(
-            manager.get_client(&Endpoint::try_from("scheme1://server2:2222").unwrap()).unwrap() as *const dyn LogClient
-                as *const (),
-            created_client.as_ref() as *const dyn LogClient as *const ()
-        );
-        assert_eq!(
-            manager.get_client(&Endpoint::try_from("scheme1://server1,server2:2222").unwrap()).unwrap()
+            manager.get_client(&ResourceUri::try_from("scheme1://server2:2222").unwrap()).unwrap()
                 as *const dyn LogClient as *const (),
             created_client.as_ref() as *const dyn LogClient as *const ()
         );
         assert_eq!(
-            manager.get_client(&Endpoint::try_from("scheme1://server4,server2:2222").unwrap()).unwrap()
+            manager.get_client(&ResourceUri::try_from("scheme1://server1,server2:2222").unwrap()).unwrap()
+                as *const dyn LogClient as *const (),
+            created_client.as_ref() as *const dyn LogClient as *const ()
+        );
+        assert_eq!(
+            manager.get_client(&ResourceUri::try_from("scheme1://server4,server2:2222").unwrap()).unwrap()
                 as *const dyn LogClient as *const (),
             created_client.as_ref() as *const dyn LogClient as *const ()
         );
@@ -281,15 +277,15 @@ mod tests {
         let factory1 = TestLogFactory::new("scheme1");
         let mut registry = LogRegistry::default();
         registry.register(factory1.clone()).unwrap();
-        let endpoint1 = Endpoint::try_from("scheme1://server1").unwrap();
-        let mut manager = registry.into_manager(&endpoint1, &Params::default()).await.unwrap();
-        let client1: Arc<dyn LogClient> = factory1.get_client(&endpoint1).unwrap().clone();
-        assert!(Arc::ptr_eq(manager.open_client(&endpoint1, &Params::default()).await.unwrap(), &client1));
+        let uri1 = ServiceUri::try_from("scheme1://server1").unwrap();
+        let mut manager = registry.into_manager(&uri1).await.unwrap();
+        let client1: Arc<dyn LogClient> = factory1.get_client(&uri1.resource()).unwrap().clone();
+        assert!(Arc::ptr_eq(manager.open_client(&uri1).await.unwrap(), &client1));
 
-        let endpoint2 = Endpoint::try_from("scheme1://server2").unwrap();
-        assert!(!Arc::ptr_eq(manager.open_client(&endpoint2, &Params::default()).await.unwrap(), &client1));
-        let endpoint12 = Endpoint::try_from("scheme1://server1,server2").unwrap();
-        assert!(!Arc::ptr_eq(manager.open_client(&endpoint12, &Params::default()).await.unwrap(), &client1));
+        let uri2 = ServiceUri::try_from("scheme1://server2").unwrap();
+        assert!(!Arc::ptr_eq(manager.open_client(&uri2).await.unwrap(), &client1));
+        let uri12 = ServiceUri::try_from("scheme1://server1,server2").unwrap();
+        assert!(!Arc::ptr_eq(manager.open_client(&uri12).await.unwrap(), &client1));
     }
 
     #[tokio::test]
@@ -297,15 +293,15 @@ mod tests {
         let factory = TestLogFactory::new("scheme");
         let mut registry = LogRegistry::default();
         registry.register(factory.clone()).unwrap();
-        let active_endpoint = Endpoint::try_from("scheme://server1,server2").unwrap();
-        let mut manager = registry.into_manager(&active_endpoint, &Params::default()).await.unwrap();
+        let active_uri = ServiceUri::try_from("scheme://server1,server2").unwrap();
+        let mut manager = registry.into_manager(&active_uri).await.unwrap();
 
         // given: create a log through log manager
         let log1_address = manager.create_log("log1", ByteSize::mib(512)).await.unwrap();
         assert_eq!(log1_address, "scheme://server1,server2/log1");
 
         // then: log created in active client
-        let active_client = factory.get_client(&active_endpoint).unwrap();
+        let active_client = factory.get_client(&active_uri.resource()).unwrap();
         let log1 = active_client.get_log("log1").unwrap();
         assert_eq!(log1.name(), "log1");
         assert_eq!(log1.retention(), ByteSize::mib(512));
@@ -335,8 +331,8 @@ mod tests {
             .is_equal_to((payload2_position, b"payload2".as_slice().to_owned()));
 
         // given: cluster endpoint for "server2"
-        let fallback_endpoint2 = Endpoint::try_from("scheme://server2").unwrap();
-        manager.open_client(&fallback_endpoint2, &Params::default()).await.unwrap();
+        let fallback_uri2 = ServiceUri::try_from("scheme://server2").unwrap();
+        manager.open_client(&fallback_uri2).await.unwrap();
 
         // then: balanced client for "server2" will be shadowed
         assert_that!(manager

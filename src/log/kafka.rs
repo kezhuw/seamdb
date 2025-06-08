@@ -33,7 +33,7 @@ use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
 use tokio::time;
 
-use crate::endpoint::{Endpoint, Params};
+use crate::endpoint::{OwnedServiceUri, ServiceUri};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogClient, LogFactory, LogOffset, LogPosition};
 
 #[derive_where(Debug)]
@@ -189,6 +189,7 @@ impl ByteLogSubscriber for KafkaPartitionConsumer {
 
 #[derive_where(Debug)]
 pub struct KafkaLogClient {
+    uri: OwnedServiceUri,
     config: ClientConfig,
     #[derive_where(skip(Debug))]
     client: AdminClient<DefaultClientContext>,
@@ -244,26 +245,44 @@ fn into_position(offset: i64) -> LogPosition {
     LogPosition::Offset(offset as u128)
 }
 
+impl KafkaLogClient {
+    fn normalize_name(&self, name: &str) -> Result<String> {
+        let mut name = self.uri.resource().child_name(name)?;
+        // Safety: bytes of non ascii characters contain non ascii bytes
+        unsafe {
+            name.as_bytes_mut().iter_mut().for_each(|b| {
+                if *b == b'/' {
+                    *b = b'.';
+                }
+            });
+        }
+        Ok(name)
+    }
+}
+
 #[async_trait]
 impl LogClient for KafkaLogClient {
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>> {
         let producer = FutureProducer::from_config(&self.config)?;
-        Ok(Box::new(KafkaPartitionProducer::new(name.to_string(), producer)))
+        let name = self.normalize_name(name)?;
+        Ok(Box::new(KafkaPartitionProducer::new(name, producer)))
     }
 
     async fn subscribe_log(&self, name: &str, offset: LogOffset) -> Result<Box<dyn ByteLogSubscriber>> {
+        let name = self.normalize_name(name)?;
         let consumer = StreamConsumer::from_config(&self.config)?;
         let offset = resolve_offset(offset)?;
         let mut topics = TopicPartitionList::new();
-        topics.add_partition_offset(name, 0, offset)?;
+        topics.add_partition_offset(&name, 0, offset)?;
         consumer.assign(&topics)?;
-        Ok(Box::new(KafkaPartitionConsumer::new(name.to_string(), 0, consumer)))
+        Ok(Box::new(KafkaPartitionConsumer::new(name, 0, consumer)))
     }
 
     async fn create_log(&self, name: &str, retention: ByteSize) -> Result<()> {
         let retention_bytes =
             if retention == ByteSize::default() { "-1".to_compact_string() } else { retention.0.to_compact_string() };
-        let topics = [new_topic_config(name, self.replication, &retention_bytes)];
+        let name = self.normalize_name(name)?;
+        let topics = [new_topic_config(&name, self.replication, &retention_bytes)];
         let mut results = self.client.create_topics(&topics, &AdminOptions::default()).await?;
         let topic_result = results.pop().ok_or_else(|| anyhow!("no topic results in topic creation"))?;
         match topic_result {
@@ -273,7 +292,8 @@ impl LogClient for KafkaLogClient {
     }
 
     async fn delete_log(&self, name: &str) -> Result<()> {
-        let mut results = self.client.delete_topics(&[name], &AdminOptions::default()).await?;
+        let name = self.normalize_name(name)?;
+        let mut results = self.client.delete_topics(&[&name], &AdminOptions::default()).await?;
         if let Err((_, error_code)) = results.pop().unwrap() {
             return Err(anyhow!("fail to delete kafka topic {}: {}", name, error_code));
         }
@@ -290,18 +310,18 @@ impl LogFactory for KafkaLogFactory {
         "kafka"
     }
 
-    async fn open_client(&self, endpoint: &Endpoint, params: &Params) -> Result<Arc<dyn LogClient>> {
+    async fn open_client(&self, uri: &ServiceUri) -> Result<Arc<dyn LogClient>> {
         let mut config = ClientConfig::new();
-        config.set("bootstrap.servers", endpoint.address());
+        config.set("bootstrap.servers", uri.address());
         config.set("client.id", "seamdb");
         config.set("group.id", "seamdb");
         config.set("acks", "all");
         let client = AdminClient::from_config(&config)?;
-        let replication = match params.query("replication") {
+        let replication = match uri.query("replication") {
             None => 1,
             Some(replication) => replication.parse().map_err(|_| anyhow!("invalid kafka topic replication"))?,
         };
-        Ok(Arc::new(KafkaLogClient { config, client, replication }))
+        Ok(Arc::new(KafkaLogClient { uri: uri.clone().into_owned(), config, client, replication }))
     }
 }
 
@@ -313,7 +333,6 @@ mod tests {
     use testcontainers::images::generic::GenericImage;
 
     use super::*;
-    use crate::endpoint::*;
 
     fn kafka_image() -> RunnableImage<GenericImage> {
         let image = GenericImage::new("confluentinc/confluent-local", "7.4.1")
@@ -340,11 +359,11 @@ mod tests {
     #[tracing_test::traced_test]
     async fn test_kafka_basic() {
         let kafka = kafka_container();
-        let server = format!("kafka://127.0.0.1:{}", kafka.get_host_port_ipv4(9092));
+        let server = format!("kafka://127.0.0.1:{}/logs", kafka.get_host_port_ipv4(9092));
 
         let uri: OwnedServiceUri = server.try_into().unwrap();
         let factory = KafkaLogFactory::default();
-        let client = factory.open_client(&uri.endpoint(), uri.params()).await.unwrap();
+        let client = factory.open_client(&uri).await.unwrap();
 
         let name = "xyz";
         client.create_log(name, ByteSize::mib(50)).await.unwrap();

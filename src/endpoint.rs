@@ -20,8 +20,9 @@ use std::fmt::{Display, Formatter, Write as _};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
-use anyhow::{anyhow, Error, Result};
+use anyhow::{anyhow, bail, Error, Result};
 use compact_str::{CompactString, ToCompactString};
+use either::Either;
 use hashbrown::Equivalent;
 use hashlink::LinkedHashMap;
 use uriparse::{Authority, Query, Scheme, SchemeError, Segment};
@@ -212,7 +213,61 @@ pub struct ResourceUri<'a> {
     path: &'a str,
 }
 
+pub struct ResourceUriIter {
+    uri: Option<OwnedResourceUri>,
+}
+
+impl ResourceUriIter {
+    /// Current resource uri.
+    ///
+    /// Panic if iter has been exhausted.
+    pub fn uri(&self) -> &OwnedResourceUri {
+        self.uri.as_ref().unwrap()
+    }
+}
+
+impl Iterator for ResourceUriIter {
+    type Item = OwnedResourceUri;
+
+    fn next(&mut self) -> Option<OwnedResourceUri> {
+        let uri = self.uri.take()?;
+        let endpoint = uri.endpoint();
+        let Some((server, _remainings)) = endpoint.split_once() else {
+            return Some(uri);
+        };
+        let mut parts =
+            UriParts { scheme: uri.scheme, address: server.address, path: uri.path, params: &Params::default() };
+        let str = parts.reshape();
+        // Safety: they are pointing to heap allocated string now.
+        let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
+        let server = OwnedResourceUri { str: Cow::Owned(str), scheme, address, path };
+        self.uri = Some(uri.strip_server(server.address));
+        Some(server)
+    }
+}
+
+impl OwnedResourceUri {
+    fn strip_server(self, server: &str) -> Self {
+        let mut parts = UriParts {
+            scheme: self.scheme,
+            address: &self.address[server.len() + 1..],
+            path: self.path,
+            params: &Params::default(),
+        };
+        let str = parts.reshape();
+        // Safety: they are pointing to heap allocated string now.
+        let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
+        Self { str: Cow::Owned(str), scheme, address, path }
+    }
+}
+
 impl<'a> ResourceUri<'a> {
+    /// # Safety
+    /// It is caller's duty to provide valid arguments.
+    pub const unsafe fn new_unchecked(str: Cow<'a, str>, scheme: &'a str, address: &'a str, path: &'a str) -> Self {
+        Self { str, scheme, address, path }
+    }
+
     pub fn scheme(&self) -> &'a str {
         self.scheme
     }
@@ -226,6 +281,23 @@ impl<'a> ResourceUri<'a> {
         self.path
     }
 
+    pub fn child_name(&self, child: &str) -> Result<String> {
+        if child.is_empty() {
+            bail!("child path is empty")
+        }
+        if child.starts_with('/') || child.ends_with('/') {
+            bail!("invalid child path: {}", child)
+        }
+        if self.path.is_empty() {
+            return Ok(child.to_string());
+        }
+        let mut s = String::with_capacity(self.path.len() + child.len());
+        s.push_str(&self.path[1..]);
+        s.push('/');
+        s.push_str(child);
+        Ok(s)
+    }
+
     /// Endpoint of the cluster this resource located in.
     pub fn endpoint(&self) -> Endpoint<'a> {
         Endpoint { scheme: self.scheme, address: self.address }
@@ -233,6 +305,31 @@ impl<'a> ResourceUri<'a> {
 
     pub fn as_str(&self) -> &str {
         &self.str
+    }
+
+    pub fn split(self) -> Either<Self, ResourceUriIter> {
+        if self.endpoint().split_once().is_none() {
+            return Either::Left(self);
+        }
+        let owned = self.into_owned();
+        Either::Right(ResourceUriIter { uri: Some(owned) })
+    }
+
+    pub fn parent(&self) -> Option<ResourceUri<'_>> {
+        if self.path.is_empty() {
+            return None;
+        }
+        let i = self.path.rfind('/').unwrap();
+        let uri =
+            UriParts { scheme: self.scheme, address: self.address, path: &self.path[..i], params: &Params::default() };
+        let n = uri.len();
+        let uri: UriParts<'static> = unsafe { uri.into_relocated(&self.str[..n]) };
+        Some(ResourceUri {
+            str: Cow::Borrowed(&self.str[0..n]),
+            scheme: uri.scheme,
+            address: uri.address,
+            path: uri.path,
+        })
     }
 
     pub fn to_owned(&self) -> OwnedResourceUri {
@@ -251,11 +348,16 @@ impl<'a> ResourceUri<'a> {
         ResourceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path }
     }
 
+    pub fn into_string(self) -> String {
+        match self.str {
+            Cow::Owned(str) => str,
+            Cow::Borrowed(str) => str.to_string(),
+        }
+    }
+
     pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
         let uri = ServiceUri::parse_named(name, str)?;
-        if uri.path().is_empty() {
-            return Err(anyhow!("{name} expect path: {uri}"));
-        } else if !uri.params().is_empty() {
+        if !uri.params().is_empty() {
             return Err(anyhow!("{name} expect no params: {uri}"));
         }
         Ok(Self { str: uri.str, scheme: uri.scheme, address: uri.address, path: uri.path })
@@ -395,6 +497,14 @@ impl<'a> UriParts<'a> {
 
     fn into(self) -> (&'a str, &'a str, &'a str) {
         (self.scheme, self.address, self.path)
+    }
+
+    fn len(&self) -> usize {
+        let mut n = self.scheme.len() + 3 + self.address.len() + self.path.len();
+        for (k, v) in self.params.map.iter() {
+            n += k.len() + v.len() + 2;
+        }
+        n
     }
 }
 
@@ -643,6 +753,12 @@ impl<'a> TryFrom<&'a str> for ServiceUri<'a> {
     }
 }
 
+impl<'a> From<ResourceUri<'a>> for ServiceUri<'a> {
+    fn from(uri: ResourceUri<'a>) -> Self {
+        Self { str: uri.str, scheme: uri.scheme, address: uri.address, path: uri.path, params: Params::default() }
+    }
+}
+
 fn split_param(s: &str) -> Option<(&str, &str)> {
     let (key, value) = match s.split_once('=') {
         None | Some(("", _)) | Some((_, "")) => return None,
@@ -780,9 +896,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "resource uri expect path")]
-    fn test_resource_uri_path() {
-        ResourceUri::try_from("scheme://address?key=value").unwrap();
+    fn test_resource_uri_no_path() {
+        ResourceUri::try_from("scheme://address").unwrap();
     }
 
     #[test]

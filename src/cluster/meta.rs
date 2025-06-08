@@ -1022,10 +1022,8 @@ mod tests {
         let log_factory = TestLogFactory::new("test");
         let mut log_registry = LogRegistry::default();
         log_registry.register(log_factory.clone()).unwrap();
-        let log_manager = log_registry
-            .into_manager(&Endpoint::try_from("test://test-cluster").unwrap(), &Default::default())
-            .await
-            .unwrap();
+        let log_manager =
+            log_registry.into_manager(&ServiceUri::try_from("test://test-cluster").unwrap()).await.unwrap();
         let log_manager = Arc::new(log_manager);
 
         let (nodes, _cluster_lease) =
