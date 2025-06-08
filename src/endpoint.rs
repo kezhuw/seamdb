@@ -200,19 +200,19 @@ impl Display for OwnedEndpoint {
     }
 }
 
-/// Owned version of [ResourceId].
-pub type OwnedResourceId = ResourceId<'static>;
+/// Owned version of [ResourceUri].
+pub type OwnedResourceUri = ResourceUri<'static>;
 
 /// Identify an resource in cluster.
 #[derive(Debug, Eq)]
-pub struct ResourceId<'a> {
+pub struct ResourceUri<'a> {
     str: Cow<'a, str>,
     scheme: &'a str,
     address: &'a str,
     path: &'a str,
 }
 
-impl<'a> ResourceId<'a> {
+impl<'a> ResourceUri<'a> {
     pub fn scheme(&self) -> &'a str {
         self.scheme
     }
@@ -235,11 +235,11 @@ impl<'a> ResourceId<'a> {
         &self.str
     }
 
-    pub fn to_owned(&self) -> OwnedResourceId {
+    pub fn to_owned(&self) -> OwnedResourceUri {
         self.clone().into_owned()
     }
 
-    pub fn into_owned(self) -> OwnedResourceId {
+    pub fn into_owned(self) -> OwnedResourceUri {
         let str = match &self.str {
             // Safety: invariant: `str` is owned only for static endpoint.
             Cow::Owned(_) => return unsafe { std::mem::transmute(self) },
@@ -248,10 +248,10 @@ impl<'a> ResourceId<'a> {
         let uri = UriParts { scheme: self.scheme, address: self.address, path: self.path, params: &Params::default() };
         // Safety: `str` is heap allocated.
         let uri: UriParts<'static> = unsafe { uri.into_relocated(&str) };
-        ResourceId { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path }
+        ResourceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path }
     }
 
-    pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceId<'a>> {
+    pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
         let uri = ServiceUri::parse(str)?;
         if uri.path().len() <= 1 {
             return Err(anyhow!("{name} expect path: {uri}"));
@@ -276,7 +276,7 @@ impl<'a> ResourceId<'a> {
     }
 }
 
-impl Deref for ResourceId<'_> {
+impl Deref for ResourceUri<'_> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -284,7 +284,7 @@ impl Deref for ResourceId<'_> {
     }
 }
 
-impl Clone for ResourceId<'_> {
+impl Clone for ResourceUri<'_> {
     fn clone(&self) -> Self {
         match self.str {
             Cow::Borrowed(str) => {
@@ -306,38 +306,38 @@ impl Clone for ResourceId<'_> {
     }
 }
 
-impl PartialEq<Self> for ResourceId<'_> {
+impl PartialEq<Self> for ResourceUri<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.str.as_ref() == other.str.as_ref()
     }
 }
 
-impl PartialEq<str> for ResourceId<'_> {
+impl PartialEq<str> for ResourceUri<'_> {
     fn eq(&self, other: &str) -> bool {
         self.str.as_ref() == other
     }
 }
 
-impl PartialEq<&str> for ResourceId<'_> {
+impl PartialEq<&str> for ResourceUri<'_> {
     fn eq(&self, other: &&str) -> bool {
         self.str.as_ref() == *other
     }
 }
 
-impl Hash for ResourceId<'_> {
+impl Hash for ResourceUri<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str().hash(state)
     }
 }
 
-impl Equivalent<ResourceId<'_>> for str {
-    fn equivalent(&self, key: &ResourceId<'_>) -> bool {
+impl Equivalent<ResourceUri<'_>> for str {
+    fn equivalent(&self, key: &ResourceUri<'_>) -> bool {
         key == self
     }
 }
 
-impl From<ResourceId<'_>> for String {
-    fn from(uri: ResourceId<'_>) -> String {
+impl From<ResourceUri<'_>> for String {
+    fn from(uri: ResourceUri<'_>) -> String {
         match uri.str {
             Cow::Borrowed(str) => str.to_owned(),
             Cow::Owned(str) => str,
@@ -345,15 +345,15 @@ impl From<ResourceId<'_>> for String {
     }
 }
 
-impl<'a> TryFrom<&'a str> for ResourceId<'a> {
+impl<'a> TryFrom<&'a str> for ResourceUri<'a> {
     type Error = Error;
 
-    fn try_from(s: &'a str) -> Result<ResourceId<'a>> {
-        Self::parse_named("resource id", s)
+    fn try_from(s: &'a str) -> Result<ResourceUri<'a>> {
+        Self::parse_named("resource uri", s)
     }
 }
 
-impl Display for ResourceId<'_> {
+impl Display for ResourceUri<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.write_str(self.as_str())
     }
@@ -491,9 +491,9 @@ impl<'a> ServiceUri<'a> {
         Endpoint { scheme: self.scheme(), address: self.address() }
     }
 
-    pub fn resource_id(&self) -> ResourceId<'_> {
+    pub fn resource(&self) -> ResourceUri<'_> {
         let len = self.scheme.len() + 3 + self.address.len() + self.path.len();
-        ResourceId {
+        ResourceUri {
             str: Cow::Borrowed(&self.str.as_ref()[..len]),
             scheme: self.scheme(),
             address: self.address(),
@@ -501,12 +501,12 @@ impl<'a> ServiceUri<'a> {
         }
     }
 
-    pub fn parts(&self) -> (ResourceId<'_>, &Params<'_>) {
-        (self.resource_id(), self.params())
+    pub fn parts(&self) -> (ResourceUri<'_>, &Params<'_>) {
+        (self.resource(), self.params())
     }
 
     pub fn with_path(self, path: &str) -> Result<OwnedServiceUri> {
-        if !ResourceId::is_valid_path(path) {
+        if !ResourceUri::is_valid_path(path) {
             return Err(anyhow!("invalid path {path} for service uri"));
         }
         let params = self.params.into_owned();
@@ -569,7 +569,7 @@ impl<'a> ServiceUri<'a> {
             Some((path, trailing)) => (path, Some(trailing)),
             None => (trailing, None),
         };
-        if !ResourceId::is_valid_path(path) {
+        if !ResourceUri::is_valid_path(path) {
             return Err(anyhow!("invalid path in service uri: {}", s));
         }
 
@@ -776,52 +776,52 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "resource id expect path")]
-    fn test_resource_id_path() {
-        ResourceId::try_from("scheme://address?key=value").unwrap();
+    #[should_panic(expected = "resource uri expect path")]
+    fn test_resource_uri_path() {
+        ResourceUri::try_from("scheme://address?key=value").unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "resource id expect no params")]
-    fn test_resource_id_no_params() {
-        ResourceId::try_from("scheme://address/path?key=value").unwrap();
+    #[should_panic(expected = "resource uri expect no params")]
+    fn test_resource_uri_no_params() {
+        ResourceUri::try_from("scheme://address/path?key=value").unwrap();
     }
 
     #[test]
-    fn test_resource_id_ok() {
-        ResourceId::try_from("scheme://address/path").unwrap();
+    fn test_resource_uri_ok() {
+        ResourceUri::try_from("scheme://address/path").unwrap();
     }
 
     #[test]
-    fn test_resource_id_equal() {
+    fn test_resource_uri_equal() {
         let str = "scheme://address,host1:9999,127.0.0.1/path";
-        let resource_id = ResourceId::try_from(str).unwrap();
-        let owned_resource_id = resource_id.to_owned();
-        assert_eq!(resource_id, str);
-        assert_eq!(resource_id, *str);
-        assert_eq!(owned_resource_id, str);
-        assert_eq!(owned_resource_id, *str);
-        assert_eq!(owned_resource_id, resource_id);
-        assert_eq!(resource_id.endpoint().to_string(), "scheme://address,host1:9999,127.0.0.1");
+        let resource_uri = ResourceUri::try_from(str).unwrap();
+        let owned_resource_uri = resource_uri.to_owned();
+        assert_eq!(resource_uri, str);
+        assert_eq!(resource_uri, *str);
+        assert_eq!(owned_resource_uri, str);
+        assert_eq!(owned_resource_uri, *str);
+        assert_eq!(owned_resource_uri, resource_uri);
+        assert_eq!(resource_uri.endpoint().to_string(), "scheme://address,host1:9999,127.0.0.1");
 
-        assert_eq!(resource_id.hash_code(), str.hash_code());
-        assert_eq!(owned_resource_id.hash_code(), str.hash_code());
+        assert_eq!(resource_uri.hash_code(), str.hash_code());
+        assert_eq!(owned_resource_uri.hash_code(), str.hash_code());
     }
 
     #[test]
-    fn test_resource_id_hashmap() {
+    fn test_resource_uri_hashmap() {
         let str = "scheme://address/path";
-        let uri = ResourceId::try_from(str).unwrap();
+        let uri = ResourceUri::try_from(str).unwrap();
         let mut map = HashMap::new();
         map.insert(uri, "v1");
         assert_that!(map.get(str).cloned()).is_equal_to(Some("v1"));
     }
 
     #[test]
-    fn test_service_resource_id() {
-        let resource_id = ResourceId::try_from("scheme://address,host1:9999,127.0.0.1/path").unwrap();
-        let service_uri: ServiceUri = format!("{}?key1=value1", resource_id).try_into().unwrap();
-        assert_eq!(service_uri.resource_id(), resource_id);
+    fn test_service_resource_uri() {
+        let resource_uri = ResourceUri::try_from("scheme://address,host1:9999,127.0.0.1/path").unwrap();
+        let service_uri: ServiceUri = format!("{}?key1=value1", resource_uri).try_into().unwrap();
+        assert_eq!(service_uri.resource(), resource_uri);
     }
 
     #[test_case("://localhost/path"; "")]
@@ -890,7 +890,7 @@ mod tests {
         assert_eq!(owned_uri, *str);
         assert_eq!(owned_uri, uri);
         assert_eq!(uri.endpoint(), "scheme://server1,server2:9090");
-        assert_eq!(uri.resource_id(), "scheme://server1,server2:9090/path/xyz");
+        assert_eq!(uri.resource(), "scheme://server1,server2:9090/path/xyz");
 
         assert_eq!(uri.hash_code(), str.hash_code());
         assert_eq!(owned_uri.hash_code(), str.hash_code());

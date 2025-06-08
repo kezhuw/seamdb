@@ -383,9 +383,9 @@ impl EtcdClusterMetaDaemon {
         uri: ServiceUri<'_>,
         env: ClusterEnv,
     ) -> Result<Box<dyn ClusterMetaHandle>> {
-        let (resource_id, params) = uri.parts();
-        let etcd = EtcdHelper::connect(resource_id.endpoint(), params).await?;
-        let client = EtcdClusterClient { name: name.into(), root: resource_id.path().to_compact_string(), etcd };
+        let (resource_uri, params) = uri.parts();
+        let etcd = EtcdHelper::connect(resource_uri.endpoint(), params).await?;
+        let client = EtcdClusterClient { name: name.into(), root: resource_uri.path().to_compact_string(), etcd };
         let (drop_owner, mut drop_watcher) = utils::drop_watcher();
         let mut daemon = EtcdClusterMetaDaemon { env, client: client.clone() };
         let handle = tokio::spawn(async move {
@@ -710,10 +710,10 @@ pub struct ClusterDeploymentWatcher {
 
 impl ClusterDeploymentWatcher {
     pub async fn new(uri: ServiceUri<'_>, timeout: Option<Duration>) -> Result<ClusterDeploymentWatcher> {
-        let (resource_id, params) = uri.parts();
-        let etcd = EtcdHelper::connect(resource_id.endpoint(), params).await?;
+        let (resource_uri, params) = uri.parts();
+        let etcd = EtcdHelper::connect(resource_uri.endpoint(), params).await?;
         let mut client =
-            EtcdClusterClient { name: Default::default(), root: resource_id.path().to_compact_string(), etcd };
+            EtcdClusterClient { name: Default::default(), root: resource_uri.path().to_compact_string(), etcd };
         client.watch_deployment(timeout).await
     }
 

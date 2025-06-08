@@ -305,10 +305,10 @@ impl EtcdNodeRegistry {
         node: NodeId,
         addr: Option<OwnedEndpoint>,
     ) -> Result<(Arc<dyn NodeRegistry>, Box<dyn NodeLease>)> {
-        let (resource_id, params) = uri.parts();
-        let mut client = EtcdHelper::connect(resource_id.endpoint(), params).await?;
+        let (resource_uri, params) = uri.parts();
+        let mut client = EtcdHelper::connect(resource_uri.endpoint(), params).await?;
 
-        let tree = format!("{}/nodes/", resource_id.path());
+        let tree = format!("{}/nodes/", resource_uri.path());
         let ((nodes, revision), lease) = if let Some(addr) = addr {
             let lease = EtcdHelper::grant_lease(&mut client, None).await?;
             let header = Self::register_node(&mut client, lease.id(), &tree, &node, addr.as_ref()).await?;

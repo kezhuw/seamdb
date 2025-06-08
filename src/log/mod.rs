@@ -29,14 +29,14 @@ use compact_str::CompactString;
 pub use self::kafka::KafkaLogFactory;
 pub use self::manager::{LogManager, LogRegistry};
 pub use self::memory::MemoryLogFactory;
-use super::endpoint::{Endpoint, Params, ResourceId};
+use super::endpoint::{Endpoint, Params, ResourceUri};
 
 pub type OwnedLogAddress = LogAddress<'static>;
 
 /// Address to a log.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LogAddress<'a> {
-    uri: ResourceId<'a>,
+    uri: ResourceUri<'a>,
 }
 
 impl<'a> TryFrom<&'a str> for LogAddress<'a> {
@@ -75,15 +75,15 @@ impl From<LogAddress<'_>> for String {
 
 impl<'a> LogAddress<'a> {
     pub fn new(str: impl Into<Cow<'a, str>>) -> Result<Self> {
-        let uri = ResourceId::parse_named("log address", str)?;
+        let uri = ResourceUri::parse_named("log address", str)?;
         if unsafe { uri.path().get_unchecked(1..) }.find('/').is_some() {
             bail!("log address invalid log name: {uri}")
         }
-        let uri: ResourceId<'a> = unsafe { std::mem::transmute(uri) };
+        let uri: ResourceUri<'a> = unsafe { std::mem::transmute(uri) };
         Ok(Self { uri })
     }
 
-    pub fn uri(&self) -> &ResourceId<'_> {
+    pub fn uri(&self) -> &ResourceUri<'_> {
         &self.uri
     }
 
