@@ -403,7 +403,7 @@ async fn scan_table_internally(
     };
     let mut builder = ClusteredRowBuilder::new(schema.fields.clone(), &table.descriptor, primary_index);
     loop {
-        let (resume_key, rows) = client.scan(&start, &index_end, 0).await?;
+        let (resume_key, rows) = client.scan(start.into(), index_end.as_slice().into(), 0).await?;
         if !rows.is_empty() {
             for row in rows {
                 builder.add_row(row);

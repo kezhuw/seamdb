@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use bytes::{Buf, BufMut};
 use tracing::trace;
 
 use super::error::SqlError;
-use crate::kv::{KvClient, KvError, KvSemantics, LazyInitTimestampedKvClient};
+use crate::kv::{KvClient, KvError, KvSemantics, LazyInitTimestampedKvClient, SharedKvClient};
 use crate::protos::{
     ColumnDescriptor,
     ColumnTypeKind,
@@ -41,7 +42,7 @@ use crate::txn::LazyInitTxn;
 #[derive(Clone)]
 pub struct SqlClient {
     semantics: KvSemantics,
-    client: Arc<dyn KvClient>,
+    client: SharedKvClient,
 }
 
 impl SqlClient {
@@ -49,13 +50,14 @@ impl SqlClient {
         match (semantics, client.semantics()) {
             (KvSemantics::Inconsistent, KvSemantics::Inconsistent)
             | (KvSemantics::Snapshot, KvSemantics::Snapshot)
-            | (KvSemantics::Transactional, KvSemantics::Transactional) => Self { semantics, client },
-            (KvSemantics::Inconsistent, _) => Self { semantics, client: Arc::new(client.client().clone()) },
-            (KvSemantics::Snapshot, _) => {
-                Self { semantics, client: Arc::new(LazyInitTimestampedKvClient::new(client.client().clone())) }
+            | (KvSemantics::Transactional, KvSemantics::Transactional) => Self { semantics, client: client.into() },
+            (KvSemantics::Inconsistent, _) => Self { semantics, client: SharedKvClient::new(client.client().clone()) },
+            (KvSemantics::Snapshot, _) => Self {
+                semantics,
+                client: SharedKvClient::new(LazyInitTimestampedKvClient::new(client.client().clone())),
             },
             (KvSemantics::Transactional, _) => {
-                Self { semantics, client: Arc::new(LazyInitTxn::new(client.client().clone())) }
+                Self { semantics, client: SharedKvClient::new(LazyInitTxn::new(client.client().clone())) }
             },
         }
     }
@@ -69,7 +71,7 @@ impl SqlClient {
             trace!("insert row: {row:?}");
             for index in table.indices.iter() {
                 let (key, value) = row.index_kv(table, index);
-                self.client.put(&key, Some(Value::Bytes(value)), Some(Timestamp::default())).await?;
+                self.client.put(key, Some(Value::Bytes(value)), Some(Timestamp::default())).await?;
             }
         }
         Ok(self.client.commit().await?)
@@ -117,7 +119,7 @@ impl SqlClient {
         database_row.add_column(Column::with_value(table.parent_id_column().id, ColumnValue::Int64(0)));
         database_row.add_column(Column::with_value(table.name_column().id, ColumnValue::String(name.clone())));
         let name_key = database_row.index_key(table.descriptor(), table.naming_index());
-        if let Some((timestamp, value)) = self.get(&name_key).await? {
+        if let Some((timestamp, value)) = self.get(name_key.as_slice().into()).await? {
             let id = decode_serial_primary_value(table.descriptor(), table.id_column(), &value)?;
             return Ok(DatabaseDescriptor { id, name, timestamp });
         }
@@ -127,7 +129,7 @@ impl SqlClient {
         let serial_id_key = table.serial_id_key();
 
         loop {
-            if let Some((timestamp, value)) = self.get(&name_key).await? {
+            if let Some((timestamp, value)) = self.get(name_key.as_slice().into()).await? {
                 if !if_not_exists {
                     return Err(SqlError::DatabaseAlreadyExists(name));
                 }
@@ -177,9 +179,9 @@ impl SqlClient {
             bytes
         };
         loop {
-            let (resume_key, rows) = self.scan(&start, &end, 0).await?;
+            let (resume_key, rows) = self.scan(start.into(), end.as_slice().into(), 0).await?;
             for row in rows {
-                self.put(&row.key, None, None).await?;
+                self.put(row.key.into(), None, None).await?;
             }
             if resume_key.is_empty() || resume_key >= end {
                 break;
@@ -207,7 +209,7 @@ impl SqlClient {
         row.add_column(Column::with_value(table.name_column().id, ColumnValue::String(name.clone())));
         row.add_column(Column::with_value(table.descriptor_column().id, ColumnValue::Bytes(blob)));
         let name_key = row.index_key(table.descriptor(), table.naming_index());
-        if let Some((timestamp, value)) = self.get(&name_key).await? {
+        if let Some((timestamp, value)) = self.get(name_key.as_slice().into()).await? {
             if if_not_exists {
                 let id = decode_serial_primary_value(table.descriptor(), table.id_column(), &value)?;
                 return Ok((false, id, timestamp));
@@ -216,7 +218,7 @@ impl SqlClient {
         }
 
         loop {
-            if let Some((timestamp, value)) = self.get(&name_key).await? {
+            if let Some((timestamp, value)) = self.get(name_key.as_slice().into()).await? {
                 if !if_not_exists {
                     return Err(SqlError::DatabaseAlreadyExists(name));
                 }
@@ -251,7 +253,7 @@ impl SqlClient {
                     continue;
                 } else if column_descriptor.serial {
                     let key = table.serial_key(column_descriptor);
-                    let incremented = self.increment(&key, 1).await?;
+                    let incremented = self.increment(key.into(), 1).await?;
                     let value = match column_descriptor.type_kind {
                         ColumnTypeKind::Int16 => {
                             if incremented > i16::MAX as i64 {
@@ -296,7 +298,7 @@ impl SqlClient {
         database_row: &mut Row,
         schema_row: &mut Row,
     ) -> Result<(), SqlError> {
-        let incremented = self.increment(serial_id_key, 2).await?;
+        let incremented = self.increment(serial_id_key.into(), 2).await?;
         let database_id = incremented - 1;
         let schema_id = incremented;
         database_row.add_column(Column::with_value(table.id_column().id, ColumnValue::Int64(database_id)));
@@ -320,7 +322,7 @@ impl SqlClient {
         let index = table.naming_index();
 
         let key = row.index_key(table.descriptor(), index);
-        let Some((ts, value)) = self.get(&key).await? else {
+        let Some((ts, value)) = self.get(key.as_slice().into()).await? else {
             return Ok(None);
         };
         let (id, name, blob) = table.decode_columns(index, TimestampedKeyValue { timestamp: ts, key, value });
@@ -340,7 +342,7 @@ impl SqlClient {
         let KeyRange { mut start, end } = row.index_range(table.descriptor(), index);
         let mut descriptors = Vec::new();
         loop {
-            let (resume_key, rows) = self.scan(&start, &end, 0).await?;
+            let (resume_key, rows) = self.scan(start.into(), end.as_slice().into(), 0).await?;
             for row in rows {
                 let timestamp = row.timestamp;
                 let (id, name, blob) = table.decode_columns(index, row);
@@ -366,19 +368,29 @@ impl KvClient for SqlClient {
         self.semantics
     }
 
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>, KvError> {
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>, KvError> {
         self.client.get(key).await
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>), KvError> {
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>), KvError> {
         self.client.scan(start, end, limit).await
     }
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp, KvError> {
+    async fn put(
+        &self,
+        key: Cow<'_, [u8]>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp, KvError> {
         self.client.put(key, value, expect_ts).await
     }
 
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64, KvError> {
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64, KvError> {
         self.client.increment(key, increment).await
     }
 

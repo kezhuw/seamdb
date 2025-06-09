@@ -363,20 +363,25 @@ impl KvClient for LazyInitTxn {
         KvSemantics::Transactional
     }
 
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
-        self.txn(key).get(key).await
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>> {
+        self.txn(&key).get(key).await
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
-        self.txn(start).scan(start, end, limit).await
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        self.txn(&start).scan(start, end, limit).await
     }
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
-        self.txn(key).put(key, value, expect_ts).await
+    async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+        self.txn(&key).put(key, value, expect_ts).await
     }
 
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
-        self.txn(key).increment(key, increment).await
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64> {
+        self.txn(&key).increment(key, increment).await
     }
 
     async fn commit(&self) -> Result<Timestamp> {
@@ -485,9 +490,9 @@ impl KvClient for Txn {
         KvSemantics::Transactional
     }
 
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>> {
         let (sequence, txn, mut notified) = self.txn.read()?;
-        let mut get = self.client.get_directly(txn.into(), key, sequence);
+        let mut get = self.client.get_directly(txn.into(), key.clone(), sequence);
         let mut get = pin!(get);
         loop {
             select! {
@@ -508,9 +513,14 @@ impl KvClient for Txn {
         }
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         let (_sequence, txn, mut notified) = self.txn.read()?;
-        let mut scan = self.client.scan_directly(txn.into(), start, end, limit);
+        let mut scan = self.client.scan_directly(txn.into(), start.clone(), end.clone(), limit);
         let mut scan = pin!(scan);
         loop {
             select! {
@@ -527,10 +537,10 @@ impl KvClient for Txn {
                             Err(KvError::unexpected("txn scan receives no response"))
                         },
                         Some((resume_key, rows)) => {
-                            if resume_key.is_empty() || resume_key.as_slice() >= end {
-                                self.txn.update_scan(&txn, start, end)?;
+                            if resume_key.is_empty() || resume_key.as_slice() >= end.as_ref() {
+                                self.txn.update_scan(&txn, start.as_ref(), end.as_ref())?;
                             } else {
-                                self.txn.update_scan(&txn, start, &resume_key)?;
+                                self.txn.update_scan(&txn, start.as_ref(), &resume_key)?;
                             }
                             Ok((resume_key, rows))
                         }
@@ -540,9 +550,9 @@ impl KvClient for Txn {
         }
     }
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+    async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
         let (sequence, txn, mut notified) = self.txn.write()?;
-        let mut put = self.client.put_directly(txn.into(), key, value, expect_ts, sequence);
+        let mut put = self.client.put_directly(txn.into(), key.clone(), value, expect_ts, sequence);
         let mut put = pin!(put);
         loop {
             select! {
@@ -553,7 +563,7 @@ impl KvClient for Txn {
                         Temporal::Transaction(txn) => txn,
                         Temporal::Timestamp(ts) => return Err(KvError::unexpected(format!("txn put received timestamp piggybacked temporal {ts}"))),
                     };
-                    self.txn.update_write(&txn, key)?;
+                    self.txn.update_write(&txn, key.as_ref())?;
                     return match response {
                         None => return Err(KvError::unexpected("txn put receives no response")),
                         Some(ts) => Ok(ts),
@@ -563,9 +573,9 @@ impl KvClient for Txn {
         }
     }
 
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64> {
         let (sequence, txn, mut notified) = self.txn.write()?;
-        let mut increment = self.client.increment_directly(txn.into(), key, increment, sequence);
+        let mut increment = self.client.increment_directly(txn.into(), key.clone(), increment, sequence);
         let mut increment = pin!(increment);
         loop {
             select! {
@@ -627,7 +637,7 @@ mod tests {
     use crate::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
     use crate::endpoint::Endpoint;
     use crate::keys;
-    use crate::kv::KvClient;
+    use crate::kv::KvClientExt;
     use crate::log::{LogManager, MemoryLogFactory};
     use crate::protos::{TxnStatus, Value};
     use crate::tablet::{TabletClient, TabletNode};
@@ -657,12 +667,12 @@ mod tests {
 
         client.put(keys::user_key(b"counter1"), Some(Value::Int(1)), None).await.unwrap();
 
-        let txn = Txn::new(client.clone(), keys::user_key(b"counter1"));
+        let txn = Txn::new(client.clone(), keys::user_key(b"counter1")).wrapped();
         txn.put(&keys::system_key(b"counter0"), Some(Value::Int(10)), None).await.unwrap();
         txn.put(&keys::user_key(b"counter1"), None, None).await.unwrap();
         txn.increment(&keys::user_key(b"counter2"), 100).await.unwrap();
         txn.commit().await.unwrap();
-        let commit_ts = txn.txn().commit_ts();
+        let commit_ts = txn.wrapped().txn().commit_ts();
 
         assert_that!(client.get(keys::system_key(b"counter0")).await.unwrap().unwrap())
             .is_equal_to((commit_ts, Value::Int(10)));
@@ -695,19 +705,19 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let counter_key = keys::user_key(b"counter");
-        let txn = Txn::new(client.clone(), counter_key.clone());
+        let txn = Txn::new(client.clone(), counter_key.clone()).wrapped();
 
         assert!(client.get(&counter_key).await.unwrap().is_none());
 
-        let write_ts = txn.txn().commit_ts();
+        let write_ts = txn.wrapped().txn().commit_ts();
         txn.put(&counter_key, Some(Value::Int(1)), None).await.unwrap();
-        let written_ts = txn.txn().commit_ts();
+        let written_ts = txn.wrapped().txn().commit_ts();
         assert_that!(written_ts).is_greater_than(write_ts);
 
         txn.commit().await.unwrap();
 
         let (read_ts, read_value) = client.get(counter_key).await.unwrap().unwrap();
-        assert_that!(read_ts).is_equal_to(txn.txn().commit_ts());
+        assert_that!(read_ts).is_equal_to(txn.wrapped().txn().commit_ts());
         assert_that!(read_value).is_equal_to(Value::Int(1));
     }
 
@@ -735,7 +745,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let counter_key = keys::user_key(b"counter");
-        let txn = Txn::new(client.clone(), counter_key.clone());
+        let txn = Txn::new(client.clone(), counter_key.clone()).wrapped();
 
         let tablet_id_counter_key = keys::system_key(b"tablet-id-counter");
 
@@ -743,19 +753,19 @@ mod tests {
 
         client.increment(&tablet_id_counter_key, 100).await.unwrap();
 
-        txn.bump_commit_ts();
+        txn.wrapped().bump_commit_ts();
         txn.put(&counter_key, Some(tablet_id_value), None).await.unwrap();
         eprintln!("EEEE: {:?}", txn.commit().await.unwrap_err());
 
         // Same to above except no write-to-read.
         let (_ts, tablet_id_value) = txn.get(&tablet_id_counter_key).await.unwrap().unwrap();
 
-        txn.bump_commit_ts();
+        txn.wrapped().bump_commit_ts();
         txn.put(&counter_key, Some(tablet_id_value.clone()), None).await.unwrap();
         txn.commit().await.unwrap();
 
         let (ts, value) = client.get(counter_key).await.unwrap().unwrap();
-        assert_that!(ts).is_equal_to(txn.txn().commit_ts());
+        assert_that!(ts).is_equal_to(txn.wrapped().txn().commit_ts());
         assert_that!(value).is_equal_to(tablet_id_value);
     }
 
@@ -782,13 +792,13 @@ mod tests {
         let client = TabletClient::new(cluster_env).scope(keys::USER_KEY_PREFIX);
         tokio::time::sleep(Duration::from_secs(20)).await;
 
-        let txn = Txn::new(client.clone(), b"counter".to_vec());
+        let txn = Txn::new(client.clone(), b"counter".to_vec()).wrapped();
         let mut write = false;
         let sum = 'sum: loop {
             let mut sum = 0;
             let mut start = Cow::Borrowed(b"counter".as_slice());
             while !start.is_empty() {
-                let (resume_key, rows) = txn.scan(start.as_ref(), b"countes", 0).await.unwrap();
+                let (resume_key, rows) = txn.scan(start, b"countes", 0).await.unwrap();
                 for row in rows {
                     if let Value::Int(v) = row.value {
                         sum += v;
@@ -800,7 +810,7 @@ mod tests {
                     client.increment(b"counter1", 100).await.unwrap();
                     write = true;
                 }
-                txn.bump_commit_ts();
+                txn.wrapped().bump_commit_ts();
                 match txn.commit().await {
                     Ok(_) => break 'sum sum,
                     Err(_) => continue,
@@ -834,16 +844,16 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let key = b"counter";
-        let txn = Txn::new(client.clone(), key.to_vec());
+        let txn = Txn::new(client.clone(), key.to_vec()).wrapped();
 
         txn.put(key, Some(Value::Int(1)), None).await.unwrap();
 
-        let commit_ts = txn.txn().commit_ts();
+        let commit_ts = txn.wrapped().txn().commit_ts();
         tokio::time::sleep(Duration::from_secs(30)).await;
         txn.commit().await.unwrap();
 
-        assert_that!(txn.txn().status).is_equal_to(TxnStatus::Committed);
-        assert_that!(txn.txn().commit_ts()).is_greater_than(commit_ts);
+        assert_that!(txn.wrapped().txn().status).is_equal_to(TxnStatus::Committed);
+        assert_that!(txn.wrapped().txn().commit_ts()).is_greater_than(commit_ts);
     }
 
     #[test_log::test(tokio::test)]
@@ -870,7 +880,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         let key = keys::user_key(b"counter");
-        let txn = Txn::new(client.clone(), key.clone());
+        let txn = Txn::new(client.clone(), key.clone()).wrapped();
         txn.put(&key, Some(Value::Int(1)), None).await.unwrap();
         txn.abort().await.unwrap();
 

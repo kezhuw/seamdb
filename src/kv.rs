@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use lazy_init::Lazy;
 use thiserror::Error;
 
@@ -109,11 +112,16 @@ pub enum KvSemantics {
 
 #[async_trait::async_trait]
 pub trait KvClient: Send + Sync {
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>>;
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)>;
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>>;
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)>;
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp>;
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64>;
+    async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp>;
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64>;
 
     fn client(&self) -> &TabletClient;
 
@@ -132,6 +140,146 @@ pub trait KvClient: Send + Sync {
     }
 }
 
+pub trait KvClientExt: KvClient {
+    fn shared(self) -> SharedKvClient
+    where
+        Self: Sized + 'static, {
+        let client: Arc<dyn KvClient> = Arc::new(self);
+        SharedKvClient::from(client)
+    }
+
+    fn wrapped(self) -> WrappedKvClient<Self>
+    where
+        Self: Sized, {
+        WrappedKvClient::new(self)
+    }
+}
+
+impl<T> KvClientExt for T where T: KvClient {}
+
+pub struct WrappedKvClient<T> {
+    client: T,
+}
+
+impl<T: KvClient> WrappedKvClient<T> {
+    fn new(client: T) -> Self {
+        Self { client }
+    }
+
+    pub fn wrapped(&self) -> &T {
+        &self.client
+    }
+
+    pub async fn get(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
+        self.client.get(key.into()).await
+    }
+
+    pub async fn scan(
+        &self,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        self.client.scan(start.into(), end.into(), limit).await
+    }
+
+    pub async fn put(
+        &self,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
+        self.client.put(key.into(), value, expect_ts).await
+    }
+
+    pub async fn increment(&self, key: impl Into<Cow<'_, [u8]>>, increment: i64) -> Result<i64> {
+        self.client.increment(key.into(), increment).await
+    }
+
+    pub fn client(&self) -> &TabletClient {
+        self.client.client()
+    }
+
+    pub fn semantics(&self) -> KvSemantics {
+        self.client.semantics()
+    }
+
+    pub async fn commit(&self) -> Result<Timestamp> {
+        self.client.commit().await
+    }
+
+    pub async fn abort(&self) -> Result<()> {
+        self.client.abort().await
+    }
+
+    pub fn restart(&self) -> Result<()> {
+        self.client.restart()
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedKvClient {
+    client: Arc<dyn KvClient>,
+}
+
+impl From<Arc<dyn KvClient>> for SharedKvClient {
+    fn from(client: Arc<dyn KvClient>) -> Self {
+        Self { client }
+    }
+}
+
+impl SharedKvClient {
+    pub fn new<T: KvClient + 'static>(client: T) -> Self {
+        Self { client: Arc::new(client) }
+    }
+
+    pub async fn get(&self, key: impl Into<Cow<'_, [u8]>>) -> Result<Option<(Timestamp, Value)>> {
+        self.client.get(key.into()).await
+    }
+
+    pub async fn scan(
+        &self,
+        start: impl Into<Cow<'_, [u8]>>,
+        end: impl Into<Cow<'_, [u8]>>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+        self.client.scan(start.into(), end.into(), limit).await
+    }
+
+    pub async fn put(
+        &self,
+        key: impl Into<Cow<'_, [u8]>>,
+        value: Option<Value>,
+        expect_ts: Option<Timestamp>,
+    ) -> Result<Timestamp> {
+        self.client.put(key.into(), value, expect_ts).await
+    }
+
+    pub async fn increment(&self, key: impl Into<Cow<'_, [u8]>>, increment: i64) -> Result<i64> {
+        self.client.increment(key.into(), increment).await
+    }
+
+    pub fn client(&self) -> &TabletClient {
+        self.client.client()
+    }
+
+    pub fn semantics(&self) -> KvSemantics {
+        self.client.semantics()
+    }
+
+    pub async fn commit(&self) -> Result<Timestamp> {
+        self.client.commit().await
+    }
+
+    pub async fn abort(&self) -> Result<()> {
+        self.client.abort().await
+    }
+
+    pub fn restart(&self) -> Result<()> {
+        self.client.restart()
+    }
+}
+
 #[async_trait::async_trait]
 impl KvClient for TabletClient {
     fn client(&self) -> &TabletClient {
@@ -142,28 +290,33 @@ impl KvClient for TabletClient {
         KvSemantics::Inconsistent
     }
 
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>> {
         match self.get_directly(Temporal::default(), key, 0).await? {
             (_temporal, None) => Err(KvError::unexpected("timestamp get get no response")),
             (_temporal, Some(response)) => Ok(response.value.map(|v| v.into_parts())),
         }
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         match self.scan_directly(Temporal::default(), start, end, limit).await? {
             (_temporal, None) => Err(KvError::unexpected("no scan response")),
             (_temporal, Some(response)) => Ok(response),
         }
     }
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+    async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
         match self.put_directly(Temporal::default(), key, value, expect_ts, 0).await? {
             (_temporal, None) => Err(KvError::unexpected("timestamp put get aborted")),
             (_temporal, Some(write_ts)) => Ok(write_ts),
         }
     }
 
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64> {
         match self.increment_directly(Temporal::default(), key, increment, 0).await? {
             (_temporal, None) => Err(KvError::unexpected("timestamp increment get aborted")),
             (_temporal, Some(incremented)) => Ok(incremented),
@@ -196,19 +349,24 @@ impl KvClient for LazyInitTimestampedKvClient {
         KvSemantics::Snapshot
     }
 
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>> {
         self.client().get(key).await
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         self.client().scan(start, end, limit).await
     }
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+    async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
         self.client().put(key, value, expect_ts).await
     }
 
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64> {
         self.client().increment(key, increment).await
     }
 }
@@ -234,28 +392,33 @@ impl KvClient for TimestampedKvClient {
         KvSemantics::Snapshot
     }
 
-    async fn get(&self, key: &[u8]) -> Result<Option<(Timestamp, Value)>> {
+    async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>> {
         match self.client.get_directly(self.timestamp.into(), key, 0).await? {
             (_temporal, None) => Err(KvError::unexpected("timestamp get get no response")),
             (_temporal, Some(response)) => Ok(response.value.map(|r| r.into_parts())),
         }
     }
 
-    async fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
+    async fn scan(
+        &self,
+        start: Cow<'_, [u8]>,
+        end: Cow<'_, [u8]>,
+        limit: u32,
+    ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         match self.client.scan_directly(self.timestamp.into(), start, end, limit).await? {
             (_temporal, None) => Err(KvError::unexpected("no scan response")),
             (_temporal, Some(response)) => Ok(response),
         }
     }
 
-    async fn put(&self, key: &[u8], value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
+    async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
         match self.client.put_directly(self.timestamp.into(), key, value, expect_ts, 0).await? {
             (_temporal, None) => Err(KvError::unexpected("timestamp put get aborted")),
             (_temporal, Some(write_ts)) => Ok(write_ts),
         }
     }
 
-    async fn increment(&self, key: &[u8], increment: i64) -> Result<i64> {
+    async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64> {
         match self.client.increment_directly(self.timestamp.into(), key, increment, 0).await? {
             (_temporal, None) => Err(KvError::unexpected("timestamp increment get aborted")),
             (_temporal, Some(incremented)) => Ok(incremented),
