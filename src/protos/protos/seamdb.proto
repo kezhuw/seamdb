@@ -100,6 +100,11 @@ message TabletDescription {
     string data_log = 4;
 }
 
+message TabletCompaction {
+    uint64 accumulated_messages = 1;
+    MessageId accumulated_cursor = 2;
+}
+
 message TabletManifest {
     TabletDescription tablet = 1;
     repeated TabletDescriptor splits = 2;
@@ -117,6 +122,8 @@ message TabletManifest {
 
     repeated string obsoleted_logs = 34;
     repeated string obsoleted_files = 35;
+
+    TabletCompaction compaction = 40;
 }
 
 message Timestamp {
@@ -222,19 +229,17 @@ message SequenceRange {
     uint32 end = 2;
 }
 
+message TxnLocator {
+    bytes key = 1;
+    Uuid id = 2;
+}
+
 // Unique priority: priority, start_ts, id
 message TxnMeta {
-    Uuid id = 1;
-
     // Tablet locating key where this txn record resides in.
-    bytes key = 2;
+    bytes key = 1;
 
-    // Increment on transaction restart.
-    //
-    // Changes:
-    // 1. Increments on client initiating transaction restart.
-    // 2. Increments on server transaction restart due to priority/deadlock reason.
-    uint32 epoch = 3;
+    Uuid id = 2;
 
     // Timestamp at which point this transaction was created and got timestamp assigned.
     //
@@ -246,20 +251,27 @@ message TxnMeta {
     // * In creation, node use this timestamp to decide whether this transaction is able to create.
     //
     // This field must never be changed after assigned.
-    Timestamp start_ts = 5;
+    Timestamp start_ts = 3;
 
-    int32 priority = 6;
+    // Timestamp at which point this transaction is trying to read and write.
+    //
+    // Fallback to start_ts if zero.
+    Timestamp commit_ts = 4;
+
+    int32 priority = 5;
+
+    // Increment on transaction restart.
+    //
+    // Changes:
+    // 1. Increments on client initiating transaction restart.
+    // 2. Increments on server transaction restart due to priority/deadlock reason.
+    uint32 epoch = 6;
 }
 
 message Transaction {
     TxnMeta meta = 1;
 
     TxnStatus status = 3;
-
-    // Timestamp at which point this transaction is trying to read and write.
-    //
-    // Fallback to start_ts if zero.
-    Timestamp commit_ts = 6;
 
     // Only set and piggybacked from locating tablet.
     Timestamp heartbeat_ts = 7;
@@ -285,6 +297,20 @@ message Transaction {
     // 2. Extends last sequence range's `end`.
     // 3. Clears on epoch bump.
     repeated SequenceRange rollbacked_sequences = 11;
+}
+
+message PlainValue {
+    Value value = 1;
+}
+
+message TxnValue {
+    Value value = 1;
+    uint32 sequence = 2;
+}
+
+message TxnIntent {
+    TxnMeta txn = 1;
+    repeated TxnValue values = 2;
 }
 
 message TabletDeployRequest {

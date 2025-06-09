@@ -15,10 +15,12 @@
 #![allow(clippy::missing_transmute_annotations)]
 #![allow(clippy::result_large_err)]
 #![allow(clippy::large_enum_variant)]
+#![allow(clippy::type_complexity)]
 
 pub mod clock;
 pub mod cluster;
 pub mod endpoint;
+pub mod fs;
 pub mod keys;
 pub mod kv;
 pub mod log;

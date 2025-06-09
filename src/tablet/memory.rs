@@ -19,11 +19,20 @@ use anyhow::Result;
 
 use super::provision::{TimestampedValue, Value};
 use super::store::Store;
-use crate::protos::Timestamp;
+use crate::protos::{PlainValue, Timestamp};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MemoryStore {
     table: MemoryTable<Timestamp, Value>,
+}
+
+impl MemoryStore {
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], Timestamp, PlainValue)> {
+        self.table
+            .map
+            .iter()
+            .flat_map(|(key, values)| values.iter().map(|(ts, value)| (key.as_slice(), *ts, value.to_protos_value())))
+    }
 }
 
 impl Store for MemoryStore {
@@ -47,7 +56,7 @@ impl Store for MemoryStore {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct MemoryTable<S, V> {
     map: BTreeMap<Vec<u8>, Vec<(S, V)>>,
 }

@@ -24,6 +24,8 @@ use tracing::trace;
 use super::store::{BatchContext, BatchResult, TabletStore, TxnTabletStore};
 use super::types::{MessageId, TabletWatermark};
 use crate::clock::{Clock, Timestamp};
+use crate::endpoint::ResourceUri;
+use crate::fs::FileSystemManager;
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogManager, LogOffset, LogPosition, LogUri};
 use crate::protos::{
     BatchError,
@@ -41,6 +43,7 @@ use crate::protos::{
     TabletManifest,
     Temporal,
 };
+use crate::tablet::file::{CompactedFileEntry, CompactedFileIterator};
 use crate::tablet::{Request, TabletClient};
 
 pub trait LogMessage: prost::Message + Sync + Default + 'static {
@@ -360,6 +363,10 @@ impl LeadingTabletStore {
             operation: None,
         }
     }
+
+    pub fn snapshot(&self) -> TabletStore {
+        self.store.snapshot()
+    }
 }
 
 pub struct LeadingTabletManifest {
@@ -374,13 +381,17 @@ impl LeadingTabletManifest {
         self.producer.send(&message).await
     }
 
-    pub fn new_message(&mut self) -> ManifestMessage {
+    pub fn with_manifest_message(&mut self, manifest: TabletManifest) -> ManifestMessage {
         self.cursor.sequence += 1;
-        ManifestMessage {
-            epoch: self.cursor.epoch,
-            sequence: self.cursor.sequence,
-            manifest: Some(self.manifest.clone()),
-        }
+        ManifestMessage { epoch: self.cursor.epoch, sequence: self.cursor.sequence, manifest: Some(manifest) }
+    }
+
+    pub fn new_message(&mut self) -> ManifestMessage {
+        self.with_manifest_message(self.manifest.clone())
+    }
+
+    pub fn new_cloned_manifest(&self) -> TabletManifest {
+        self.manifest.clone()
     }
 }
 
@@ -398,6 +409,10 @@ pub struct LeadingTablet {
 impl LeadingTablet {
     pub fn id(&self) -> TabletId {
         self.manifest.manifest.tablet.id.into()
+    }
+
+    pub fn description(&self) -> &TabletDescription {
+        &self.manifest.manifest.tablet
     }
 
     pub fn shards(&self) -> &[ShardDescription] {
@@ -419,8 +434,20 @@ impl LeadingTablet {
         }
     }
 
+    pub fn add_dirty_files(&mut self, files: &[String]) {
+        self.manifest.manifest.dirty_files.extend_from_slice(files);
+    }
+
+    pub fn new_cloned_manifest(&self) -> TabletManifest {
+        self.manifest.new_cloned_manifest()
+    }
+
     pub fn new_manifest_message(&mut self) -> ManifestMessage {
         self.manifest.new_message()
+    }
+
+    pub fn with_manifest_message(&mut self, manifest: TabletManifest) -> ManifestMessage {
+        self.manifest.with_manifest_message(manifest)
     }
 
     pub fn closed_timestamp(&self) -> Timestamp {
@@ -449,8 +476,23 @@ impl LeadingTablet {
     pub async fn rotate(&mut self, closing_timestamp: Timestamp, leader_expiration: Timestamp) -> Result<()> {
         self.manifest.manifest.rotate();
         self.update_watermark(closing_timestamp, leader_expiration);
+        self.update_compaction_stat();
         self.manifest.publish().await?;
         Ok(())
+    }
+
+    pub fn update_compaction_stat(&mut self) -> usize {
+        self.manifest.manifest.compaction.update_compaction_stat(self.store.store.last_txn_id());
+        self.manifest.manifest.compaction.accumulated_messages as usize
+    }
+
+    pub fn reset_compaction_stat(&mut self) {
+        self.manifest.manifest.compaction.accumulated_cursor = self.store.store.last_txn_id();
+        self.manifest.manifest.compaction.accumulated_messages = 0;
+    }
+
+    pub fn get_accumulated_compaction_messages(&self) -> u64 {
+        self.manifest.manifest.compaction.accumulated_messages
     }
 
     pub fn update_watermark(&mut self, closing_timestamp: Timestamp, leader_expiration: Timestamp) {
@@ -539,11 +581,12 @@ impl FollowingTablet {
 #[derive(Clone)]
 pub struct TabletLoader {
     log: Arc<LogManager>,
+    fs: Arc<FileSystemManager>,
 }
 
 impl TabletLoader {
-    pub fn new(log: Arc<LogManager>) -> Self {
-        Self { log }
+    pub fn new(log: Arc<LogManager>, fs: Arc<FileSystemManager>) -> Self {
+        Self { log, fs }
     }
 
     async fn read_manifest(
@@ -693,9 +736,24 @@ impl TabletLoader {
     }
 
     async fn load_store(&self, tablet: &TabletDescription, limit: Option<LogPosition>) -> Result<FollowingTabletStore> {
-        if tablet.shards.iter().any(|r| !r.segments.is_empty()) {
-            return Err(anyhow!("do not support file compaction and transaction rotation for now"));
+        let mut store = TabletStore::new(tablet.id.into(), &tablet.shards);
+
+        for shard in tablet.shards.iter() {
+            let Some(segment) = shard.segments.last() else {
+                continue;
+            };
+            let file_uri = ResourceUri::parse_named("file uri", &segment.file)?;
+            let file = self.fs.open(&file_uri).await?;
+            let mut reader = CompactedFileIterator::new(file).await?;
+            while let Some(entry) = reader.read_next().await? {
+                match entry {
+                    CompactedFileEntry::Transaction(txn) => store.add_txn(txn),
+                    CompactedFileEntry::WriteIntent { key, intent } => store.add_intent(key, intent),
+                    CompactedFileEntry::KeyValue { key, ts, value } => store.add_key(key, ts, value),
+                }
+            }
         }
+
         let uri = LogUri::try_from(tablet.data_log.as_str())?;
         trace!("subscribing log {uri}");
         let mut consumer: Box<dyn ByteLogSubscriber> = self.log.subscribe_log(&uri.address(), uri.offset()).await?;
@@ -706,12 +764,12 @@ impl TabletLoader {
         let mut typed_consumer: TypedLogConsumer<DataMessage> = TypedLogConsumer::new(consumer.as_mut());
         let mut subscriber = LimitedLogConsumer::new(&mut typed_consumer, limit.clone());
         let mut cursor = MessageId::default();
-        let mut store = TabletStore::new(tablet.id.into(), &tablet.shards);
         while let Some(message) = subscriber.read().await? {
             if cursor.advance(MessageId::new(message.epoch, message.sequence))? {
                 store.apply(message)?;
             }
         }
+        store.set_last_position(limit.clone());
         let consumer = MessageConsumer {
             last_epoch: cursor.epoch,
             last_sequence: cursor.sequence,
@@ -732,7 +790,8 @@ impl TabletLoader {
     ) -> Result<LeadingTabletStore> {
         let mut producer = BufMessageProducer::new(self.log.produce_log(uri).await?);
         let position = producer.send_message(&DataMessage::new_fenced(epoch)).await?;
-        self.read_store(&mut store.cursor, &mut store.store, &mut store.consumer, Some(position)).await?;
+        self.read_store(&mut store.cursor, &mut store.store, &mut store.consumer, Some(position.clone())).await?;
+        store.store.set_last_position(position);
         Ok(LeadingTabletStore {
             cursor: store.cursor,
             store: TxnTabletStore::new(store.store, clock, client),

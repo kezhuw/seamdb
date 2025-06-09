@@ -23,7 +23,7 @@ use tokio::select;
 use crate::endpoint::{Endpoint, Params};
 use crate::utils::{self, DropOwner, DropWatcher};
 
-pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(20);
+pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 
 pub struct EtcdLease {
     id: i64,

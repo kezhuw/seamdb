@@ -461,7 +461,7 @@ impl TxnParticipant {
             (true, TxnStatus::Pending) => {
                 if ts > self.txn.commit_ts() {
                     debug!("push txn {} commit ts from {} to {}", self.txn.id(), self.txn.commit_ts(), ts);
-                    self.txn.commit_ts = ts;
+                    self.txn.meta.commit_ts = ts;
                     self.updates.send(self.txn.clone()).ignore();
                 }
                 ts
@@ -570,7 +570,7 @@ impl<'a> TxnCoordinator<'a> {
     ) {
         let pushed = match participant.epoch().cmp(&self.txn.epoch()) {
             Greater => true,
-            Equal => participant.commit_ts > self.txn.commit_ts,
+            Equal => participant.commit_ts() > self.txn.commit_ts(),
             Less => {
                 subscriber.send(ParticipateTxnResponse { txn: self.txn.clone(), dependents: vec![] });
                 self.subscribers.push(subscriber);
@@ -588,7 +588,7 @@ impl<'a> TxnCoordinator<'a> {
     pub fn update_participation(&mut self, participant: Transaction, dependents: Vec<TxnMeta>) {
         let pushed = match participant.epoch().cmp(&self.txn.epoch()) {
             Greater => true,
-            Equal => participant.commit_ts > self.txn.commit_ts,
+            Equal => participant.commit_ts() > self.txn.commit_ts(),
             Less => return,
         };
         if pushed {
@@ -1013,7 +1013,7 @@ impl TxnTable {
                     let bumped_ts = self.fences.min_write_ts(txn.id(), &request.write_keys, txn.commit_ts());
                     if bumped_ts != commit_ts {
                         txn.status = TxnStatus::Pending;
-                        txn.commit_ts = bumped_ts;
+                        txn.meta.commit_ts = bumped_ts;
                         txn.commit_set.clear();
                     }
                 }

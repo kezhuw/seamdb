@@ -840,6 +840,7 @@ mod tests {
     use crate::cluster::etcd::EtcdHelper;
     use crate::cluster::{EtcdNodeRegistry, *};
     use crate::endpoint::{Endpoint, ServiceUri};
+    use crate::fs::MemoryFileSystemFactory;
     use crate::log::tests::*;
     use crate::log::LogRegistry;
     use crate::protos::{
@@ -1028,7 +1029,7 @@ mod tests {
 
         let (nodes, _cluster_lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), NodeId::new_random(), None).await.unwrap();
-        let cluster_env = ClusterEnv::new(log_manager.clone(), nodes).with_replicas(2);
+        let cluster_env = ClusterEnv::new(log_manager.clone(), MemoryFileSystemFactory.into(), nodes).with_replicas(2);
 
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env).await.unwrap();
@@ -1094,7 +1095,7 @@ mod tests {
 
         let (nodes2, _cluster_lease2) =
             EtcdNodeRegistry::join(cluster_uri.clone(), NodeId::new_random(), None).await.unwrap();
-        let cluster_env2 = ClusterEnv::new(log_manager, nodes2).with_replicas(2);
+        let cluster_env2 = ClusterEnv::new(log_manager, MemoryFileSystemFactory.into(), nodes2).with_replicas(2);
         let mut cluster_meta_handle2 =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env2).await.unwrap();
 

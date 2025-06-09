@@ -36,6 +36,7 @@ use super::provision::{
 use super::types::StreamingChannel;
 use crate::clock::Clock;
 use crate::keys::Key;
+use crate::log::LogPosition;
 use crate::protos::{
     self,
     BatchError,
@@ -172,15 +173,16 @@ pub struct BatchContext {
     pub replication: ReplicationTracker,
 }
 
+#[derive(Clone)]
 struct ShardStore {
     id: ShardId,
     range: KeyRange,
-    store: Box<dyn Store>,
+    store: MemoryStore,
 }
 
 impl ShardStore {
     pub fn new(id: ShardId, range: KeyRange) -> Self {
-        Self { id, range, store: Box::<MemoryStore>::default() }
+        Self { id, range, store: MemoryStore::default() }
     }
 
     fn put(&mut self, key: Vec<u8>, ts: Timestamp, value: Value) -> Result<()> {
@@ -595,7 +597,7 @@ impl ShardStore {
                 if intent.txn.is_same(txn) || intent.txn.commit_ts() > txn.commit_ts() {
                     return Ok(Vec::default());
                 }
-                return Err(DataError::conflict_write(span.key, intent.txn.get().clone()));
+                return Err(DataError::conflict_write(span.key, intent.txn.read_txn()));
             }
             let found = self.get(context, txn.commit_ts(), &span.key)?;
             if found.timestamp <= from {
@@ -606,7 +608,7 @@ impl ShardStore {
         let mut start = span.key.clone();
         while let Some((found, intent)) = provision.find_intent(context, &start, &span.end) {
             if !intent.txn.is_same(txn) && intent.txn.commit_ts() <= txn.commit_ts() {
-                return Err(DataError::conflict_write(span.key, intent.txn.get().clone()));
+                return Err(DataError::conflict_write(span.key, intent.txn.read_txn()));
             }
             start.clear();
             start.extend(found);
@@ -749,6 +751,7 @@ impl TabletCache {
     }
 }
 
+#[derive(Clone)]
 pub struct DataStore {
     id: TabletId,
     shards: Vec<ShardDescription>,
@@ -759,6 +762,15 @@ impl DataStore {
     pub fn new(id: TabletId, shards: Vec<ShardDescription>) -> Self {
         let stores = shards.iter().map(|shard| ShardStore::new(shard.id.into(), shard.range.clone())).collect();
         Self { id, shards, stores }
+    }
+
+    pub fn add_key(&mut self, key: Vec<u8>, ts: Timestamp, value: protos::PlainValue) {
+        let value = Value::new_replicated(value.value);
+        self.put(key, ts, value).unwrap();
+    }
+
+    fn get_shard_store(&self, id: ShardId) -> Option<&ShardStore> {
+        self.stores.iter().find(|store| store.id == id)
     }
 
     fn get_shard_store_mut(&mut self, id: ShardId) -> Option<&mut ShardStore> {
@@ -798,13 +810,24 @@ impl DataStore {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TxnProvision {
     intents: BTreeMap<Key, TxnIntent>,
     transactions: HashMap<Uuid, TxnRecord>,
 }
 
 impl TxnProvision {
+    fn add_txn(&mut self, txn: Transaction) {
+        self.transactions.insert(txn.id(), TxnRecord::new(txn));
+    }
+
+    fn add_intent(&mut self, key: Vec<u8>, intent: protos::TxnIntent) {
+        let protos::TxnIntent { txn, values } = intent;
+        let record = self.transactions.entry(txn.id()).or_insert_with(|| TxnRecord::new(txn.into())).clone();
+        let intent = TxnIntent::new_from_history(record, values);
+        self.intents.insert(key, intent);
+    }
+
     fn prepare_txn(&mut self, txn: &Transaction) -> TxnRecord {
         let HashEntry::Occupied(entry) = self.transactions.entry(txn.id()) else {
             return TxnRecord::new(txn.clone());
@@ -828,9 +851,9 @@ impl TxnProvision {
                 BTreeEntry::Occupied(mut entry) => {
                     trace!(
                         "txn {} write key {:?} to intent {} with value {:?}, sequence {}",
-                        txn.meta(),
+                        txn.reader().meta(),
                         entry.key(),
-                        entry.get().meta(),
+                        entry.get().txn.reader().meta(),
                         write.value,
                         write.sequence
                     );
@@ -913,7 +936,7 @@ impl TxnProvision {
         }
 
         let current = entry.get_mut();
-        if !current.commit_set.is_empty() && txn.commit_set.is_empty() && !self_update {
+        if !current.reader().commit_set.is_empty() && txn.commit_set.is_empty() && !self_update {
             // It is possible for txn coordinator to issue txn resolution request to its locating
             // tablet in case of shard migration. It is importent for us to not write this empty
             // commit_set txn to log/store as it is a txn completion marker. In response, shard
@@ -964,12 +987,16 @@ impl TxnProvision {
     }
 }
 
+#[derive(Clone)]
 pub struct TabletStore {
     store: DataStore,
     provision: TxnProvision,
 
     watermark: TabletWatermark,
     watermarks: VecDeque<TabletWatermark>,
+
+    last_txn_id: MessageId,
+    last_offset: Option<LogPosition>,
 }
 
 impl TabletStore {
@@ -980,15 +1007,56 @@ impl TabletStore {
             provision: Default::default(),
             watermark: Default::default(),
             watermarks: Default::default(),
+            last_txn_id: MessageId::default(),
+            last_offset: None,
         }
+    }
+
+    pub fn tablet_id(&self) -> TabletId {
+        self.store.id
     }
 
     pub fn shards(&self) -> &[ShardDescription] {
         &self.store.shards
     }
 
-    pub fn transactions(&self) -> impl Iterator<Item = &Transaction> {
-        self.provision.transactions.values().map(|txn| txn.get())
+    pub fn shard_txns(&self, shard_id: ShardId) -> impl Iterator<Item = Transaction> + use<'_> {
+        let shard = self.shards().iter().find(|shard| shard.id == shard_id.0).unwrap();
+        self.provision
+            .transactions
+            .values()
+            .filter(|record| shard.range.contains(record.key()))
+            .map(|txn| txn.read_txn())
+    }
+
+    pub fn shard_intents(&self, shard_id: ShardId) -> impl Iterator<Item = (&[u8], protos::TxnIntent)> {
+        let shard = self.shards().iter().find(|shard| shard.id == shard_id.0).unwrap();
+        self.provision
+            .intents
+            .iter()
+            .filter(|(key, _)| shard.range.contains(key.as_slice()))
+            .map(|(key, intent)| (key.as_slice(), intent.to_protos_intent()))
+    }
+
+    pub fn shard_keys(&self, shard_id: ShardId) -> impl Iterator<Item = (&[u8], Timestamp, protos::PlainValue)> {
+        let store = self.store.get_shard_store(shard_id).unwrap();
+        store.store.iter()
+    }
+
+    pub fn add_txn(&mut self, txn: Transaction) {
+        self.provision.add_txn(txn);
+    }
+
+    pub fn add_intent(&mut self, key: Vec<u8>, intent: protos::TxnIntent) {
+        self.provision.add_intent(key, intent);
+    }
+
+    pub fn add_key(&mut self, key: Vec<u8>, ts: Timestamp, value: protos::PlainValue) {
+        self.store.add_key(key, ts, value);
+    }
+
+    pub fn transactions(&self) -> impl Iterator<Item = Transaction> + use<'_> {
+        self.provision.transactions.values().map(|txn| txn.read_txn())
     }
 
     fn update_cursor(&mut self, cursor: MessageId) {
@@ -999,6 +1067,10 @@ impl TabletStore {
     }
 
     fn check_cursor(&mut self) {
+        let cursor = self.watermark.cursor;
+        if cursor.sequence != 0 && cursor > self.last_txn_id {
+            self.last_txn_id = cursor;
+        }
         let Some(next_watermark) = self.watermarks.front() else {
             return;
         };
@@ -1153,6 +1225,14 @@ impl TabletStore {
             Temporal::Transaction(txn) => self.batch_transactional(context, txn, requests),
         }
     }
+
+    pub fn get_last_position(&self) -> Option<LogPosition> {
+        self.last_offset.clone()
+    }
+
+    pub fn set_last_position(&mut self, position: LogPosition) {
+        self.last_offset = Some(position);
+    }
 }
 
 pub struct TxnTabletStore {
@@ -1163,8 +1243,7 @@ pub struct TxnTabletStore {
 
 impl TxnTabletStore {
     pub fn new(store: TabletStore, clock: Clock, client: TabletClient) -> Self {
-        let (mut txn_table, updated_txns) =
-            TxnTable::new(clock, client, store.shards().to_vec(), store.transactions().cloned());
+        let (mut txn_table, updated_txns) = TxnTable::new(clock, client, store.shards().to_vec(), store.transactions());
         txn_table.close_ts(store.watermark.leader_expiration);
         Self { store, txn_table, updated_txns }
     }
@@ -1241,6 +1320,22 @@ impl TxnTabletStore {
             },
         };
         Ok(Some(result))
+    }
+
+    pub fn last_txn_id(&self) -> MessageId {
+        self.store.last_txn_id
+    }
+
+    pub fn get_last_position(&mut self) -> Option<LogPosition> {
+        self.store.get_last_position()
+    }
+
+    pub fn set_last_position(&mut self, position: LogPosition) {
+        self.store.set_last_position(position);
+    }
+
+    pub fn snapshot(&self) -> TabletStore {
+        self.store.clone()
     }
 }
 

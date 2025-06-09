@@ -22,7 +22,7 @@ mod sql;
 mod temporal;
 mod uuid;
 
-use std::cmp;
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt::{Display, Error, Formatter};
 
 use anyhow::{anyhow, bail, Result};
@@ -142,13 +142,13 @@ impl MessageId {
 
     pub fn advance(&mut self, next: MessageId) -> Result<bool> {
         match next.epoch.cmp(&self.epoch) {
-            cmp::Ordering::Less => Ok(false),
-            cmp::Ordering::Greater => {
+            Less => Ok(false),
+            Greater => {
                 self.epoch = next.epoch;
                 self.sequence = next.sequence;
                 Ok(true)
             },
-            cmp::Ordering::Equal => {
+            Equal => {
                 if next.sequence <= self.sequence {
                     Ok(false)
                 } else if next.sequence != self.sequence + 1 {
@@ -308,6 +308,24 @@ impl TabletManifest {
 
     pub fn update_watermark(&mut self, watermark: TabletWatermark) {
         self.watermark = watermark;
+    }
+}
+
+impl TabletCompaction {
+    pub fn update_compaction_stat(&mut self, last_txn_id: MessageId) {
+        match self.accumulated_cursor.epoch.cmp(&last_txn_id.epoch) {
+            Less => {
+                self.accumulated_cursor = last_txn_id;
+                self.accumulated_messages += last_txn_id.sequence;
+            },
+            Equal => {
+                if last_txn_id.sequence > self.accumulated_cursor.sequence {
+                    self.accumulated_messages += last_txn_id.sequence - self.accumulated_cursor.sequence;
+                    self.accumulated_cursor.sequence = last_txn_id.sequence;
+                }
+            },
+            Greater => {},
+        }
     }
 }
 

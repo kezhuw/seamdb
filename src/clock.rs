@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::ops::{Add, Sub};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -96,8 +97,28 @@ impl std::fmt::Display for Timestamp {
         if self.logical == 0 {
             write!(f, "{}", ts)
         } else {
-            write!(f, "{}-{}", ts, self.logical)
+            write!(f, "{}L{}", ts, self.logical)
         }
+    }
+}
+
+impl FromStr for Timestamp {
+    type Err = anyhow::Error;
+
+    fn from_str(mut s: &str) -> Result<Self, anyhow::Error> {
+        if let Some(sequence) = s.strip_prefix("txn-seq-") {
+            let sequence: u32 = sequence.parse()?;
+            return Ok(Self::txn_sequence(sequence));
+        }
+        let logical = match s.rfind('L') {
+            None => 0,
+            Some(i) => {
+                s = &s[..i];
+                s[i + 1..].parse()?
+            },
+        };
+        let ts = JiffTimestamp::from_str(s)?;
+        Ok(Timestamp { seconds: ts.as_second() as u64, nanoseconds: ts.subsec_nanosecond() as u32, logical })
     }
 }
 

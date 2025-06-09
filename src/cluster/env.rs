@@ -16,22 +16,36 @@ use std::sync::Arc;
 
 use super::{ClusterDeploymentMonitor, ClusterDescriptorWatcher, NodeRegistry};
 use crate::clock::Clock;
+use crate::fs::FileSystemManager;
 use crate::log::LogManager;
 use crate::protos::{ClusterDescriptor, TabletDeployment};
+
+const TABLET_COMPACTION_MESSAGES: usize = 5000;
 
 #[derive(Clone)]
 pub struct ClusterEnv {
     log: Arc<LogManager>,
+    fs: Arc<FileSystemManager>,
     clock: Clock,
     nodes: Arc<dyn NodeRegistry>,
     replicas: usize,
     descriptor: Option<ClusterDescriptorWatcher>,
     deployment: Option<ClusterDeploymentMonitor>,
+    tablet_compaction_messages: usize,
 }
 
 impl ClusterEnv {
-    pub fn new(log: Arc<LogManager>, nodes: Arc<dyn NodeRegistry>) -> Self {
-        Self { log, nodes, replicas: 3, clock: Clock::new(), descriptor: None, deployment: None }
+    pub fn new(log: Arc<LogManager>, fs: Arc<FileSystemManager>, nodes: Arc<dyn NodeRegistry>) -> Self {
+        Self {
+            log,
+            fs,
+            nodes,
+            replicas: 3,
+            clock: Clock::new(),
+            descriptor: None,
+            deployment: None,
+            tablet_compaction_messages: TABLET_COMPACTION_MESSAGES,
+        }
     }
 
     pub fn with_replicas(self, replicas: usize) -> Self {
@@ -46,9 +60,18 @@ impl ClusterEnv {
         Self { deployment: Some(deployment), ..self }
     }
 
+    pub fn with_tablet_compaction_messages(self, tablet_compaction_messages: usize) -> Self {
+        Self { tablet_compaction_messages, ..self }
+    }
+
     #[inline]
     pub fn log(&self) -> &Arc<LogManager> {
         &self.log
+    }
+
+    #[inline]
+    pub fn fs(&self) -> &Arc<FileSystemManager> {
+        &self.fs
     }
 
     #[inline]
@@ -72,5 +95,9 @@ impl ClusterEnv {
 
     pub fn latest_deployment(&self) -> Option<Arc<TabletDeployment>> {
         self.deployment.as_ref().and_then(|d| d.latest())
+    }
+
+    pub fn tablet_compaction_messages(&self) -> usize {
+        self.tablet_compaction_messages
     }
 }

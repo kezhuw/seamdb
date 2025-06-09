@@ -71,6 +71,10 @@ impl<'a> Endpoint<'a> {
         let address = self.address;
         address.split(',').map(move |s| Self { scheme, address: s })
     }
+
+    fn len(&self) -> usize {
+        self.scheme.len() + 3 + self.address.len()
+    }
 }
 
 impl Hash for Endpoint<'_> {
@@ -355,12 +359,37 @@ impl<'a> ResourceUri<'a> {
         }
     }
 
+    pub fn into_child(self, child: &str) -> Result<OwnedResourceUri> {
+        if child.is_empty() {
+            return Ok(self.into_owned());
+        }
+        if child.starts_with('/') || child.ends_with('/') {
+            bail!("invalid child path: {}", child)
+        }
+        let mut str = self.as_str().to_string();
+        str.push('/');
+        str.push_str(child);
+        let endpoint = Endpoint { scheme: self.scheme, address: self.address };
+        let uri = UriParts {
+            scheme: self.scheme,
+            address: self.address,
+            path: &str[endpoint.len()..],
+            params: &Params::default(),
+        };
+        let uri: UriParts<'static> = unsafe { uri.into_relocated(&str) };
+        Ok(ResourceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path })
+    }
+
     pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
         let uri = ServiceUri::parse_named(name, str)?;
         if !uri.params().is_empty() {
             return Err(anyhow!("{name} expect no params: {uri}"));
         }
         Ok(Self { str: uri.str, scheme: uri.scheme, address: uri.address, path: uri.path })
+    }
+
+    pub fn parse(str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
+        Self::parse_named("resource uri", str)
     }
 
     fn is_valid_path(s: &str) -> bool {
@@ -562,6 +591,10 @@ impl Params<'_> {
         self.map.get(key).map(|s| s.as_str())
     }
 
+    fn set(&mut self, key: &str, value: impl Display) {
+        self.map.insert(key.into(), value.to_compact_string());
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -627,6 +660,16 @@ impl<'a> ServiceUri<'a> {
         Ok(OwnedServiceUri { str: Cow::Owned(uri), scheme, address, path, params })
     }
 
+    pub fn with_query(self, key: &str, value: impl Display) -> Result<OwnedServiceUri> {
+        let mut params = self.params.into_owned();
+        params.set(key, value);
+        let mut parts = UriParts { scheme: self.scheme, address: self.address, path: self.path, params: &params };
+        let uri = parts.reshape();
+        // Safety: they are pointing to heap allocated string now.
+        let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
+        Ok(OwnedServiceUri { str: Cow::Owned(uri), scheme, address, path, params })
+    }
+
     pub fn as_str(&self) -> &str {
         self.str.as_ref()
     }
@@ -646,6 +689,13 @@ impl<'a> ServiceUri<'a> {
         // Safety: `str` is heap allocated.
         let uri = unsafe { uri.into_relocated(&str) };
         ServiceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path, params }
+    }
+
+    pub fn into_string(self) -> String {
+        match self.str {
+            Cow::Owned(str) => str,
+            Cow::Borrowed(str) => str.to_string(),
+        }
     }
 
     pub fn parse(s: impl Into<Cow<'a, str>>) -> Result<Self> {

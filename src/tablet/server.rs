@@ -40,8 +40,8 @@ use crate::tablet::service::{TabletServiceManager, TabletServiceState};
 use crate::tablet::TabletClient;
 
 pub struct TabletServiceImpl {
-    state: Arc<TabletServiceState>,
     client: TabletClient,
+    requester: mpsc::Sender<TabletServiceRequest>,
 }
 
 unsafe impl Send for TabletServiceImpl {}
@@ -50,7 +50,7 @@ unsafe impl Sync for TabletServiceImpl {}
 impl TabletServiceImpl {
     pub fn new(node: NodeId, cluster: ClusterEnv) -> Self {
         let (requester, receiver) = mpsc::channel(5000);
-        let state = Arc::new(TabletServiceState::new(node, cluster.clone(), requester));
+        let state = Arc::new(TabletServiceState::new(node, cluster.clone(), requester.downgrade()));
         tokio::spawn({
             let mut manager = TabletServiceManager::new(state.clone());
             async move {
@@ -58,11 +58,11 @@ impl TabletServiceImpl {
             }
         });
         let client = TabletClient::new(cluster);
-        Self { state, client }
+        Self { client, requester }
     }
 
     async fn request<T>(&self, request: TabletServiceRequest, receiver: oneshot::Receiver<T>) -> Result<T, Status> {
-        self.state.messager().send(request).await.map_err(|_| Status::unavailable("service shutdown"))?;
+        self.requester.send(request).await.map_err(|_| Status::unavailable("service shutdown"))?;
         receiver.await.map_err(|_| Status::unavailable("service shutdown"))
     }
 

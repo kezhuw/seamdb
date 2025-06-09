@@ -48,7 +48,7 @@ tracing = "0.1.37"
 static_assertions = "1.1.0"
 scopeguard = "1.2.0"
 arc-swap = "1.6.0"
-either = "1.9.0"
+either = "1.15"
 atomic = "0.6.0"
 bytemuck = { version = "1.13.1", features = ["derive"] }
 futures = "0.3.28"
@@ -67,6 +67,9 @@ jiff = "0.1.15"
 clap = { version = "4.5.23", features = ["derive"] }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["tracing-log", "env-filter", "std"] }
+async_cell = "0.2.2"
+opendal = { version = "0.53.3", features = ["services-hdfs-native", "services-s3"] }
+hex-simd = { version = "0.8.0", features = ["alloc"] }
 
 [dev-dependencies]
 assertor = "0.0.2"

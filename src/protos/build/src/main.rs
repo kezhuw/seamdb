@@ -77,10 +77,11 @@ fn main() {
         .require_field("ParticipateTxnResponse.txn")
         .require_field("DataMessage.temporal")
         .require_field("Transaction.meta")
-        .require_field("Transaction.commit_ts")
         .require_field("Transaction.heartbeat_ts")
         .require_field("TxnMeta.id")
         .require_field("TxnMeta.start_ts")
+        .require_field("TxnMeta.commit_ts")
+        .require_field("TxnIntent.txn")
         .require_field("RefreshReadRequest.span")
         .require_field("RefreshReadRequest.from")
         .require_field("TimestampedValue.value")
@@ -96,6 +97,8 @@ fn main() {
         .require_field("ShardDescription.range")
         .require_field("TabletManifest.tablet")
         .require_field("TabletManifest.watermark")
+        .require_field("TabletManifest.compaction")
+        .require_field("TabletCompaction.accumulated_cursor")
         .require_field("TabletDeployRequest.deployment");
 
     tonic_build::configure().out_dir(&outdir).compile_with_config(config, &protos, &[protos_dir]).unwrap();

@@ -124,6 +124,14 @@ pub struct TabletDescription {
     pub data_log: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct TabletCompaction {
+    #[prost(uint64, tag = "1")]
+    pub accumulated_messages: u64,
+    #[prost(message, required, tag = "2")]
+    pub accumulated_cursor: MessageId,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TabletManifest {
     #[prost(message, required, tag = "1")]
@@ -147,6 +155,8 @@ pub struct TabletManifest {
     pub obsoleted_logs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "35")]
     pub obsoleted_files: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, required, tag = "40")]
+    pub compaction: TabletCompaction,
 }
 #[derive(Eq, Hash, PartialOrd, Ord)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -287,22 +297,23 @@ pub struct SequenceRange {
     #[prost(uint32, tag = "2")]
     pub end: u32,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TxnLocator {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub id: ::core::option::Option<Uuid>,
+}
 /// Unique priority: priority, start_ts, id
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnMeta {
-    #[prost(message, required, tag = "1")]
-    pub id: Uuid,
     /// Tablet locating key where this txn record resides in.
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(bytes = "vec", tag = "1")]
     pub key: ::prost::alloc::vec::Vec<u8>,
-    /// Increment on transaction restart.
-    ///
-    /// Changes:
-    /// 1. Increments on client initiating transaction restart.
-    /// 2. Increments on server transaction restart due to priority/deadlock reason.
-    #[prost(uint32, tag = "3")]
-    pub epoch: u32,
+    #[prost(message, required, tag = "2")]
+    pub id: Uuid,
     /// Timestamp at which point this transaction was created and got timestamp assigned.
     ///
     /// This is required as writes of transaction record and data records are parallel.
@@ -313,10 +324,22 @@ pub struct TxnMeta {
     /// * In creation, node use this timestamp to decide whether this transaction is able to create.
     ///
     /// This field must never be changed after assigned.
-    #[prost(message, required, tag = "5")]
+    #[prost(message, required, tag = "3")]
     pub start_ts: Timestamp,
-    #[prost(int32, tag = "6")]
+    /// Timestamp at which point this transaction is trying to read and write.
+    ///
+    /// Fallback to start_ts if zero.
+    #[prost(message, required, tag = "4")]
+    pub commit_ts: Timestamp,
+    #[prost(int32, tag = "5")]
     pub priority: i32,
+    /// Increment on transaction restart.
+    ///
+    /// Changes:
+    /// 1. Increments on client initiating transaction restart.
+    /// 2. Increments on server transaction restart due to priority/deadlock reason.
+    #[prost(uint32, tag = "6")]
+    pub epoch: u32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -325,11 +348,6 @@ pub struct Transaction {
     pub meta: TxnMeta,
     #[prost(enumeration = "!TxnStatus", tag = "3")]
     pub status: TxnStatus,
-    /// Timestamp at which point this transaction is trying to read and write.
-    ///
-    /// Fallback to start_ts if zero.
-    #[prost(message, required, tag = "6")]
-    pub commit_ts: Timestamp,
     /// Only set and piggybacked from locating tablet.
     #[prost(message, required, tag = "7")]
     pub heartbeat_ts: Timestamp,
@@ -355,6 +373,28 @@ pub struct Transaction {
     /// 3. Clears on epoch bump.
     #[prost(message, repeated, tag = "11")]
     pub rollbacked_sequences: ::prost::alloc::vec::Vec<SequenceRange>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PlainValue {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<Value>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TxnValue {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<Value>,
+    #[prost(uint32, tag = "2")]
+    pub sequence: u32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TxnIntent {
+    #[prost(message, required, tag = "1")]
+    pub txn: TxnMeta,
+    #[prost(message, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<TxnValue>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

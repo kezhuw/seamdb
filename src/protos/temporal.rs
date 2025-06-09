@@ -49,10 +49,10 @@ impl Temporal {
 }
 
 impl Transaction {
-    pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+    pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5000);
 
     pub fn new(key: Vec<u8>, start_ts: Timestamp) -> Self {
-        let meta = TxnMeta { id: Uuid::new_random(), key, epoch: 0, start_ts, priority: 0 };
+        let meta = TxnMeta::new(key, start_ts);
         Transaction { meta, ..Default::default() }
     }
 
@@ -67,17 +67,6 @@ impl Transaction {
 
     pub fn sort_spans(&mut self) {
         self.commit_set.sort_by(|left, right| left.key.cmp(&right.key))
-    }
-
-    pub fn start_ts(&self) -> Timestamp {
-        self.meta.start_ts
-    }
-
-    pub fn commit_ts(&self) -> Timestamp {
-        match self.commit_ts.is_zero() {
-            true => self.start_ts(),
-            false => self.commit_ts,
-        }
     }
 
     pub fn is_rollbacked(&self, sequence: u32) -> bool {
@@ -103,13 +92,14 @@ impl Transaction {
         assert_eq!(self.id(), other.id());
         assert_eq!(self.key(), other.key());
         assert_eq!(self.start_ts(), other.start_ts());
-        self.commit_ts.forward(other.commit_ts);
+        self.meta.commit_ts.forward(other.commit_ts());
         self.heartbeat_ts.forward(other.heartbeat_ts);
         match self.epoch().cmp(&other.epoch()) {
             Less => {
                 self.status = other.status;
                 self.meta.epoch = other.epoch();
                 self.rollbacked_sequences.clear();
+                self.rollbacked_sequences.extend(other.rollbacked_sequences.iter());
                 self.commit_set.clear();
                 self.commit_set.extend(other.commit_set.iter().cloned());
             },
@@ -185,6 +175,10 @@ impl HasTxnStatus for Transaction {
 }
 
 impl TxnMeta {
+    pub fn new(key: Vec<u8>, start_ts: Timestamp) -> Self {
+        Self { key, id: Uuid::new_random(), start_ts, ..Default::default() }
+    }
+
     pub fn is_same(&self, other: &TxnMeta) -> bool {
         self.id == other.id && self.key == other.key
     }
@@ -241,7 +235,6 @@ impl From<TxnMeta> for Transaction {
         Self {
             meta,
             status: TxnStatus::Pending,
-            commit_ts: Timestamp::default(),
             heartbeat_ts: Default::default(),
             write_set: Default::default(),
             commit_set: Default::default(),
@@ -300,6 +293,17 @@ pub trait HasTxnMeta {
 
     fn epoch(&self) -> u32 {
         self.meta().epoch
+    }
+
+    fn start_ts(&self) -> Timestamp {
+        self.meta().start_ts
+    }
+
+    fn commit_ts(&self) -> Timestamp {
+        match self.meta().commit_ts.is_zero() {
+            true => self.start_ts(),
+            false => self.meta().commit_ts,
+        }
     }
 }
 

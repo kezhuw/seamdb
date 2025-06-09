@@ -14,20 +14,27 @@
 
 use std::cmp;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use async_cell::sync::{AsyncCell, Get};
+use asyncs::select;
 use hashbrown::hash_map::{Entry as HashEntry, HashMap};
+use hex_simd::AsciiCase;
 use ignore_result::Ignore;
-use tokio::select;
+use prost::Message;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::deployer::RangeTabletDeployer;
+use super::store::TabletStore;
 use super::types::{StreamingChannel, TabletRequest, TabletServiceRequest};
 use crate::clock::Clock;
 use crate::cluster::{ClusterEnv, NodeId};
+use crate::endpoint::{ResourceUri, ServiceUri};
+use crate::log::LogPosition;
 use crate::protos::{
     self,
     BatchError,
@@ -41,12 +48,15 @@ use crate::protos::{
     ParticipateTxnResponse,
     ShardDescriptor,
     ShardResponse,
+    ShardSegment,
     TabletDeployment,
+    TabletDescription,
     TabletDescriptor,
     TabletHeartbeatResponse,
     TabletId,
     Temporal,
 };
+use crate::tablet::file::CompactedFileWriter;
 use crate::tablet::{
     BatchResult,
     FollowingTablet,
@@ -77,13 +87,37 @@ impl BatchResponser {
 struct WritingBatch {
     replication: ReplicationTracker,
     responser: Option<BatchResponser>,
+    offset_notifier: Option<Arc<AsyncCell<LogPosition>>>,
 }
 
+struct PendingCompaction {
+    files: Vec<String>,
+}
+
+impl PendingCompaction {
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+}
+
+#[derive(Default, Debug)]
+struct CompletedCompaction {
+    offset: LogPosition,
+    files: VecDeque<String>,
+}
+
+impl CompletedCompaction {
+    pub fn new(offset: LogPosition, files: VecDeque<String>) -> Self {
+        Self { offset, files }
+    }
+}
+
+#[derive(Clone)]
 pub struct TabletServiceState {
     node: NodeId,
     clock: Clock,
     loader: TabletLoader,
-    messager: mpsc::Sender<TabletServiceRequest>,
+    messager: mpsc::WeakSender<TabletServiceRequest>,
     cluster: ClusterEnv,
 }
 
@@ -115,14 +149,19 @@ impl<T> Unify for T {
 }
 
 impl TabletServiceState {
-    pub fn new(node: NodeId, cluster: ClusterEnv, messager: mpsc::Sender<TabletServiceRequest>) -> Self {
+    pub fn new(node: NodeId, cluster: ClusterEnv, messager: mpsc::WeakSender<TabletServiceRequest>) -> Self {
         let clock = cluster.clock().clone();
-        let loader = TabletLoader::new(cluster.log().clone());
+        let loader = TabletLoader::new(cluster.log().clone(), cluster.fs().clone());
         Self { node, clock, loader, messager, cluster }
     }
 
-    pub fn messager(&self) -> &mpsc::Sender<TabletServiceRequest> {
-        &self.messager
+    fn create_pending_compaction(&self, tablet: &TabletDescription) -> PendingCompaction {
+        let mut files = Vec::with_capacity(tablet.shards.len());
+        for _ in 0..tablet.shards.len() {
+            let uri = self.cluster.fs().resource_of(&uuid::Uuid::new_v4().to_string()).unwrap();
+            files.push(uri.into_string())
+        }
+        PendingCompaction { files }
     }
 
     fn deploy(
@@ -137,7 +176,10 @@ impl TabletServiceState {
                 warn!("tablet deployment {:?} quit: {:?}", deployment, err);
             }
             drop(requester);
-            state.messager.send(TabletServiceRequest::UnloadTablet { deployment }).await.ignore();
+            info!("unloading tablet: {:?}", deployment);
+            if let Some(sender) = state.messager.upgrade() {
+                sender.send(TabletServiceRequest::UnloadTablet { deployment }).await.ignore();
+            }
         });
     }
 
@@ -155,7 +197,9 @@ impl TabletServiceState {
             Some(_) => ServingTablet::Follower(self.load_following(&descriptor).await?),
         };
         let (id, shards) = tablet.shards();
-        self.messager.send(TabletServiceRequest::DeployedTablet { id, shards }).await.ignore();
+        if let Some(sender) = self.messager.upgrade() {
+            sender.send(TabletServiceRequest::DeployedTablet { id, shards }).await.ignore();
+        }
         loop {
             match tablet {
                 ServingTablet::Leader(leader) => {
@@ -193,6 +237,60 @@ impl TabletServiceState {
         self.loader.load_tablet(descriptor.manifest_log.as_str()).await
     }
 
+    async fn compact(
+        &self,
+        store: TabletStore,
+        offset_waiter: Get<Arc<AsyncCell<LogPosition>>>,
+        mut files: Vec<String>,
+    ) -> Result<CompletedCompaction> {
+        info!("compacting tablet({}, {:?}) to files {:?}", store.tablet_id(), store.shards(), files);
+        let mut compacted_files = VecDeque::with_capacity(files.len());
+        for shard in store.shards() {
+            let file = files.remove(files.len() - 1);
+            let uri = ResourceUri::parse_named("file uri", &file).unwrap();
+            let writer = self.cluster.fs().create(&uri).await?;
+            let mut writer = CompactedFileWriter::new(writer).await.unwrap();
+            let mut serialized_key = Vec::with_capacity(128);
+            let mut serialized_value = Vec::with_capacity(256);
+            for txn in store.shard_txns(shard.id.into()) {
+                serialized_key.clear();
+                serialized_value.clear();
+                write!(&mut serialized_key, "0_txns/{}", txn.id()).ignore();
+                txn.encode(&mut serialized_value).unwrap();
+                writer.append(&serialized_key, &serialized_value).await.unwrap();
+            }
+            for (key, intent) in store.shard_intents(shard.id.into()) {
+                serialized_key.clear();
+                serialized_value.clear();
+                serialized_key.extend_from_slice(b"1_intents/");
+                hex_simd::encode_append(key, &mut serialized_key, AsciiCase::Lower);
+                intent.encode(&mut serialized_value).unwrap();
+                writer.append(&serialized_key, &serialized_value).await.unwrap();
+            }
+            for (key, ts, value) in store.shard_keys(shard.id.into()) {
+                serialized_key.clear();
+                serialized_value.clear();
+                serialized_key.extend_from_slice(b"2_values/");
+                hex_simd::encode_append(key, &mut serialized_key, AsciiCase::Lower);
+                write!(&mut serialized_key, "/{}", ts).ignore();
+                value.encode(&mut serialized_value).unwrap();
+                writer.append(&serialized_key, &serialized_value).await.unwrap();
+            }
+            writer.finish().await.unwrap();
+            compacted_files.push_back(file);
+        }
+        debug!("wait for offset");
+        let offset = offset_waiter.await;
+        info!(
+            "compacted tablet({}, {:?}) logs up to {} to files {:?}",
+            store.tablet_id(),
+            store.shards(),
+            offset,
+            compacted_files
+        );
+        Ok(CompletedCompaction::new(offset, compacted_files))
+    }
+
     fn start_deployment(
         &self,
         tablet: &LeadingTablet,
@@ -220,12 +318,16 @@ impl TabletServiceState {
 
         let _drop_owner = self.start_deployment(&tablet, self_requester);
 
+        let mut pending_compaction = None;
+        let mut ongoing_compaction = None;
+
         let mut manifest_messages = VecDeque::with_capacity(5);
         let mut writing_batches = VecDeque::with_capacity(128);
 
         let mut next_watermark = tokio::time::sleep(watermark_duration);
         let mut unblocking_requests = VecDeque::with_capacity(16);
-        loop {
+        let mut closing = false;
+        while !closing {
             while let Some(request) = unblocking_requests.pop_front() {
                 let Some(result) = tablet.process_request(request)? else {
                     continue;
@@ -271,6 +373,7 @@ impl TabletServiceState {
                         writing_batches.push_back(WritingBatch {
                             replication,
                             responser: Some(BatchResponser { temporal, responses, responser }),
+                            offset_notifier: None,
                         });
                         unblocking_requests.extend(requests.into_iter());
                     },
@@ -285,45 +388,113 @@ impl TabletServiceState {
                     let leader_expiration = now + watermark_duration * 2;
 
                     tablet.update_watermark(closing_timestamp, leader_expiration);
+                    let accumulated_messages = tablet.update_compaction_stat();
+                    if accumulated_messages >= self.cluster.tablet_compaction_messages() && pending_compaction.is_none() && ongoing_compaction.is_none() {
+                        let compaction = self.create_pending_compaction(tablet.description());
+                        tablet.add_dirty_files(compaction.files());
+                        pending_compaction = Some(compaction);
+                    }
                     next_watermark = tokio::time::sleep(watermark_duration);
                     let message = tablet.new_manifest_message();
                     tablet.manifest.producer.queue(&message)?;
                     manifest_messages.push_back(message);
+                },
+                result = ongoing_compaction.as_mut().unwrap(), if ongoing_compaction.is_some() => {
+                    ongoing_compaction = None;
+                    match result {
+                        Err(err) => {
+                            warn!("fail to complete tablet compaction {}: {}", tablet.id(), err);
+                        },
+                        Ok(Err(err)) => {
+                            info!("fail to compact tablet {}: {}", tablet.id(), err);
+                        },
+                        Ok(Ok(mut completed_compaction @ CompletedCompaction { .. })) => {
+                            let mut manifest = tablet.new_cloned_manifest();
+                            for shard in manifest.tablet.shards.iter_mut() {
+                                while let Some(segment) = shard.segments.pop() {
+                                    if !segment.file.is_empty() {
+                                        manifest.obsoleted_files.push(segment.file);
+                                    }
+                                }
+                                let compacted_file = completed_compaction.files.pop_front().unwrap();
+                                shard.segments.push(ShardSegment {
+                                    file: compacted_file,
+                                    ..Default::default()
+                                });
+                            }
+                            let uri = ServiceUri::parse_named("log uri", &manifest.tablet.data_log).unwrap();
+                            let uri = uri.with_query("offset", &completed_compaction.offset).unwrap();
+                            manifest.tablet.data_log = uri.into_string();
+                            info!("tablet compacted: {:?}", manifest);
+                            let message = tablet.with_manifest_message(manifest);
+                            tablet.manifest.producer.queue(&message)?;
+                            manifest_messages.push_back(message);
+                        }
+                    }
                 },
                 result = tablet.manifest.producer.wait() => {
                     let _offset = result?;
                     let message: ManifestMessage = manifest_messages.pop_front().unwrap();
                     let manifest = message.manifest.unwrap();
                     tablet.update_manifest(manifest);
+                    if let Some(compaction) = pending_compaction.take() {
+                        let store = tablet.store.snapshot();
+                        let offset_waiter = match writing_batches.back_mut() {
+                            Some(batch) => {
+                                let offset_notifier = batch.offset_notifier.get_or_insert_with(AsyncCell::shared);
+                                offset_notifier.get_shared()
+                            }
+                            None => {
+                                let last_position = tablet.store.store.get_last_position().unwrap();
+                                Get(AsyncCell::new_with(last_position).into_shared())
+                            }
+                        };
+                        tablet.reset_compaction_stat();
+                        ongoing_compaction = Some(asyncs::spawn({
+                            let state = self.clone();
+                            async move {
+                                state.compact(store, offset_waiter, compaction.files().to_owned()).await
+                            }
+                        }));
+                    }
                 },
                 result = tablet.store.producer.wait() => {
-                    let _offset = result?;
+                    let offset = result?;
                     let mut batch = writing_batches.pop_front().unwrap();
+                    if let Some(offset_notifier) = batch.offset_notifier.take() {
+                        offset_notifier.set(offset.clone());
+                    }
+                    tablet.store.store.set_last_position(offset);
                     batch.replication.commit();
                     if let Some(responser) = batch.responser {
                         responser.send();
                     }
                 },
-                Some(mut txn) = tablet.store.store.updated_txns().recv() => {
+                Some(ref mut txn) = tablet.store.store.updated_txns().recv() => {
                     trace!("update txn {:?}", txn);
-                    let (replication, requests) = tablet.store.store.update_txn(&mut txn);
+                    let (replication, requests) = tablet.store.store.update_txn(txn);
                     trace!("unblock txn {}(epoch:{}, {:?}) requests {:?}", txn.id(), txn.epoch(), txn.status(), requests);
                     unblocking_requests.extend(requests.into_iter());
                     if let Some(replication) = replication {
                         self.clock.update(txn.commit_ts());
                         txn.write_set.clear();
                         let message = DataMessage {
-                            temporal: Temporal::Transaction(txn),
+                            temporal: Temporal::Transaction(std::mem::take(txn)),
                             ..tablet.new_data_message()
                         };
                         tablet.store.producer.queue(&message)?;
                         writing_batches.push_back(WritingBatch {
                             replication,
                             responser: None,
+                            offset_notifier: None,
                         });
                     }
                 },
-                Some(request) = requester.recv() => {
+                result = requester.recv() => {
+                    let Some(request) = result else {
+                        closing = true;
+                        continue;
+                    };
                     let (mut batch, responser) = match request {
                         TabletRequest::Batch { batch, responser } => (batch, responser),
                         TabletRequest::ParticipateTxn { request, channel } => {
@@ -353,6 +524,7 @@ impl TabletServiceState {
                 },
             }
         }
+        Ok(None)
     }
 
     async fn follow(
@@ -369,7 +541,9 @@ impl TabletServiceState {
                     tablet.apply_manifest_message(message)?;
                 },
                 message = tablet.store.consumer.read_message() => {
-                    tablet.store.store.apply(message?.1)?;
+                    let (position, message) = message?;
+                    tablet.store.store.apply(message)?;
+                    tablet.store.store.set_last_position(position);
                 },
                 request = requester.recv() => match request {
                     None => return Ok(None),
@@ -384,9 +558,14 @@ impl TabletServiceState {
                             match deployment.index(&self.node) {
                                 None => return Ok(None),
                                 Some(0) => {
-                                    return Ok(Some(self.loader.lead_tablet(
-                self.clock.clone(), TabletClient::new(self.cluster.clone()),
-                                                epoch, descriptor.manifest_log.as_str(), tablet).await?));
+                                    let tablet = self.loader.lead_tablet(
+                                        self.clock.clone(),
+                                        TabletClient::new(self.cluster.clone()),
+                                        epoch,
+                                        descriptor.manifest_log.as_str(),
+                                        tablet
+                                    ).await?;
+                                    return Ok(Some(tablet));
                                 },
                                 Some(_) => {},
                             }
@@ -566,5 +745,6 @@ impl TabletServiceManager {
                 },
             }
         }
+        info!("node {} is down", self.state.node)
     }
 }

@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cell::UnsafeCell;
 use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::ptr::NonNull;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use anyhow::{bail, Result};
 use ignore_result::Ignore;
 use tokio::sync::watch;
 
-use crate::protos::{self, HasTxnMeta, KeySpan, Timestamp, Transaction, TxnMeta};
+use crate::protos::{self, HasTxnMeta, KeySpan, PlainValue, Timestamp, Transaction, TxnMeta, Uuid};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::NoUninit)]
 #[repr(i32)]
@@ -110,6 +109,10 @@ impl Value {
 
     pub fn is_tombstone(&self) -> bool {
         self.value.is_none()
+    }
+
+    pub fn to_protos_value(&self) -> PlainValue {
+        PlainValue { value: self.value.clone() }
     }
 
     pub fn correct_timestamp(&self, ts: Timestamp) -> Timestamp {
@@ -325,51 +328,101 @@ impl TxnValue {
     pub fn into_value(self) -> Option<protos::Value> {
         self.value.value
     }
+
+    pub fn to_protos_value(&self) -> protos::TxnValue {
+        protos::TxnValue { value: self.value.value.clone(), sequence: self.sequence }
+    }
+}
+
+impl From<protos::TxnValue> for TxnValue {
+    fn from(value: protos::TxnValue) -> Self {
+        Self::new_replicated(value.value, value.sequence)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct TxnRecord {
-    txn: Rc<UnsafeCell<Transaction>>,
+    ptr: NonNull<Transaction>,
+    txn: Arc<RwLock<Transaction>>,
 }
 
-impl Deref for TxnRecord {
+pub struct TxnRecordReader {
+    guard: RwLockReadGuard<'static, Transaction>,
+    _record: TxnRecord,
+}
+
+impl Deref for TxnRecordReader {
     type Target = Transaction;
 
     fn deref(&self) -> &Transaction {
-        self.get()
+        &self.guard
     }
 }
 
 unsafe impl Send for TxnRecord {}
+unsafe impl Sync for TxnRecord {}
 
 impl TxnRecord {
     pub fn new(txn: Transaction) -> Self {
-        Self { txn: Rc::new(UnsafeCell::new(txn)) }
+        let mut record = Self { txn: Arc::new(RwLock::new(txn)), ptr: NonNull::dangling() };
+        record.ptr = {
+            let locked = record.txn.read().unwrap();
+            let refed: &Transaction = &locked;
+            // Safety: txn is heap allocated and store along with ptr
+            let ptr = unsafe { std::mem::transmute::<_, &'static Transaction>(refed) };
+            ptr.into()
+        };
+        record
     }
 
-    pub fn get(&self) -> &Transaction {
-        self.get_mut()
+    pub fn reader(&self) -> TxnRecordReader {
+        let txn = self.txn.read().unwrap();
+        TxnRecordReader { _record: self.clone(), guard: unsafe { std::mem::transmute(txn) } }
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn get_mut(&self) -> &mut Transaction {
-        unsafe { &mut *(self.txn.get()) }
+    pub fn id(&self) -> Uuid {
+        // Safety: id never changed
+        unsafe { self.ptr.as_ref().id() }
+    }
+
+    pub fn key(&self) -> &[u8] {
+        // Safety: key never changed
+        unsafe { self.ptr.as_ref().key() }
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.reader().epoch()
+    }
+
+    pub fn commit_ts(&self) -> Timestamp {
+        self.reader().commit_ts()
+    }
+
+    pub fn read_txn(&self) -> Transaction {
+        self.reader().clone()
+    }
+
+    pub fn read_meta(&self) -> TxnMeta {
+        self.reader().meta.clone()
     }
 
     pub fn is_same(&self, other: &TxnRecord) -> bool {
-        Rc::ptr_eq(&self.txn, &other.txn)
+        Arc::ptr_eq(&self.txn, &other.txn)
     }
 
     pub fn update(&self, other: &Transaction) {
-        self.get_mut().update(other)
+        let mut txn = self.txn.write().unwrap();
+        txn.update(other)
     }
 
     pub fn add_write_span(&self, span: KeySpan) {
-        self.get_mut().write_set.push(span);
+        let mut txn = self.txn.write().unwrap();
+        txn.write_set.push(span);
     }
 
     pub fn take_write_set(&self) -> Vec<KeySpan> {
-        std::mem::take(&mut self.get_mut().write_set)
+        let mut txn = self.txn.write().unwrap();
+        std::mem::take(&mut txn.write_set)
     }
 }
 
@@ -378,18 +431,6 @@ pub struct TxnIntent {
     pub txn: TxnRecord,
     pub value: TxnValue,
     pub history: Vec<TxnValue>,
-}
-
-impl HasTxnMeta for TxnRecord {
-    fn meta(&self) -> &TxnMeta {
-        &self.meta
-    }
-}
-
-impl HasTxnMeta for TxnIntent {
-    fn meta(&self) -> &TxnMeta {
-        &self.txn.meta
-    }
 }
 
 impl TxnIntent {
@@ -401,6 +442,18 @@ impl TxnIntent {
     pub fn new_replicated(txn: TxnRecord, value: Option<protos::Value>, sequence: u32) -> Self {
         let value = TxnValue::new_replicated(value, sequence);
         Self { txn, value, history: Default::default() }
+    }
+
+    pub fn new_from_history(txn: TxnRecord, mut history: Vec<protos::TxnValue>) -> Self {
+        let value = history.remove(0).into();
+        Self { txn, value, history: history.into_iter().map(TxnValue::from).collect() }
+    }
+
+    pub fn to_protos_intent(&self) -> protos::TxnIntent {
+        let mut values = Vec::with_capacity(self.history.len() + 1);
+        values.push(self.value.to_protos_value());
+        self.history.iter().for_each(|v| values.push(v.to_protos_value()));
+        protos::TxnIntent { txn: self.txn.read_meta(), values }
     }
 
     pub fn into_latest(self, txn: &Transaction) -> Option<TxnValue> {
@@ -436,7 +489,7 @@ impl TxnIntent {
         if value.sequence <= self.value.sequence {
             bail!(
                 "txn {:?} write(sequence: {}) encounters higher sequence {}",
-                self.txn.meta,
+                self.txn.read_meta(),
                 value.sequence,
                 self.value.sequence
             );
@@ -449,10 +502,9 @@ impl TxnIntent {
 
 #[cfg(test)]
 mod tests {
-    use static_assertions::{assert_impl_all, assert_not_impl_any};
+    use static_assertions::assert_impl_all;
 
     use super::TxnRecord;
 
-    assert_impl_all!(TxnRecord: Send);
-    assert_not_impl_any!(TxnRecord: Sync);
+    assert_impl_all!(TxnRecord: Send, Sync);
 }
