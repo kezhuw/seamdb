@@ -171,6 +171,7 @@ impl TabletServiceState {
         mut requester: mpsc::UnboundedReceiver<TabletRequest>,
     ) {
         let state = self.clone();
+        info!("deploying tablet: {:?}", deployment);
         tokio::spawn(async move {
             if let Err(err) = state.serve(&mut deployment, self_requester, &mut requester).await {
                 warn!("tablet deployment {:?} quit: {:?}", deployment, err);
@@ -189,6 +190,7 @@ impl TabletServiceState {
         self_requester: mpsc::WeakUnboundedSender<TabletRequest>,
         requester: &mut mpsc::UnboundedReceiver<TabletRequest>,
     ) -> Result<()> {
+        info!("serving tablet: {:?}", deployment);
         let client = TabletClient::new(self.cluster.clone());
         let (_, descriptor) = client.get_tablet_descriptor(deployment.id.into()).await?;
         let mut tablet = match deployment.servers.iter().position(|s| *s == self.node.as_ref()) {
@@ -728,6 +730,7 @@ impl TabletServiceManager {
     }
 
     pub async fn serve(&mut self, mut requester: mpsc::Receiver<TabletServiceRequest>) {
+        info!("serving node: {:?}", self.state.node);
         while let Some(request) = requester.recv().await {
             match request {
                 TabletServiceRequest::DeployTablet { deployment, responser } => {

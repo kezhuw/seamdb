@@ -659,6 +659,7 @@ impl RootTabletClient {
         let Some(addr) = self.cluster.nodes().get_endpoint(node) else {
             return Err(TabletClientError::NodeNotAvailable { node: node.clone() });
         };
+        trace!("connecting addr: {}, shard: {:?}", addr, deployment);
         TabletServiceClient::connect(addr.to_string())
             .await
             .map_err(|e| TabletClientError::NodeNotConnectable { node: node.clone(), message: e.to_string() })

@@ -40,6 +40,7 @@ use crate::tablet::service::{TabletServiceManager, TabletServiceState};
 use crate::tablet::TabletClient;
 
 pub struct TabletServiceImpl {
+    id: NodeId,
     client: TabletClient,
     requester: mpsc::Sender<TabletServiceRequest>,
 }
@@ -50,7 +51,7 @@ unsafe impl Sync for TabletServiceImpl {}
 impl TabletServiceImpl {
     pub fn new(node: NodeId, cluster: ClusterEnv) -> Self {
         let (requester, receiver) = mpsc::channel(5000);
-        let state = Arc::new(TabletServiceState::new(node, cluster.clone(), requester.downgrade()));
+        let state = Arc::new(TabletServiceState::new(node.clone(), cluster.clone(), requester.downgrade()));
         tokio::spawn({
             let mut manager = TabletServiceManager::new(state.clone());
             async move {
@@ -58,7 +59,11 @@ impl TabletServiceImpl {
             }
         });
         let client = TabletClient::new(cluster);
-        Self { client, requester }
+        Self { id: node, client, requester }
+    }
+
+    pub fn id(&self) -> &NodeId {
+        &self.id
     }
 
     async fn request<T>(&self, request: TabletServiceRequest, receiver: oneshot::Receiver<T>) -> Result<T, Status> {
