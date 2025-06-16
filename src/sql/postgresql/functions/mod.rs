@@ -39,7 +39,7 @@ impl CurrentCatalog {
     pub fn new(context: Arc<SqlContext>) -> Self {
         Self {
             context,
-            signature: Signature::new(TypeSignature::Any(0), Volatility::Stable),
+            signature: Signature::new(TypeSignature::Nullary, Volatility::Stable),
             aliases: vec!["current_database".to_string()],
         }
     }
@@ -82,7 +82,7 @@ impl CurrentUser {
     pub fn new(context: Arc<SqlContext>) -> Self {
         Self {
             context,
-            signature: Signature::new(TypeSignature::Any(0), Volatility::Stable),
+            signature: Signature::new(TypeSignature::Nullary, Volatility::Stable),
             aliases: vec!["current_role".to_string(), "user".to_string()],
         }
     }
@@ -123,7 +123,7 @@ pub struct InetClientPort {
 
 impl InetClientPort {
     pub fn new(context: Arc<SqlContext>) -> Self {
-        Self { context, signature: Signature::new(TypeSignature::Any(0), Volatility::Stable), aliases: vec![] }
+        Self { context, signature: Signature::new(TypeSignature::Nullary, Volatility::Stable), aliases: vec![] }
     }
 }
 
