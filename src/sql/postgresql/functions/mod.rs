@@ -29,6 +29,45 @@ use datafusion::logical_expr::{
 use crate::sql::context::SqlContext;
 
 #[derive(Debug)]
+pub struct CurrentSchema {
+    context: Arc<SqlContext>,
+    signature: Signature,
+    aliases: Vec<String>,
+}
+
+impl CurrentSchema {
+    pub fn new(context: Arc<SqlContext>) -> Self {
+        Self { context, signature: Signature::new(TypeSignature::Nullary, Volatility::Stable), aliases: vec![] }
+    }
+}
+
+impl ScalarUDFImpl for CurrentSchema {
+    fn as_any(&self) -> &(dyn Any + 'static) {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "current_schema"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, DataFusionError> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue, DataFusionError> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(self.context.current_schema().to_string().into())))
+    }
+}
+
+#[derive(Debug)]
 pub struct CurrentCatalog {
     context: Arc<SqlContext>,
     signature: Signature,

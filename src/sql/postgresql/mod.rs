@@ -74,6 +74,7 @@ use crate::tablet::TabletClient;
 pub fn create_all_scalar_functions(context: &Arc<SqlContext>) -> Vec<Arc<ScalarUDF>> {
     vec![
         Arc::new(ScalarUDF::new_from_impl(self::functions::CurrentCatalog::new(context.clone()))),
+        Arc::new(ScalarUDF::new_from_impl(self::functions::CurrentSchema::new(context.clone()))),
         Arc::new(ScalarUDF::new_from_impl(self::functions::CurrentUser::new(context.clone()))),
         Arc::new(ScalarUDF::new_from_impl(self::functions::InetClientPort::new(context.clone()))),
     ]

@@ -256,5 +256,19 @@ mod tests {
         assert_eq!(column_id.value(3), 2);
         assert_eq!(column_count.value(3), 3);
         assert_eq!(column_description.value(3), "NNNNNN");
+
+        let mut stream = executor
+            .execute_sql("select current_catalog, current_database() as database, current_schema(), inet_client_port()")
+            .await
+            .unwrap();
+        let record = stream.next().await.unwrap().unwrap();
+        let column_catalog = record.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let column_database = record.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let column_schema = record.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let column_client_port = record.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(column_catalog.value(0), "test1");
+        assert_eq!(column_database.value(0), "test1");
+        assert_eq!(column_schema.value(0), "public");
+        assert_eq!(column_client_port.value(0), 0);
     }
 }
