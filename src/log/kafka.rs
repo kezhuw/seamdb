@@ -335,8 +335,9 @@ mod tests {
     use super::*;
 
     fn kafka_image() -> RunnableImage<GenericImage> {
-        let image = GenericImage::new("confluentinc/confluent-local", "7.4.1")
-            .with_wait_for(WaitFor::StdOutMessage { message: "Server started, listening for requests".to_string() });
+        let image = GenericImage::new("apache/kafka", "3.9.1")
+            .with_wait_for(WaitFor::StdOutMessage { message: "Kafka Server started".into() });
+
         // I can't find a way to connect to random mapping port for Kafka.
         //
         // Kafka registers listening port to cluster, and advertise it to client. So client will receive the advertised
