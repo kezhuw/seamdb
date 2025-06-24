@@ -327,40 +327,112 @@ impl LogFactory for KafkaLogFactory {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
+    use ignore_result::Ignore;
     use speculoos::*;
     use testcontainers::clients::Cli as DockerCli;
-    use testcontainers::core::{Container, Port, RunnableImage, WaitFor};
+    use testcontainers::core::{Container, RunnableImage, WaitFor};
     use testcontainers::images::generic::GenericImage;
 
     use super::*;
 
-    fn kafka_image() -> RunnableImage<GenericImage> {
+    fn kafka_image(network: String) -> RunnableImage<GenericImage> {
         let image = GenericImage::new("apache/kafka", "3.9.1")
             .with_wait_for(WaitFor::StdOutMessage { message: "Kafka Server started".into() });
-
-        // I can't find a way to connect to random mapping port for Kafka.
-        //
-        // Kafka registers listening port to cluster, and advertise it to client. So client will receive the advertised
-        // port for connection. And it is bound in configuration. See also:
-        //
-        // * https://www.confluent.io/blog/kafka-client-cannot-connect-to-broker-on-aws-on-docker-etc/
-        // * https://stackoverflow.com/questions/59343783/run-kafka-using-docker-compose-and-expose-a-different-port-instead-of-default-on
-        RunnableImage::from(image).with_mapped_port(Port { local: 9092, internal: 9092 })
+        RunnableImage::from(image).with_network(network)
     }
 
-    fn kafka_container() -> Container<'static, GenericImage> {
-        let docker = DockerCli::default();
-        let kafka = docker.run(kafka_image());
-        tracing::debug!("kafka container started, listen on host port {}", kafka.get_host_port_ipv4(9092));
-        unsafe { std::mem::transmute(kafka) }
+    fn kafka_proxy_image(listener_port: u16, advertised_port: u16) -> RunnableImage<GenericImage> {
+        let image = GenericImage::new("grepplabs/kafka-proxy", "0.3.12")
+            .with_wait_for(WaitFor::StdErrMessage { message: "Ready for new connections".into() })
+            .with_exposed_port(listener_port);
+        let args = vec![
+            "server".into(),
+            "--bootstrap-server-mapping".into(),
+            format!("localhost:9092,0.0.0.0:{listener_port},127.0.0.1:{advertised_port}"),
+        ];
+        RunnableImage::from((image, args))
     }
 
-    #[test_log::test(tokio::test)]
-    #[serial_test::serial("kafka_9092")]
+    struct KafkaProxyContainer {
+        advertised_port: u16,
+        container: Container<'static, GenericImage>,
+        _port_forwarder: asyncs::task::TaskHandle<()>,
+    }
+
+    impl KafkaProxyContainer {
+        const CONTAINER_PORT: u16 = 2222;
+
+        pub fn new() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let advertised_port = listener.local_addr().unwrap().port();
+
+            let docker = DockerCli::default();
+            let container = docker.run(kafka_proxy_image(Self::CONTAINER_PORT, advertised_port));
+            let listener_port = container.get_host_port_ipv4(Self::CONTAINER_PORT);
+            let _port_forwarder = asyncs::spawn(async move {
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                loop {
+                    let (mut source, _) = listener.accept().await.unwrap();
+                    asyncs::spawn(async move {
+                        let mut target =
+                            tokio::net::TcpStream::connect(format!("127.0.0.1:{listener_port}")).await.unwrap();
+                        tokio::io::copy_bidirectional(&mut source, &mut target).await.ignore();
+                    });
+                }
+            })
+            .attach();
+            let container = unsafe { std::mem::transmute(container) };
+            Self { advertised_port, container, _port_forwarder }
+        }
+
+        pub fn get_listen_port(&self) -> u16 {
+            self.container.get_host_port_ipv4(Self::CONTAINER_PORT)
+        }
+
+        pub fn get_advertised_port(&self) -> u16 {
+            self.advertised_port
+        }
+
+        pub fn network(&self) -> String {
+            format!("container:{}", self.container.id())
+        }
+    }
+
+    pub struct KafkaContainer {
+        _kafka: Container<'static, GenericImage>,
+        proxy: KafkaProxyContainer,
+    }
+
+    impl KafkaContainer {
+        pub fn new() -> Self {
+            let proxy = KafkaProxyContainer::new();
+            let docker = DockerCli::default();
+            let kafka = docker.run(kafka_image(proxy.network()));
+            tracing::debug!(
+                "kafka container started, listen on {}, advertised at port {}",
+                proxy.get_listen_port(),
+                proxy.get_advertised_port()
+            );
+            let kafka = unsafe { std::mem::transmute(kafka) };
+            Self { _kafka: kafka, proxy }
+        }
+
+        pub fn get_host_port(&self) -> u16 {
+            self.proxy.get_listen_port()
+        }
+    }
+
+    // There are request timeouts in case of current_thread scheduler.
+    // I guess there are blocking operations in async context. But after
+    // bumping both tokio and rdkafka, the phenomenon still exists.
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     #[tracing_test::traced_test]
     async fn test_kafka_basic() {
-        let kafka = kafka_container();
-        let server = format!("kafka://127.0.0.1:{}/logs", kafka.get_host_port_ipv4(9092));
+        let kafka = KafkaContainer::new();
+        let server = format!("kafka://127.0.0.1:{}/logs", kafka.get_host_port());
 
         let uri: OwnedServiceUri = server.try_into().unwrap();
         let factory = KafkaLogFactory::default();
