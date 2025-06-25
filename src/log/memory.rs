@@ -25,7 +25,7 @@ use hashbrown::hash_map::HashMap;
 use tokio::sync::futures::Notified;
 use tokio::sync::Notify;
 
-use crate::endpoint::{ResourceUri, ServiceUri};
+use crate::endpoint::{OwnedServiceUri, ResourceUri, ServiceUri};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogClient, LogFactory, LogOffset, LogPosition};
 
 #[cfg(test)]
@@ -167,12 +167,17 @@ impl ByteLogSubscriber for MemoryLogSubscriber {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MemoryLogClient {
+    uri: OwnedServiceUri,
     logs: Arc<Mutex<HashMap<String, Arc<MemoryLog>>>>,
 }
 
 impl MemoryLogClient {
+    fn new(uri: OwnedServiceUri) -> Self {
+        Self { uri, logs: Default::default() }
+    }
+
     fn get_log(&self, name: &str) -> Result<Arc<MemoryLog>> {
         let logs = self.logs.lock().unwrap();
         logs.get(name).cloned().ok_or_else(|| anyhow!("no log named {}", name))
@@ -181,6 +186,10 @@ impl MemoryLogClient {
 
 #[async_trait]
 impl LogClient for MemoryLogClient {
+    fn location(&self) -> ResourceUri<'_> {
+        self.uri.resource()
+    }
+
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>> {
         let log = self.get_log(name)?;
         let producer = MemoryLogProducer { log, queue: Default::default() };
@@ -237,7 +246,7 @@ impl LogFactory for MemoryLogFactory {
 
     async fn open_client(&self, uri: &ServiceUri) -> Result<Arc<dyn LogClient>> {
         assert_eq!(uri.scheme(), "memory", "invalid scheme: expect \"memory\", got \"{}\"", uri.scheme());
-        Ok(Arc::new(MemoryLogClient::default()))
+        Ok(Arc::new(MemoryLogClient::new(uri.to_owned())))
     }
 }
 

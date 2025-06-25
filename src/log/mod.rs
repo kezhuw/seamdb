@@ -261,6 +261,8 @@ pub trait ByteLogSubscriber: Send + Sync + fmt::Debug {
 /// Client to a log cluster.
 #[async_trait]
 pub trait LogClient: Send + Sync + fmt::Debug + 'static {
+    fn location(&self) -> ResourceUri<'_>;
+
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>>;
 
     async fn subscribe_log(&self, name: &str, offset: LogOffset) -> Result<Box<dyn ByteLogSubscriber>>;
@@ -444,6 +446,10 @@ pub mod tests {
 
     #[async_trait]
     impl LogClient for TestLogClient {
+        fn location(&self) -> ResourceUri<'_> {
+            self.uri.resource()
+        }
+
         async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>> {
             let Some(log) = self.logs.lock().unwrap().get(name).cloned() else { bail!("log {name} not found") };
             Ok(Box::new(TestLogProducer::new(log)))

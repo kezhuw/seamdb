@@ -33,7 +33,7 @@ use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use rdkafka::{Offset, TopicPartitionList};
 use tokio::time;
 
-use crate::endpoint::{OwnedServiceUri, ServiceUri};
+use crate::endpoint::{OwnedServiceUri, ResourceUri, ServiceUri};
 use crate::log::{ByteLogProducer, ByteLogSubscriber, LogClient, LogFactory, LogOffset, LogPosition};
 
 #[derive_where(Debug)]
@@ -262,6 +262,10 @@ impl KafkaLogClient {
 
 #[async_trait]
 impl LogClient for KafkaLogClient {
+    fn location(&self) -> ResourceUri<'_> {
+        self.uri.resource()
+    }
+
     async fn produce_log(&self, name: &str) -> Result<Box<dyn ByteLogProducer>> {
         let producer = FutureProducer::from_config(&self.config)?;
         let name = self.normalize_name(name)?;

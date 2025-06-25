@@ -30,7 +30,6 @@ use crate::endpoint::{OwnedResourceUri, ResourceUri, ServiceUri};
 pub struct LogManager {
     registry: LogRegistry,
     active_client: Arc<dyn LogClient>,
-    active_address: OwnedResourceUri,
     cluster_clients: HashMap<OwnedResourceUri, Arc<dyn LogClient>>,
     balanced_clients: HashMap<OwnedResourceUri, Vec<Arc<dyn LogClient>>>,
 }
@@ -68,7 +67,6 @@ impl LogRegistry {
         let mut manager = LogManager {
             registry: self,
             active_client: client,
-            active_address: uri.resource().into_owned(),
             cluster_clients: Default::default(),
             balanced_clients: Default::default(),
         };
@@ -118,7 +116,7 @@ impl LogManager {
     }
 
     fn get_cluster_client<'a>(&'a self, uri: &ResourceUri<'_>) -> Option<&'a Arc<dyn LogClient>> {
-        if self.active_address == *uri {
+        if self.active_client.location() == *uri {
             return Some(&self.active_client);
         }
         self.cluster_clients.get(uri.as_str())
@@ -156,13 +154,13 @@ impl LogManager {
     }
 
     pub fn locate_log(&self, name: &str) -> OwnedLogAddress {
-        let address = format!("{}/{}", self.active_address, name);
+        let address = format!("{}/{}", self.active_client.location(), name);
         OwnedLogAddress::new(address).unwrap()
     }
 
     pub async fn create_log(&self, name: &str, retention: ByteSize) -> Result<OwnedLogAddress> {
         self.active_client.create_log(name, retention).await?;
-        let address = format!("{}/{}", self.active_address, name);
+        let address = format!("{}/{}", self.active_client.location(), name);
         Ok(OwnedLogAddress::new(address).unwrap())
     }
 
@@ -241,7 +239,7 @@ mod tests {
         let uri = ServiceUri::parse("scheme1://server1,server2:2222?param1=value1").unwrap();
         let manager = registry.into_manager(&uri).await.unwrap();
         let created_client: Arc<dyn LogClient> = factory1.get_client(&uri.resource()).unwrap();
-        assert_that!(manager.active_address).is_equal_to(uri.resource());
+        assert_that!(manager.active_client.location()).is_equal_to(uri.resource());
         assert!(Arc::ptr_eq(&manager.active_client, &created_client));
 
         // https://github.com/rust-lang/rust/issues/106447
