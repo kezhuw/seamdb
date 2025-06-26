@@ -563,7 +563,7 @@ pub type OwnedServiceUri = ServiceUri<'static>;
 /// Queryable endpoint for cluster resource.
 ///
 /// It has shape `schema://address[path][?param1=abc&param2=xyz]`.
-#[derive(Clone, Debug, Eq)]
+#[derive(Debug, Eq)]
 pub struct ServiceUri<'a> {
     str: Cow<'a, str>,
     scheme: &'a str,
@@ -745,6 +745,34 @@ impl<'a> ServiceUri<'a> {
         // Safety: they are pointing to what cow holds
         let (scheme, address, path) = unsafe { std::mem::transmute((scheme, address, path)) };
         Ok(ServiceUri { str: s, scheme, address, path, params })
+    }
+}
+
+impl Clone for ServiceUri<'_> {
+    fn clone(&self) -> Self {
+        match self.str {
+            Cow::Borrowed(str) => Self {
+                str: Cow::Borrowed(str),
+                scheme: self.scheme,
+                address: self.address,
+                path: self.path,
+                params: self.params.clone(),
+            },
+            Cow::Owned(ref str) => {
+                let str = str.clone();
+                let uri =
+                    UriParts { scheme: self.scheme, address: self.address, path: self.path, params: &self.params };
+                // Safety: `str` is heap allocated.
+                let uri = unsafe { uri.into_relocated(&str) };
+                Self {
+                    str: Cow::Owned(str),
+                    scheme: uri.scheme,
+                    address: uri.address,
+                    path: uri.path,
+                    params: self.params.clone(),
+                }
+            },
+        }
     }
 }
 
