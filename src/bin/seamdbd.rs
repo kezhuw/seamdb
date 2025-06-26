@@ -20,7 +20,6 @@ use clap::Parser;
 use pgwire::tokio::process_socket;
 use seamdb::cluster::{ClusterEnv, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
 use seamdb::endpoint::{Endpoint, ServiceUri};
-use seamdb::fs::MemoryFileSystemFactory;
 use seamdb::log::{KafkaLogFactory, LogManager, MemoryLogFactory};
 use seamdb::protos::TableDescriptor;
 use seamdb::sql::postgresql::PostgresqlHandlerFactory;
@@ -85,7 +84,7 @@ async fn main() {
     let (nodes, lease) =
         EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
     let log_manager = new_log_manager(log_uri).await.unwrap();
-    let cluster_env = ClusterEnv::new(log_manager.into(), MemoryFileSystemFactory.into(), nodes).with_replicas(1);
+    let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
     let mut cluster_meta_handle =
         EtcdClusterMetaDaemon::start(args.cluster_name, cluster_uri.clone(), cluster_env.clone()).await.unwrap();
     let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();

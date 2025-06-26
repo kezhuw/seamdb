@@ -64,7 +64,6 @@ mod tests {
     use crate::cluster::tests::etcd_container;
     use crate::cluster::{ClusterEnv, ClusterMetaHandle, EtcdClusterMetaDaemon, EtcdNodeRegistry, NodeId};
     use crate::endpoint::{Endpoint, OwnedServiceUri};
-    use crate::fs::{FileSystemManager, MemoryFileSystemFactory};
     use crate::keys;
     use crate::kv::KvClientExt;
     use crate::log::{LogManager, MemoryLogFactory};
@@ -120,7 +119,6 @@ mod tests {
     async fn start_tablet_node(
         cluster_uri: OwnedServiceUri,
         log_manager: Arc<LogManager>,
-        fs_manager: Arc<FileSystemManager>,
     ) -> (Box<dyn ClusterMetaHandle>, TabletNode, TabletClient) {
         let node_id = NodeId::new_random();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -128,8 +126,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let cluster_env =
-            ClusterEnv::new(log_manager, fs_manager, nodes).with_replicas(1).with_tablet_compaction_messages(200);
+        let cluster_env = ClusterEnv::new(log_manager, nodes).with_replicas(1).with_tablet_compaction_messages(200);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
         let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
@@ -148,10 +145,8 @@ mod tests {
 
         let log_manager =
             Arc::new(LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap());
-        let fs_manager = Arc::new(FileSystemManager::from(MemoryFileSystemFactory));
 
-        let (node, daemon, client) =
-            start_tablet_node(cluster_uri.clone(), log_manager.clone(), fs_manager.clone()).await;
+        let (node, daemon, client) = start_tablet_node(cluster_uri.clone(), log_manager.clone()).await;
 
         tokio::time::sleep(Duration::from_secs(20)).await;
 
@@ -172,7 +167,7 @@ mod tests {
         drop(client);
         drop(daemon);
 
-        let (_daemon, _node1, client1) = start_tablet_node(cluster_uri.clone(), log_manager, fs_manager).await;
+        let (_daemon, _node1, client1) = start_tablet_node(cluster_uri.clone(), log_manager).await;
         tokio::time::sleep(Duration::from_secs(30)).await;
         for i in 0.. {
             if i * 10 >= n {

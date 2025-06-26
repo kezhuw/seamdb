@@ -35,7 +35,7 @@ pub struct ClusterEnv {
 }
 
 impl ClusterEnv {
-    pub fn new(log: Arc<LogManager>, fs: Arc<FileSystemManager>, nodes: Arc<dyn NodeRegistry>) -> Self {
+    pub fn with_filesystem(log: Arc<LogManager>, fs: Arc<FileSystemManager>, nodes: Arc<dyn NodeRegistry>) -> Self {
         Self {
             log,
             fs,
@@ -46,6 +46,11 @@ impl ClusterEnv {
             deployment: None,
             tablet_compaction_messages: TABLET_COMPACTION_MESSAGES,
         }
+    }
+
+    pub fn new(log: Arc<LogManager>, nodes: Arc<dyn NodeRegistry>) -> Self {
+        let fs = Arc::new(FileSystemManager::from(log.clone()));
+        Self::with_filesystem(log, fs, nodes)
     }
 
     pub fn with_replicas(self, replicas: usize) -> Self {

@@ -330,7 +330,7 @@ impl LogFactory for KafkaLogFactory {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::net::TcpListener;
 
     use ignore_result::Ignore;

@@ -29,6 +29,8 @@ use thiserror::Error;
 
 pub use self::memory::MemoryFileSystemFactory;
 use crate::endpoint::{OwnedResourceUri, OwnedServiceUri, ResourceUri};
+use crate::log::fs::{LogFileSystem, LogFileSystemFactory};
+use crate::log::LogManager;
 
 pub struct FileMeta {
     pub last_modified: SystemTime,
@@ -132,12 +134,35 @@ impl From<MemoryFileSystemFactory> for Arc<FileSystemManager> {
     }
 }
 
+impl From<Arc<LogManager>> for FileSystemManager {
+    fn from(logs: Arc<LogManager>) -> Self {
+        let filesystems = logs
+            .clients()
+            .cloned()
+            .map(|client| (client.location().into_owned(), Arc::new(LogFileSystem::new(client)) as Arc<dyn FileSystem>))
+            .collect();
+        let default = Arc::new(LogFileSystem::new(logs.default_client().clone()));
+        let mut factories = FileSystemFactories::default();
+        factories.register(Arc::new(LogFileSystemFactory::new(logs))).unwrap();
+        Self { factories, default, filesystems }
+    }
+}
+
 impl FileSystemManager {
     pub async fn new(factories: FileSystemFactories, filesystem: OwnedServiceUri) -> Result<Self> {
         let default = factories.open(filesystem).await?;
         let mut manager = Self { factories, default: default.clone(), filesystems: Default::default() };
         manager.mount_fs(default);
         Ok(manager)
+    }
+
+    pub fn add_log_filesystems(&mut self, logs: Arc<LogManager>) -> Result<()> {
+        self.factories.register(Arc::new(LogFileSystemFactory::new(logs.clone())))?;
+        for client in logs.clients() {
+            let fs = Arc::new(LogFileSystem::new(client.clone()));
+            self.mount_fs(fs);
+        }
+        Ok(())
     }
 
     pub async fn open(&self, uri: &ResourceUri<'_>) -> Result<Box<dyn FileReader>> {

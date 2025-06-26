@@ -14,6 +14,7 @@
 
 //! Persistent log trait and its implementations.
 
+pub mod fs;
 mod kafka;
 mod manager;
 mod memory;
@@ -109,6 +110,12 @@ impl Display for LogAddress<'_> {
 impl From<LogAddress<'_>> for String {
     fn from(address: LogAddress<'_>) -> String {
         address.uri.into()
+    }
+}
+
+impl<'a> From<LogAddress<'a>> for ResourceUri<'a> {
+    fn from(address: LogAddress<'a>) -> Self {
+        address.uri
     }
 }
 

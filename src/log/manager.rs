@@ -48,11 +48,15 @@ impl LogRegistry {
         }
     }
 
+    pub(super) fn factories(&self) -> &HashMap<&'static str, Arc<dyn LogFactory>> {
+        &self.factories
+    }
+
     fn find_factory(&self, scheme: &str) -> Option<&dyn LogFactory> {
         self.factories.get(scheme).map(|f| f.as_ref())
     }
 
-    async fn new_client(&self, uri: &ServiceUri<'_>) -> Result<Arc<dyn LogClient>> {
+    pub(super) async fn new_client(&self, uri: &ServiceUri<'_>) -> Result<Arc<dyn LogClient>> {
         let Some(factory) = self.find_factory(uri.scheme()) else {
             bail!("no log factory for scheme of endpoint {}", uri.endpoint())
         };
@@ -72,6 +76,18 @@ impl LogManager {
         let mut registry = LogRegistry::default();
         registry.register(factory).unwrap();
         registry.into_manager(uri).await
+    }
+
+    pub fn registry(&self) -> &LogRegistry {
+        &self.registry
+    }
+
+    pub fn clients(&self) -> impl Iterator<Item = &Arc<dyn LogClient>> {
+        self.clients.values()
+    }
+
+    pub fn default_client(&self) -> &Arc<dyn LogClient> {
+        &self.active_client
     }
 
     /// Open a client to produce, subscribe and delete existing logs.
