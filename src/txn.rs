@@ -492,7 +492,7 @@ impl KvClient for Txn {
 
     async fn get(&self, key: Cow<'_, [u8]>) -> Result<Option<(Timestamp, Value)>> {
         let (sequence, txn, mut notified) = self.txn.read()?;
-        let mut get = self.client.get_directly(txn.into(), key.clone(), sequence);
+        let get = self.client.get_directly(txn.into(), key.clone(), sequence);
         let mut get = pin!(get);
         loop {
             select! {
@@ -520,7 +520,7 @@ impl KvClient for Txn {
         limit: u32,
     ) -> Result<(Vec<u8>, Vec<TimestampedKeyValue>)> {
         let (_sequence, txn, mut notified) = self.txn.read()?;
-        let mut scan = self.client.scan_directly(txn.into(), start.clone(), end.clone(), limit);
+        let scan = self.client.scan_directly(txn.into(), start.clone(), end.clone(), limit);
         let mut scan = pin!(scan);
         loop {
             select! {
@@ -552,7 +552,7 @@ impl KvClient for Txn {
 
     async fn put(&self, key: Cow<'_, [u8]>, value: Option<Value>, expect_ts: Option<Timestamp>) -> Result<Timestamp> {
         let (sequence, txn, mut notified) = self.txn.write()?;
-        let mut put = self.client.put_directly(txn.into(), key.clone(), value, expect_ts, sequence);
+        let put = self.client.put_directly(txn.into(), key.clone(), value, expect_ts, sequence);
         let mut put = pin!(put);
         loop {
             select! {
@@ -575,7 +575,7 @@ impl KvClient for Txn {
 
     async fn increment(&self, key: Cow<'_, [u8]>, increment: i64) -> Result<i64> {
         let (sequence, txn, mut notified) = self.txn.write()?;
-        let mut increment = self.client.increment_directly(txn.into(), key.clone(), increment, sequence);
+        let increment = self.client.increment_directly(txn.into(), key.clone(), increment, sequence);
         let mut increment = pin!(increment);
         loop {
             select! {
