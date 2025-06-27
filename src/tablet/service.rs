@@ -274,7 +274,7 @@ impl TabletServiceState {
                 serialized_value.clear();
                 serialized_key.extend_from_slice(b"2_values/");
                 hex_simd::encode_append(key, &mut serialized_key, AsciiCase::Lower);
-                write!(&mut serialized_key, "/{}", ts).ignore();
+                write!(&mut serialized_key, "/{ts}").ignore();
                 value.encode(&mut serialized_value).unwrap();
                 writer.append(&serialized_key, &serialized_value).await.unwrap();
             }

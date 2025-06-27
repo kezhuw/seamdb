@@ -73,14 +73,14 @@ pub fn root_key(key: &[u8]) -> Vec<u8> {
 pub fn descriptor_key(id: TabletId) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(TABLET_DESCRIPTOR_KEY_PREFIX);
-    write!(&mut buf, "{}", id).unwrap();
+    write!(&mut buf, "{id}").unwrap();
     buf
 }
 
 pub fn deployment_key(id: TabletId) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(TABLET_DEPLOYMENT_KEY_PREFIX);
-    write!(&mut buf, "{}", id).unwrap();
+    write!(&mut buf, "{id}").unwrap();
     buf
 }
 

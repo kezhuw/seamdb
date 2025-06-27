@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn test_service_resource_uri() {
         let resource_uri = ResourceUri::try_from("scheme://address,host1:9999,127.0.0.1/path").unwrap();
-        let service_uri: ServiceUri = format!("{}?key1=value1", resource_uri).try_into().unwrap();
+        let service_uri: ServiceUri = format!("{resource_uri}?key1=value1").try_into().unwrap();
         assert_eq!(service_uri.resource(), resource_uri);
     }
 

@@ -91,13 +91,13 @@ impl SystemTimeClock {
 impl std::fmt::Display for Timestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(sequence) = self.get_txn_sequence() {
-            return write!(f, "txn-seq-{}", sequence);
+            return write!(f, "txn-seq-{sequence}");
         }
         let ts = JiffTimestamp::new(self.seconds as i64, self.nanoseconds as i32).unwrap();
         if self.logical == 0 {
-            write!(f, "{}", ts)
+            write!(f, "{ts}")
         } else {
-            write!(f, "{}L{}", ts, self.logical)
+            write!(f, "{ts}L{}", self.logical)
         }
     }
 }

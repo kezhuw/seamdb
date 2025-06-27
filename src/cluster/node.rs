@@ -263,7 +263,7 @@ impl EtcdNodeRegistry {
         node: &NodeId,
         addr: Endpoint<'_>,
     ) -> Result<ResponseHeader> {
-        let key = format!("{}{}", tree, node);
+        let key = format!("{tree}{node}");
         let options = PutOptions::new().with_lease(lease_id);
         let mut response = client.put(key, addr.to_string(), Some(options)).await?;
         Ok(response.take_header().unwrap())

@@ -189,7 +189,7 @@ impl LogPosition {
 impl Display for LogPosition {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            LogPosition::Offset(offset) => f.write_fmt(format_args!("{}", offset)),
+            LogPosition::Offset(offset) => f.write_fmt(format_args!("{offset}")),
             LogPosition::Cursor(cursor) => f.write_str(cursor),
         }
     }

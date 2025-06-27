@@ -174,7 +174,7 @@ impl TableDescriptor {
             values.push(value);
         }
         if values.len() != index.storing_column_ids.len() {
-            panic!("index {:?} get mismatching values {:?}", index, values)
+            panic!("index {index:?} get mismatching values {values:?}")
         }
         values
     }
@@ -204,7 +204,7 @@ impl TableDescriptor {
             values.push(value);
         }
         if values.len() != index.column_ids.len() {
-            panic!("index {:?} get mismatching keys {:?}", index, values)
+            panic!("index {index:?} get mismatching keys {values:?}")
         }
         values
     }

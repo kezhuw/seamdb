@@ -553,8 +553,7 @@ impl RootTabletClient {
         };
         let Value::Bytes(bytes) = value else {
             return Err(TabletClientError::corrupted(format!(
-                "tablet {} expect descriptor bytes, but got {:?}",
-                id, value
+                "tablet {id} expect descriptor bytes, but got {value:?}",
             )));
         };
         let descriptor =
@@ -573,8 +572,7 @@ impl RootTabletClient {
         };
         let Value::Bytes(bytes) = value else {
             return Err(TabletClientError::corrupted(format!(
-                "tablet {} expect deployment bytes, but got {:?}",
-                id, value
+                "tablet {id} expect deployment bytes, but got {value:?}"
             )));
         };
         let deployment =
@@ -596,7 +594,7 @@ impl RootTabletClient {
             })
             .await?
             .into_find()
-            .map_err(|r| TabletClientError::unexpected(format!("unexpected find response: {:?}", r)))?;
+            .map_err(|r| TabletClientError::unexpected(format!("unexpected find response: {r:?}")))?;
 
         let FindResponse { key: located_key, value: Some(value) } = find else {
             return Err(TabletClientError::ShardNotFound {
@@ -717,7 +715,7 @@ impl RootTabletClient {
         };
         let response = self.batch_request(deployment, batch).await?;
         if response.responses.len() != n {
-            return Err(TabletClientError::unexpected(format!("unexpected responses: {:?}", response)));
+            return Err(TabletClientError::unexpected(format!("unexpected responses: {response:?}")));
         }
         Ok(response.responses.into_iter().map(|response| response.response).collect())
     }

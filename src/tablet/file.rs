@@ -109,39 +109,33 @@ impl CompactedFileIterator {
         if let Some(suffix) = key.strip_prefix(b"0_txns/") {
             let txn_id = match uuid::Uuid::try_parse_ascii(suffix) {
                 Ok(id) => Uuid::from(id),
-                Err(err) => return Err(CompactedFileError::Corrupted(format!("invalid txn id {:?}: {}", suffix, err))),
+                Err(err) => return Err(CompactedFileError::Corrupted(format!("invalid txn id {suffix:?}: {err}"))),
             };
             let txn = match Transaction::decode(value.as_slice()) {
                 Ok(txn) => txn,
                 Err(err) => {
-                    return Err(CompactedFileError::Corrupted(format!(
-                        "fail to decode txn {} {:?}: {}",
-                        txn_id, value, err
-                    )))
+                    return Err(CompactedFileError::Corrupted(format!("fail to decode txn {txn_id} {value:?}: {err}")))
                 },
             };
             return Ok(CompactedFileEntry::Transaction(txn));
         }
         if let Some(key) = key.strip_prefix(b"1_intents/") {
             let Ok(key) = hex_simd::decode_to_vec(key) else {
-                return Err(CompactedFileError::Corrupted(format!("fail to decode txn intent key: {:?}", key)));
+                return Err(CompactedFileError::Corrupted(format!("fail to decode txn intent key: {key:?}")));
             };
             let intent = TxnIntent::decode(value.as_slice()).map_err(|err| {
-                CompactedFileError::Corrupted(format!("fail to decode txn intent key {:?} {:?}: {}", key, value, err))
+                CompactedFileError::Corrupted(format!("fail to decode txn intent key {key:?} {value:?}: {err}"))
             })?;
             return Ok(CompactedFileEntry::WriteIntent { key: key.to_owned(), intent });
         }
         if let Some(key) = key.strip_prefix(b"2_values/") {
             let (key, ts) = Self::decode_value_key(key)?;
             let value = PlainValue::decode(value.as_slice()).map_err(|err| {
-                CompactedFileError::Corrupted(format!(
-                    "fail to decode timestamped key {:?}/{} {:?}: {}",
-                    key, ts, value, err
-                ))
+                CompactedFileError::Corrupted(format!("fail to decode timestamped key {key:?}/{ts} {value:?}: {err}"))
             })?;
             return Ok(CompactedFileEntry::KeyValue { key, ts, value });
         }
-        Err(CompactedFileError::Corrupted(format!("unknown entry key {:?}", key)))
+        Err(CompactedFileError::Corrupted(format!("unknown entry key {key:?}")))
     }
 
     fn decode_value_key(key: &[u8]) -> Result<(Vec<u8>, Timestamp), CompactedFileError> {
@@ -154,7 +148,7 @@ impl CompactedFileIterator {
                 }
             }
         };
-        Err(CompactedFileError::Corrupted(format!("fail to decode timestamped key: {:?}", key)))
+        Err(CompactedFileError::Corrupted(format!("fail to decode timestamped key: {key:?}")))
     }
 
     pub async fn new(file: Box<dyn FileReader>) -> Result<Self, CompactedFileError> {
@@ -164,8 +158,7 @@ impl CompactedFileIterator {
         };
         if key != HEADER_MAGIC_KEY.as_bytes() || value != MAGIC_NUMBER.as_bytes() {
             return Err(CompactedFileError::Corrupted(format!(
-                "expect header magic ({}, {}), get ({:?}, {:?})",
-                HEADER_MAGIC_KEY, MAGIC_NUMBER, key, value
+                "expect header magic ({HEADER_MAGIC_KEY}, {MAGIC_NUMBER}), get ({key:?}, {value:?})",
             )));
         }
         Ok(iter)
@@ -184,8 +177,7 @@ impl CompactedFileIterator {
                 return Ok(None);
             }
             return Err(CompactedFileError::Corrupted(format!(
-                "expect footer magic ({}, {}), get ({:?})",
-                FOOTER_MAGIC_KEY, MAGIC_NUMBER, key
+                "expect footer magic ({FOOTER_MAGIC_KEY}, {MAGIC_NUMBER}), get ({key:?})",
             )));
         }
         Ok(Some((key, value)))

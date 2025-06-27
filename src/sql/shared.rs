@@ -111,7 +111,7 @@ impl TableDescriptorBuilder {
         type_declaration: Option<ColumnTypeDeclaration>,
     ) -> Result<ColumnDescriptorBuilder<'_>, SqlError> {
         if self.descriptor.find_column(&name).is_some() {
-            return Err(SqlError::invalid(format!("multiple columns named {}", name)));
+            return Err(SqlError::invalid(format!("multiple columns named {name}")));
         }
         self.descriptor.add_column(ColumnDescriptor {
             id: 0,

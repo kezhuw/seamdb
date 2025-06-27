@@ -190,11 +190,11 @@ pub trait TabletDeployServant {
 
     async fn connect_node_with_addr(&self, node: &NodeId, addr: Endpoint<'_>) -> Result<TabletServiceClient<Channel>> {
         let channel = TonicEndpoint::from_shared(addr.to_string())
-            .with_context(|| format!("node {:?} get invalid grpc addr {}", node, addr))?
+            .with_context(|| format!("node {node:?} get invalid grpc addr {addr}"))?
             .connect_timeout(HEARTBEAT_EXPIRATION)
             .connect()
             .await
-            .with_context(|| format!("fail to connect to {:?} at {}", node, addr))?;
+            .with_context(|| format!("fail to connect to {node:?} at {addr}"))?;
         Ok(TabletServiceClient::new(channel))
     }
 

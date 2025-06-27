@@ -74,7 +74,7 @@ mod tests {
     async fn read_keys(client: &TabletClient, prefix: String, n: usize) {
         for i in 0..n {
             let mut key = keys::user_key(prefix.as_bytes());
-            write!(&mut key, "_{}", i).ignore();
+            write!(&mut key, "_{i}").ignore();
             let (_ts, value) = client.get(key.clone()).await.unwrap().unwrap();
             let int = value.read_int(key.as_slice(), "read").unwrap();
             assert_eq!(i, int as usize);
@@ -93,7 +93,7 @@ mod tests {
         let mut futures = FuturesUnordered::new();
         for i in 0..n {
             let mut key = keys::user_key(prefix.as_bytes());
-            write!(&mut key, "_{}", i).ignore();
+            write!(&mut key, "_{i}").ignore();
             futures.push(client.put(key, Some(Value::Int(i as i64)), None));
         }
         while let Some(result) = futures.next().await {
@@ -107,7 +107,7 @@ mod tests {
         let mut futures = FuturesUnordered::new();
         for i in 0..n {
             let mut key = keys::user_key(&prefix);
-            write!(&mut key, "_{}", i).ignore();
+            write!(&mut key, "_{i}").ignore();
             futures.push(txn.put(key, Some(Value::Int(i as i64)), None));
         }
         while let Some(result) = futures.next().await {
@@ -155,7 +155,7 @@ mod tests {
             if i * 10 >= n {
                 break;
             }
-            let prefix = format!("keys_{}", i);
+            let prefix = format!("keys_{i}");
             futures.push(write_keys(client.clone(), i % 2 == 0, prefix, 10));
         }
         while futures.next().await.is_some() {}
@@ -172,7 +172,7 @@ mod tests {
             if i * 10 >= n {
                 break;
             }
-            let prefix = format!("keys_{}", i);
+            let prefix = format!("keys_{i}");
             read_keys(&client1, prefix, 10).await;
         }
     }

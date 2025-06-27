@@ -160,7 +160,7 @@ pub mod tests {
         let mut client = EtcdHelper::connect(uri.endpoint(), uri.params()).await.unwrap();
         let lease = EtcdHelper::grant_lease(&mut client, Some(Duration::from_secs(2))).await.unwrap();
         let ttl = lease.ttl();
-        println!("lease ttl: {:?}", ttl);
+        println!("lease ttl: {ttl:?}");
 
         // when: sleep more than ttl
         tokio::time::sleep(ttl + Duration::from_secs(2)).await;

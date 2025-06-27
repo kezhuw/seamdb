@@ -277,7 +277,7 @@ impl ContextProvider for PostgresContextProvider<'_> {
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>, DataFusionError> {
         let resolved = self.state.resolve_table_reference(name);
         let Some(table) = self.tables.get(&resolved) else {
-            return Err(DataFusionError::Plan(format!("no table source for {}", resolved)));
+            return Err(DataFusionError::Plan(format!("no table source for {resolved}")));
         };
         Ok(Arc::new(DefaultTableSource::new(table.clone())))
     }
@@ -444,7 +444,7 @@ async fn send_record_batch(
                     rows[i].encode_field(&value).unwrap();
                 }
             },
-            data_type => panic!("unsupported data type {}", data_type),
+            data_type => panic!("unsupported data type {data_type}"),
         }
     }
     for row in rows {

@@ -283,7 +283,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_boolean_field(builder: &mut BooleanBuilder, value: Option<&ColumnValue>) {
         let value = value.map(|v| match v {
             ColumnValue::Boolean(v) => *v,
-            _ => panic!("not int16: {:?}", v),
+            _ => panic!("not int16: {v:?}"),
         });
         builder.append_option(value);
     }
@@ -291,7 +291,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_int16_field(builder: &mut Int16Builder, value: Option<&ColumnValue>) {
         let value = value.map(|v| match v {
             ColumnValue::Int16(int) => *int as i16,
-            _ => panic!("not int16: {:?}", v),
+            _ => panic!("not int16: {v:?}"),
         });
         builder.append_option(value);
     }
@@ -299,7 +299,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_int32_field(builder: &mut Int32Builder, value: Option<&ColumnValue>) {
         let value = value.map(|v| match v {
             ColumnValue::Int32(int) => *int,
-            _ => panic!("not int: {:?}", v),
+            _ => panic!("not int: {v:?}"),
         });
         builder.append_option(value);
     }
@@ -307,7 +307,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_int64_field(builder: &mut Int64Builder, value: Option<&ColumnValue>) {
         let value = value.map(|v| match v {
             ColumnValue::Int64(int) => *int,
-            _ => panic!("not int64: {:?}", v),
+            _ => panic!("not int64: {v:?}"),
         });
         builder.append_option(value);
     }
@@ -315,7 +315,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_float32_field(builder: &mut Float32Builder, value: Option<&ColumnValue>) {
         let value = value.map(|v| match v {
             ColumnValue::Float32(v) => v.value,
-            _ => panic!("not int: {:?}", v),
+            _ => panic!("not int: {v:?}"),
         });
         builder.append_option(value);
     }
@@ -323,7 +323,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_float64_field(builder: &mut Float64Builder, value: Option<&ColumnValue>) {
         let value = value.map(|v| match v {
             ColumnValue::Float64(v) => v.value,
-            _ => panic!("not int64: {:?}", v),
+            _ => panic!("not int64: {v:?}"),
         });
         builder.append_option(value);
     }
@@ -331,7 +331,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_binary_field(builder: &mut BinaryBuilder, value: Option<&ColumnValue>) {
         let bytes = value.map(|v| match v {
             ColumnValue::Bytes(bytes) => bytes.as_slice(),
-            _ => panic!("not int: {:?}", v),
+            _ => panic!("not int: {v:?}"),
         });
         builder.append_option(bytes);
     }
@@ -339,7 +339,7 @@ impl<'a> ClusteredRowBuilder<'a> {
     fn add_string_field(builder: &mut StringBuilder, value: Option<&ColumnValue>) {
         let bytes = value.map(|v| match v {
             ColumnValue::String(string) => string.as_str(),
-            _ => panic!("not int: {:?}", v),
+            _ => panic!("not int: {v:?}"),
         });
         builder.append_option(bytes);
     }
