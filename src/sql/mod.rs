@@ -182,7 +182,7 @@ mod tests {
         let endpoint = Endpoint::try_from(address.as_str()).unwrap();
         let (nodes, lease) =
             EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
-        let log_manager = LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap();
+        let log_manager = LogManager::from(MemoryLogFactory);
         let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
         let mut cluster_meta_handle =
             EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();

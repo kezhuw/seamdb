@@ -14,18 +14,21 @@
 
 //! Defines textual endpoint for service and resource.
 
-use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt::{Display, Formatter, Write as _};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
 use anyhow::{anyhow, bail, Error, Result};
+use arcstr::ArcStr;
+use bytes::BufMut;
 use compact_str::{CompactString, ToCompactString};
 use either::Either;
 use hashbrown::Equivalent;
 use hashlink::LinkedHashMap;
 use uriparse::{Authority, Query, Scheme, SchemeError, Segment};
+
+use crate::shared_string::RefedString;
 
 /// Service endpoint for cluster.
 ///
@@ -37,12 +40,6 @@ pub struct Endpoint<'a> {
 }
 
 impl<'a> Endpoint<'a> {
-    /// # Safety
-    /// It is caller's duty to provide valid arguments.
-    pub const unsafe fn new_unchecked(scheme: &'static str, address: &'static str) -> Endpoint<'static> {
-        Endpoint { scheme, address }
-    }
-
     pub fn scheme(&self) -> &'a str {
         self.scheme
     }
@@ -209,9 +206,9 @@ impl Display for OwnedEndpoint {
 pub type OwnedResourceUri = ResourceUri<'static>;
 
 /// Identify an resource in cluster.
-#[derive(Debug, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct ResourceUri<'a> {
-    str: Cow<'a, str>,
+    str: RefedString<'a>,
     scheme: &'a str,
     address: &'a str,
     path: &'a str,
@@ -244,7 +241,7 @@ impl Iterator for ResourceUriIter {
         let str = parts.reshape();
         // Safety: they are pointing to heap allocated string now.
         let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
-        let server = OwnedResourceUri { str: Cow::Owned(str), scheme, address, path };
+        let server = OwnedResourceUri { str: str.into(), scheme, address, path };
         self.uri = Some(uri.strip_server(server.address));
         Some(server)
     }
@@ -261,17 +258,11 @@ impl OwnedResourceUri {
         let str = parts.reshape();
         // Safety: they are pointing to heap allocated string now.
         let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
-        Self { str: Cow::Owned(str), scheme, address, path }
+        Self { str: str.into(), scheme, address, path }
     }
 }
 
 impl<'a> ResourceUri<'a> {
-    /// # Safety
-    /// It is caller's duty to provide valid arguments.
-    pub const unsafe fn new_unchecked(str: Cow<'a, str>, scheme: &'a str, address: &'a str, path: &'a str) -> Self {
-        Self { str, scheme, address, path }
-    }
-
     pub fn scheme(&self) -> &'a str {
         self.scheme
     }
@@ -308,7 +299,7 @@ impl<'a> ResourceUri<'a> {
     }
 
     pub fn as_str(&self) -> &str {
-        &self.str
+        self.str.as_str()
     }
 
     pub fn split(self) -> Either<Self, ResourceUriIter> {
@@ -327,13 +318,9 @@ impl<'a> ResourceUri<'a> {
         let uri =
             UriParts { scheme: self.scheme, address: self.address, path: &self.path[..i], params: &Params::default() };
         let n = uri.len();
-        let uri: UriParts<'static> = unsafe { uri.into_relocated(&self.str[..n]) };
-        Some(ResourceUri {
-            str: Cow::Borrowed(&self.str[0..n]),
-            scheme: uri.scheme,
-            address: uri.address,
-            path: uri.path,
-        })
+        let str = self.str.slice(0..n);
+        let uri: UriParts<'static> = unsafe { uri.into_relocated(str.as_str()) };
+        Some(ResourceUri { str, scheme: uri.scheme, address: uri.address, path: uri.path })
     }
 
     pub fn to_owned(&self) -> OwnedResourceUri {
@@ -342,21 +329,18 @@ impl<'a> ResourceUri<'a> {
 
     pub fn into_owned(self) -> OwnedResourceUri {
         let str = match &self.str {
-            // Safety: invariant: `str` is owned only for static endpoint.
-            Cow::Owned(_) => return unsafe { std::mem::transmute(self) },
-            Cow::Borrowed(str) => str.to_string(),
+            RefedString::Ref(str) => ArcStr::try_alloc(str).unwrap(),
+            // Safety: owned uri
+            _ => return unsafe { std::mem::transmute(self) },
         };
         let uri = UriParts { scheme: self.scheme, address: self.address, path: self.path, params: &Params::default() };
         // Safety: `str` is heap allocated.
         let uri: UriParts<'static> = unsafe { uri.into_relocated(&str) };
-        ResourceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path }
+        ResourceUri { str: str.into(), scheme: uri.scheme, address: uri.address, path: uri.path }
     }
 
     pub fn into_string(self) -> String {
-        match self.str {
-            Cow::Owned(str) => str,
-            Cow::Borrowed(str) => str.to_string(),
-        }
+        self.str.as_str().to_string()
     }
 
     pub fn into_child(self, child: &str) -> Result<OwnedResourceUri> {
@@ -366,9 +350,14 @@ impl<'a> ResourceUri<'a> {
         if child.starts_with('/') || child.ends_with('/') {
             bail!("invalid child path: {}", child)
         }
-        let mut str = self.as_str().to_string();
-        str.push('/');
-        str.push_str(child);
+        let str = unsafe {
+            ArcStr::init_with_unchecked(self.as_str().len() + child.len() + 1, |mut s| {
+                s.put_slice(self.as_str().as_bytes());
+                s.put_u8(b'/');
+                s.put_slice(child.as_bytes());
+            })
+        };
+
         let endpoint = Endpoint { scheme: self.scheme, address: self.address };
         let uri = UriParts {
             scheme: self.scheme,
@@ -377,10 +366,10 @@ impl<'a> ResourceUri<'a> {
             params: &Params::default(),
         };
         let uri: UriParts<'static> = unsafe { uri.into_relocated(&str) };
-        Ok(ResourceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path })
+        Ok(ResourceUri { str: str.into(), scheme: uri.scheme, address: uri.address, path: uri.path })
     }
 
-    pub fn parse_named(name: &'_ str, str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
+    pub fn parse_named(name: &'_ str, str: impl Into<RefedString<'a>>) -> Result<ResourceUri<'a>> {
         let uri = ServiceUri::parse_named(name, str)?;
         if !uri.params().is_empty() {
             return Err(anyhow!("{name} expect no params: {uri}"));
@@ -388,7 +377,7 @@ impl<'a> ResourceUri<'a> {
         Ok(Self { str: uri.str, scheme: uri.scheme, address: uri.address, path: uri.path })
     }
 
-    pub fn parse(str: impl Into<Cow<'a, str>>) -> Result<ResourceUri<'a>> {
+    pub fn parse(str: impl Into<RefedString<'a>>) -> Result<ResourceUri<'a>> {
         Self::parse_named("resource uri", str)
     }
 
@@ -415,43 +404,21 @@ impl Deref for ResourceUri<'_> {
     }
 }
 
-impl Clone for ResourceUri<'_> {
-    fn clone(&self) -> Self {
-        match self.str {
-            Cow::Borrowed(str) => {
-                Self { str: Cow::Borrowed(str), scheme: self.scheme, address: self.address, path: self.path }
-            },
-            Cow::Owned(ref str) => {
-                let str = str.clone();
-                let uri = UriParts {
-                    scheme: self.scheme,
-                    address: self.address,
-                    path: self.path,
-                    params: &Params::default(),
-                };
-                // Safety: `str` is heap allocated.
-                let uri = unsafe { uri.into_relocated(&str) };
-                Self { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path }
-            },
-        }
-    }
-}
-
 impl PartialEq<Self> for ResourceUri<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.str.as_ref() == other.str.as_ref()
+        self.str.as_str() == other.str.as_str()
     }
 }
 
 impl PartialEq<str> for ResourceUri<'_> {
     fn eq(&self, other: &str) -> bool {
-        self.str.as_ref() == other
+        self.str.as_str() == other
     }
 }
 
 impl PartialEq<&str> for ResourceUri<'_> {
     fn eq(&self, other: &&str) -> bool {
-        self.str.as_ref() == *other
+        self.str.as_str() == *other
     }
 }
 
@@ -469,10 +436,7 @@ impl Equivalent<ResourceUri<'_>> for str {
 
 impl From<ResourceUri<'_>> for String {
     fn from(uri: ResourceUri<'_>) -> String {
-        match uri.str {
-            Cow::Borrowed(str) => str.to_owned(),
-            Cow::Owned(str) => str,
-        }
+        uri.str.into_string()
     }
 }
 
@@ -514,8 +478,25 @@ impl<'a> UriParts<'a> {
         uri
     }
 
-    fn reshape(&mut self) -> String {
-        let str = self.to_string();
+    fn reshape(&mut self) -> ArcStr {
+        let str = unsafe {
+            ArcStr::init_with_unchecked(self.len(), |mut s| {
+                s.put_slice(self.scheme.as_bytes());
+                s.put_slice(&b"://"[..]);
+                s.put_slice(self.address.as_bytes());
+                s.put_slice(self.path.as_bytes());
+                for (i, (k, v)) in self.params.map.iter().enumerate() {
+                    if i == 0 {
+                        s.put_u8(b'?');
+                    } else {
+                        s.put_u8(b'&');
+                    }
+                    s.put_slice(k.as_bytes());
+                    s.put_u8(b'=');
+                    s.put_slice(v.as_bytes());
+                }
+            })
+        };
         // Safety: str is heap allocated
         unsafe {
             let str = std::mem::transmute(str.as_str());
@@ -563,9 +544,9 @@ pub type OwnedServiceUri = ServiceUri<'static>;
 /// Queryable endpoint for cluster resource.
 ///
 /// It has shape `schema://address[path][?param1=abc&param2=xyz]`.
-#[derive(Debug, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct ServiceUri<'a> {
-    str: Cow<'a, str>,
+    str: RefedString<'a>,
     scheme: &'a str,
     address: &'a str,
     path: &'a str,
@@ -636,12 +617,7 @@ impl<'a> ServiceUri<'a> {
 
     pub fn resource(&self) -> ResourceUri<'_> {
         let len = self.scheme.len() + 3 + self.address.len() + self.path.len();
-        ResourceUri {
-            str: Cow::Borrowed(&self.str.as_ref()[..len]),
-            scheme: self.scheme(),
-            address: self.address(),
-            path: self.path(),
-        }
+        ResourceUri { str: self.str.slice(..len), scheme: self.scheme(), address: self.address(), path: self.path() }
     }
 
     pub fn parts(&self) -> (ResourceUri<'_>, &Params<'_>) {
@@ -657,7 +633,7 @@ impl<'a> ServiceUri<'a> {
         let uri = parts.reshape();
         // Safety: they are pointing to heap allocated string now.
         let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
-        Ok(OwnedServiceUri { str: Cow::Owned(uri), scheme, address, path, params })
+        Ok(OwnedServiceUri { str: uri.into(), scheme, address, path, params })
     }
 
     pub fn with_query(self, key: &str, value: impl Display) -> Result<OwnedServiceUri> {
@@ -667,11 +643,11 @@ impl<'a> ServiceUri<'a> {
         let uri = parts.reshape();
         // Safety: they are pointing to heap allocated string now.
         let (scheme, address, path) = unsafe { std::mem::transmute(parts.into()) };
-        Ok(OwnedServiceUri { str: Cow::Owned(uri), scheme, address, path, params })
+        Ok(OwnedServiceUri { str: uri.into(), scheme, address, path, params })
     }
 
     pub fn as_str(&self) -> &str {
-        self.str.as_ref()
+        self.str.as_str()
     }
 
     pub fn to_owned(&self) -> OwnedServiceUri {
@@ -680,29 +656,26 @@ impl<'a> ServiceUri<'a> {
 
     pub fn into_owned(self) -> OwnedServiceUri {
         let str = match &self.str {
-            // Safety: invariant: `str` is owned only for static endpoint.
-            Cow::Owned(_) => return unsafe { std::mem::transmute(self) },
-            Cow::Borrowed(str) => str.to_string(),
+            RefedString::Ref(str) => ArcStr::try_alloc(str).unwrap(),
+            // Safety: uri is owned
+            _ => return unsafe { std::mem::transmute(self) },
         };
         let params = self.params.into_owned();
         let uri = UriParts { scheme: self.scheme, address: self.address, path: self.path, params: &params };
         // Safety: `str` is heap allocated.
         let uri = unsafe { uri.into_relocated(&str) };
-        ServiceUri { str: Cow::Owned(str), scheme: uri.scheme, address: uri.address, path: uri.path, params }
+        ServiceUri { str: str.into(), scheme: uri.scheme, address: uri.address, path: uri.path, params }
     }
 
     pub fn into_string(self) -> String {
-        match self.str {
-            Cow::Owned(str) => str,
-            Cow::Borrowed(str) => str.to_string(),
-        }
+        self.str.as_str().to_string()
     }
 
-    pub fn parse(s: impl Into<Cow<'a, str>>) -> Result<Self> {
+    pub fn parse(s: impl Into<RefedString<'a>>) -> Result<Self> {
         Self::parse_named("service uri", s)
     }
 
-    pub fn parse_named(name: &'_ str, s: impl Into<Cow<'a, str>>) -> Result<Self> {
+    pub fn parse_named(name: &'_ str, s: impl Into<RefedString<'a>>) -> Result<Self> {
         let s = s.into();
         let Some((scheme, trailing)) = s.split_once("://") else {
             return Err(anyhow!("invalid {name}: {s}"));
@@ -748,37 +721,9 @@ impl<'a> ServiceUri<'a> {
     }
 }
 
-impl Clone for ServiceUri<'_> {
-    fn clone(&self) -> Self {
-        match self.str {
-            Cow::Borrowed(str) => Self {
-                str: Cow::Borrowed(str),
-                scheme: self.scheme,
-                address: self.address,
-                path: self.path,
-                params: self.params.clone(),
-            },
-            Cow::Owned(ref str) => {
-                let str = str.clone();
-                let uri =
-                    UriParts { scheme: self.scheme, address: self.address, path: self.path, params: &self.params };
-                // Safety: `str` is heap allocated.
-                let uri = unsafe { uri.into_relocated(&str) };
-                Self {
-                    str: Cow::Owned(str),
-                    scheme: uri.scheme,
-                    address: uri.address,
-                    path: uri.path,
-                    params: self.params.clone(),
-                }
-            },
-        }
-    }
-}
-
 impl PartialEq<Self> for ServiceUri<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.str.as_ref() == other.str.as_ref()
+        self.str.as_str() == other.str.as_str()
     }
 }
 
@@ -808,10 +753,7 @@ impl Equivalent<ServiceUri<'_>> for str {
 
 impl From<ServiceUri<'_>> for String {
     fn from(uri: ServiceUri<'_>) -> String {
-        match uri.str {
-            Cow::Borrowed(str) => str.to_owned(),
-            Cow::Owned(str) => str,
-        }
+        uri.str.into_string()
     }
 }
 

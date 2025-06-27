@@ -132,7 +132,7 @@ impl<'a> TryFrom<ResourceUri<'a>> for LogAddress<'a> {
 
 impl<'a> LogAddress<'a> {
     pub fn new(str: impl Into<Cow<'a, str>>) -> Result<Self> {
-        let uri = ResourceUri::parse_named("log address", str)?;
+        let uri = ResourceUri::parse_named("log address", str.into())?;
         Self::try_from(uri)
     }
 

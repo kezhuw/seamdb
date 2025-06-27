@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -230,11 +229,13 @@ impl LogClient for MemoryLogClient {
 pub struct MemoryLogFactory;
 
 impl MemoryLogFactory {
-    pub const URI: ResourceUri<'static> =
-        unsafe { ResourceUri::new_unchecked(Cow::Borrowed("memory://logs"), "memory", "logs", "") };
-
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn open(uri: &ServiceUri) -> Arc<dyn LogClient> {
+        assert_eq!(uri.scheme(), "memory", "invalid scheme: expect \"memory\", got \"{}\"", uri.scheme());
+        Arc::new(MemoryLogClient::new(uri.to_owned()))
     }
 }
 
@@ -246,7 +247,7 @@ impl LogFactory for MemoryLogFactory {
 
     async fn open_client(&self, uri: &ServiceUri) -> Result<Arc<dyn LogClient>> {
         assert_eq!(uri.scheme(), "memory", "invalid scheme: expect \"memory\", got \"{}\"", uri.scheme());
-        Ok(Arc::new(MemoryLogClient::new(uri.to_owned())))
+        Ok(Self::open(uri))
     }
 }
 

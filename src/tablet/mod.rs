@@ -143,8 +143,7 @@ mod tests {
         let etcd = etcd_container();
         let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
 
-        let log_manager =
-            Arc::new(LogManager::new(MemoryLogFactory::new(), &MemoryLogFactory::URI.into()).await.unwrap());
+        let log_manager = Arc::new(LogManager::from(MemoryLogFactory));
 
         let (node, daemon, client) = start_tablet_node(cluster_uri.clone(), log_manager.clone()).await;
 

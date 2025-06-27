@@ -21,7 +21,16 @@ use bytesize::ByteSize;
 use either::Either;
 use hashbrown::hash_map::{Entry, HashMap};
 
-use super::{ByteLogProducer, ByteLogSubscriber, LogAddress, LogClient, LogFactory, LogOffset, OwnedLogAddress};
+use super::{
+    ByteLogProducer,
+    ByteLogSubscriber,
+    LogAddress,
+    LogClient,
+    LogFactory,
+    LogOffset,
+    MemoryLogFactory,
+    OwnedLogAddress,
+};
 use crate::endpoint::{OwnedResourceUri, ResourceUri, ServiceUri};
 
 #[derive(Debug)]
@@ -76,6 +85,15 @@ impl LogManager {
         let mut registry = LogRegistry::default();
         registry.register(factory).unwrap();
         registry.into_manager(uri).await
+    }
+
+    pub fn with_client(factory: impl LogFactory, client: Arc<dyn LogClient>) -> Self {
+        let mut registry = LogRegistry::default();
+        registry.register(factory).unwrap();
+        let uri = client.location().into_owned();
+        let mut manager = LogManager { registry, active_client: client, clients: Default::default() };
+        manager.add_client(uri, manager.active_client.clone());
+        manager
     }
 
     pub fn registry(&self) -> &LogRegistry {
@@ -178,6 +196,14 @@ impl LogManager {
     ) -> Result<Box<dyn ByteLogSubscriber>> {
         let (client, name) = self.find_client(address)?;
         client.subscribe_log(name, offset).await
+    }
+}
+
+impl From<MemoryLogFactory> for LogManager {
+    fn from(factory: MemoryLogFactory) -> Self {
+        let uri = ServiceUri::parse("memory://logs").unwrap();
+        let client = MemoryLogFactory::open(&uri);
+        Self::with_client(factory, client)
     }
 }
 

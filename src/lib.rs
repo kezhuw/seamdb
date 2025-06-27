@@ -25,6 +25,7 @@ pub mod keys;
 pub mod kv;
 pub mod log;
 pub mod protos;
+pub mod shared_string;
 pub mod sql;
 pub mod tablet;
 pub mod timer;

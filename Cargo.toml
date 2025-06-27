@@ -70,6 +70,8 @@ tracing-subscriber = { version = "0.3.19", features = ["tracing-log", "env-filte
 async_cell = "0.2.2"
 opendal = { version = "0.53.3", features = ["services-hdfs-native", "services-s3"] }
 hex-simd = { version = "0.8.0", features = ["alloc"] }
+arcstr = "1.2.0"
+imstr = "0.2.0"
 
 [dev-dependencies]
 assertor = "0.0.2"
