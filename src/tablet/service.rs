@@ -472,16 +472,16 @@ impl TabletServiceState {
                         responser.send();
                     }
                 },
-                Some(ref mut txn) = tablet.store.store.updated_txns().recv() => {
+                Some(mut txn) = tablet.store.store.updated_txns().recv() => {
                     trace!("update txn {:?}", txn);
-                    let (replication, requests) = tablet.store.store.update_txn(txn);
+                    let (replication, requests) = tablet.store.store.update_txn(&mut txn);
                     trace!("unblock txn {}(epoch:{}, {:?}) requests {:?}", txn.id(), txn.epoch(), txn.status(), requests);
                     unblocking_requests.extend(requests.into_iter());
                     if let Some(replication) = replication {
                         self.clock.update(txn.commit_ts());
                         txn.write_set.clear();
                         let message = DataMessage {
-                            temporal: Temporal::Transaction(std::mem::take(txn)),
+                            temporal: Temporal::Transaction(txn),
                             ..tablet.new_data_message()
                         };
                         tablet.store.producer.queue(&message)?;

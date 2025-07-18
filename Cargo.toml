@@ -22,6 +22,7 @@ homepage = "https://github.com/kezhuw/seamdb"
 repository = "https://github.com/kezhuw/seamdb"
 description = "A computation cluster to seam existing services to provide database interfaces"
 documentation = "https://docs.rs/seamdb"
+rust-version = "1.87"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -57,7 +58,7 @@ tokio-stream = "0.1.15"
 datafusion = "47.0.0"
 pgwire = "0.27.0"
 derive-where = "1.2.7"
-asyncs = { version = "0.3.0", features = ["tokio"] }
+asyncs = { version = "0.4.0", features = ["tokio"] }
 async-io = "2.3.4"
 bytes = "1.7.2"
 lazy_static = "1.5.0"
@@ -75,7 +76,7 @@ imstr = "0.2.0"
 
 [dev-dependencies]
 assertor = "0.0.2"
-asyncs = { version = "0.3.0", features = ["test", "tokio"] }
+asyncs = { version = "0.4.0", features = ["test", "tokio"] }
 env_logger = "0.11.5"
 serial_test = "2.0.0"
 speculoos = "0.11.0"
@@ -83,12 +84,6 @@ test-case = "3.1.0"
 test-log = "0.2.12"
 testcontainers = "0.14.0"
 tracing-test = "0.2.4"
-
-[profile.dev]
-lto = "thin"
-
-[profile.release]
-lto = "thin"
 
 [workspace]
 members = ["src/protos/build"]
