@@ -367,8 +367,12 @@ pub enum TabletClientError {
     TabletNotDeployed { id: TabletId },
     #[error("node {node} not available")]
     NodeNotAvailable { node: NodeId },
-    #[error("node {node} not connectable: {message}")]
-    NodeNotConnectable { node: NodeId, message: String },
+    #[error("node {node} not connectable: {source}")]
+    NodeNotConnectable {
+        node: NodeId,
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("{status}")]
     GrpcError { status: tonic::Status },
     #[error("unexpected: {message}")]
@@ -660,7 +664,7 @@ impl RootTabletClient {
         trace!("connecting addr: {}, shard: {:?}", addr, deployment);
         TabletServiceClient::connect(addr.to_string())
             .await
-            .map_err(|e| TabletClientError::NodeNotConnectable { node: node.clone(), message: e.to_string() })
+            .map_err(|e| TabletClientError::NodeNotConnectable { node: node.clone(), source: anyhow::Error::new(e) })
     }
 
     pub async fn service(

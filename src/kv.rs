@@ -36,8 +36,12 @@ pub enum KvError {
     TabletNotDeployed { id: TabletId },
     #[error("node {node} not available")]
     NodeNotAvailable { node: NodeId },
-    #[error("node {node} not connectable: {message}")]
-    NodeNotConnectable { node: NodeId, message: String },
+    #[error("node {node} not connectable: {source}")]
+    NodeNotConnectable {
+        node: NodeId,
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("{status}")]
     GrpcError { status: tonic::Status },
     #[error("unexpected: {message}")]
@@ -88,7 +92,7 @@ impl From<TabletClientError> for KvError {
             TabletClientError::DeploymentNotFound { id } => Self::DeploymentNotFound { id },
             TabletClientError::TabletNotDeployed { id } => Self::TabletNotDeployed { id },
             TabletClientError::NodeNotAvailable { node } => Self::NodeNotAvailable { node },
-            TabletClientError::NodeNotConnectable { node, message } => Self::NodeNotConnectable { node, message },
+            TabletClientError::NodeNotConnectable { node, source } => Self::NodeNotConnectable { node, source },
             TabletClientError::GrpcError { status } => Self::GrpcError { status },
             TabletClientError::UnexpectedError { message } => Self::UnexpectedError { message },
             TabletClientError::ShardNotFound { tablet_id, shard_id, key } => {
