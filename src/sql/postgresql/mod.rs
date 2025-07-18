@@ -40,7 +40,14 @@ use datafusion::config::ConfigOptions;
 use datafusion::datasource::default_table_source::DefaultTableSource;
 use datafusion::execution::session_state::SessionState;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::sqlparser::ast::{CharacterLength, ColumnDef, CreateTable, Statement, TableConstraint};
+use datafusion::logical_expr::sqlparser::ast::{
+    CharacterLength,
+    ColumnDef,
+    CreateTable,
+    NullsDistinctOption,
+    Statement,
+    TableConstraint,
+};
 use datafusion::logical_expr::var_provider::{is_system_variables, VarType};
 use datafusion::logical_expr::{AggregateUDF, Expr, LogicalPlan, ScalarUDF, TableSource, WindowUDF};
 use datafusion::sql::planner::{object_name_to_table_reference, ContextProvider, SqlToRel};
@@ -187,8 +194,11 @@ impl<'a> PostgresPlanner<'a> {
                                 if characteristics.is_some() {
                                     return Err(SqlError::unsupported("CREATE TABLE .. [ DEFERRABLE | NOT DEFERRABLE ] [ INITIALLY DEFERRED | INITIALLY IMMEDIATE ]"));
                                 }
-                                column_builder
-                                    .add_unique_constraint(is_primary, option.name.map(|ident| ident.value))?;
+                                column_builder.add_unique_constraint(
+                                    is_primary,
+                                    option.name.map(|ident| ident.value),
+                                    NullsDistinctOption::None,
+                                )?;
                             },
                             ColumnOption::Materialized(_) => {
                                 return Err(SqlError::invalid("CREATE TABLE .. (column_name .. MATERIALIZE ..)"))
@@ -229,10 +239,10 @@ impl<'a> PostgresPlanner<'a> {
                 }
                 for constraint in constraints {
                     match constraint {
-                        TableConstraint::Unique { name, index_name, columns, .. } => {
+                        TableConstraint::Unique { name, index_name, columns, nulls_distinct, .. } => {
                             let index_name = index_name.or(name).map(|ident| ident.value);
                             let column_names = columns.into_iter().map(|ident| ident.value).collect();
-                            table_descriptor_builder.add_unique_index(index_name, column_names)?;
+                            table_descriptor_builder.add_unique_index(index_name, column_names, nulls_distinct)?;
                         },
                         TableConstraint::PrimaryKey { name, index_name, columns, .. } => {
                             let index_name = index_name.or(name).map(|ident| ident.value);
@@ -563,7 +573,7 @@ mod tests {
     use datafusion::logical_expr::LogicalPlan;
 
     use super::PostgresPlanner;
-    use crate::protos::{CharacterTypeDeclaration, ColumnTypeDeclaration, ColumnTypeKind};
+    use crate::protos::{CharacterTypeDeclaration, ColumnTypeDeclaration, ColumnTypeKind, IndexKind};
     use crate::sql::plan::CreateTablePlan;
 
     fn session_state() -> SessionState {
@@ -617,13 +627,13 @@ mod tests {
         assert_eq!(descriptor.columns[2].type_declaration, None);
 
         assert_eq!(descriptor.indices[0].id, 1);
-        assert!(descriptor.indices[0].unique);
+        assert_eq!(descriptor.indices[0].kind, IndexKind::PrimaryKey);
         assert_eq!(descriptor.indices[0].column_ids, vec![1]);
         assert_eq!(descriptor.indices[0].storing_column_ids, vec![2, 3]);
 
         assert_eq!(descriptor.indices[1].id, 2);
-        assert!(descriptor.indices[1].unique);
+        assert_eq!(descriptor.indices[1].kind, IndexKind::UniqueNullsDistinct);
         assert_eq!(descriptor.indices[1].column_ids, vec![2]);
-        assert_eq!(descriptor.indices[1].storing_column_ids, vec![1]);
+        assert_eq!(descriptor.indices[1].storing_column_ids, Vec::<u32>::new());
     }
 }

@@ -72,7 +72,7 @@ impl<'a> TableDescriptorFetcher<'a> {
         else {
             return Ok(None);
         };
-        let table = Arc::new(SqlTable::new(table_descriptor));
+        let table = Arc::new(SqlTable::new(table_ref.clone(), table_descriptor));
         self.tables.insert(table_ref.clone().into(), table.clone());
         Ok(Some(table))
     }

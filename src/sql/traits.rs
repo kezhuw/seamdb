@@ -24,7 +24,7 @@ use datafusion::sql::sqlparser::ast::{visit_relations, Statement};
 use datafusion::sql::{ResolvedTableReference, TableReference};
 
 use super::error::SqlError;
-use crate::protos::{ColumnDescriptor, IndexDescriptor, TableDescriptor};
+use crate::protos::{ColumnDescriptor, IndexDescriptor, IndexKind, TableDescriptor};
 
 pub trait TableSchema {
     fn add_column(&mut self, column: ColumnDescriptor) -> &mut ColumnDescriptor;
@@ -41,26 +41,19 @@ impl TableSchema for TableDescriptor {
 
     fn add_index(&mut self, mut index: IndexDescriptor) {
         index.id = self.last_index_id + 1;
-        if index.storing_column_ids.is_empty() {
-            match self.indices.first() {
-                None => {
-                    assert!(index.unique);
-                    // This is the primary index.
-                    index.storing_column_ids.extend(
-                        self.columns
-                            .iter()
-                            .map(|column| column.id)
-                            .filter(|column_id| !index.column_ids.iter().copied().any(|id| id == *column_id)),
-                    );
-                },
-                Some(primary_index) => index.storing_column_ids.extend_from_slice(&primary_index.column_ids),
-            }
+        if index.is_primary() {
+            assert!(index.storing_column_ids.is_empty());
+            index.storing_column_ids.extend(
+                self.columns.iter().map(|column| column.id).filter(|column_id| !index.column_ids.contains(column_id)),
+            );
         }
         if index.name.is_empty() {
-            index.name = match (self.indices.len(), index.unique) {
-                (0, true) => format!("primary_index_{}", index.id),
-                (_, true) => format!("unique_index_{}", index.id),
-                (_, _) => format!("index_{}", index.id),
+            index.name = match index.kind {
+                IndexKind::PrimaryKey => format!("primary_index_{}", index.id),
+                IndexKind::UniqueNullsDistinct | IndexKind::UniqueNullsNotDistinct => {
+                    format!("unique_index_{}", index.id)
+                },
+                IndexKind::NotUnique => format!("index_{}", index.id),
             };
         }
         self.last_index_id = index.id;

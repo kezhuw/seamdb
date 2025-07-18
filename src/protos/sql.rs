@@ -12,23 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 
 use bytes::{Buf, BufMut};
 use prost::Message;
 
 use crate::protos::{
+    Column,
     ColumnDescriptor,
     ColumnTypeKind,
     ColumnValue,
     DatabaseDescriptor,
     DescriptorMeta,
     IndexDescriptor,
+    IndexKind,
     SchemaDescriptor,
     StoringFloat32,
     StoringFloat64,
     TableDescriptor,
 };
+
+impl Display for IndexKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotUnique => f.write_str("index"),
+            Self::UniqueNullsDistinct => f.write_str("unique nulls distinct"),
+            Self::UniqueNullsNotDistinct => f.write_str("unique nulls not distinct"),
+            Self::PrimaryKey => f.write_str("primary index"),
+        }
+    }
+}
 
 pub trait NamespaceDescriptor {
     fn kind() -> &'static str;
@@ -113,7 +127,7 @@ impl TableDescriptor {
 
     pub fn primary_index(&self) -> &IndexDescriptor {
         for index in self.indices.iter() {
-            if index.id == 1 {
+            if index.is_primary() {
                 return index;
             }
         }
@@ -134,6 +148,10 @@ impl TableDescriptor {
         key
     }
 
+    pub fn column_indices(&self, columns: impl Iterator<Item = u32>) -> Vec<usize> {
+        columns.map(|id| self.columns.iter().position(|column| column.id == id).unwrap()).collect()
+    }
+
     pub fn find_column(&self, name: &str) -> Option<&ColumnDescriptor> {
         self.columns.iter().find(|column| column.name == name)
     }
@@ -142,22 +160,30 @@ impl TableDescriptor {
         self.columns.iter().find(|column| column.id == id)
     }
 
-    pub fn decode_storing_columns(&self, index: &IndexDescriptor, mut bytes: &[u8]) -> Vec<Option<ColumnValue>> {
-        let mut values = Vec::with_capacity(index.storing_column_ids.len());
+    pub fn decode_key_columns_to(&self, index: &IndexDescriptor, mut bytes: &[u8], row: &mut Vec<Column>) {
+        let prefix = self.index_prefix(index);
+        bytes.advance(prefix.len());
+        loop {
+            let id = bytes.get_u32();
+            if id == 0 {
+                break;
+            }
+            let value = ColumnValue::decode_from_key(&mut bytes);
+            let column = self.column(id).unwrap();
+            if value.type_kind() != column.type_kind {
+                panic!("index {index:?} column {column:?} mismatch column value {value:?}")
+            }
+            row.push(Column::new(id, Some(value)));
+        }
+    }
+
+    pub fn decode_value_columns_to(&self, index: &IndexDescriptor, mut bytes: &[u8], row: &mut Vec<Column>) {
         loop {
             let id = bytes.get_u32();
             if id == 0 {
                 break;
             }
             let value = ColumnValue::decode(&mut bytes);
-            let i = values.len();
-            if i >= index.storing_column_ids.len() {
-                values.push(value);
-                panic!("index key has more columns than descriptor {index:?}: {values:?}")
-            }
-            if id != index.storing_column_ids[i] {
-                panic!("index descriptor {index:?} does not have column id {id}")
-            }
             let column = self.column(id).unwrap();
             match value.as_ref().map(|v| v.type_kind()) {
                 None => {
@@ -171,48 +197,26 @@ impl TableDescriptor {
                     }
                 },
             }
-            values.push(value);
+            row.push(Column::new(id, value));
         }
-        if values.len() != index.storing_column_ids.len() {
-            panic!("index {index:?} get mismatching values {values:?}")
-        }
-        values
     }
 
-    pub fn decode_index_key(&self, index: &IndexDescriptor, mut bytes: &[u8]) -> Vec<ColumnValue> {
-        let prefix = self.index_prefix(index);
-        bytes.advance(prefix.len());
-        let mut values = Vec::with_capacity(index.column_ids.len());
-        loop {
-            let id = bytes.get_u32();
-            if id == 0 {
-                break;
-            }
-            let value = ColumnValue::decode_from_key(&mut bytes);
-            let i = values.len();
-            if i >= index.column_ids.len() {
-                values.push(value);
-                panic!("index key has more columns than descriptor {index:?}: {values:?}")
-            }
-            if id != index.column_ids[i] {
-                panic!("index descriptor {index:?} does not have column id {id}")
-            }
-            let column = self.column(id).unwrap();
-            if value.type_kind() != column.type_kind {
-                panic!("index {index:?} column {column:?} mismatch column value {value:?}")
-            }
-            values.push(value);
-        }
-        if values.len() != index.column_ids.len() {
-            panic!("index {index:?} get mismatching keys {values:?}")
-        }
+    pub fn decode_key_columns(&self, index: &IndexDescriptor, bytes: &[u8]) -> Vec<Column> {
+        let mut keys = Vec::with_capacity(index.column_ids.len());
+        self.decode_key_columns_to(index, bytes, &mut keys);
+        keys
+    }
+
+    pub fn decode_value_columns(&self, index: &IndexDescriptor, bytes: &[u8]) -> Vec<Column> {
+        let mut values = Vec::with_capacity(index.storing_column_ids.len());
+        self.decode_value_columns_to(index, bytes, &mut values);
         values
     }
 }
 
 impl IndexDescriptor {
     pub fn is_primary(&self) -> bool {
-        self.id == 1
+        self.kind == IndexKind::PrimaryKey
     }
 
     pub fn sole_column(&self) -> Option<u32> {
@@ -220,6 +224,44 @@ impl IndexDescriptor {
             return Some(self.column_ids[0]);
         }
         None
+    }
+}
+
+impl Column {
+    pub fn new(id: u32, value: Option<ColumnValue>) -> Self {
+        Self { id, value }
+    }
+
+    pub fn with_value(id: u32, value: ColumnValue) -> Self {
+        Self { id, value: Some(value) }
+    }
+
+    pub fn new_null(id: u32) -> Self {
+        Self { id, value: None }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.value.is_none()
+    }
+
+    pub fn encode_as_key(&self, buf: &mut impl BufMut) {
+        buf.put_u32(self.id);
+        match self.value.as_ref() {
+            None => {
+                buf.put_i32(-1);
+            },
+            Some(value) => value.encode_as_key(buf),
+        }
+    }
+
+    pub fn encode_as_value(&self, buf: &mut impl BufMut) {
+        buf.put_u32(self.id);
+        match self.value.as_ref() {
+            None => {
+                buf.put_i32(-1);
+            },
+            Some(value) => value.encode(buf),
+        }
     }
 }
 

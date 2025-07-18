@@ -110,6 +110,14 @@ pub struct StoringFloat64 {
     #[prost(double, tag = "1")]
     pub value: f64,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Column {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    #[prost(message, optional, tag = "2")]
+    pub value: ::core::option::Option<ColumnValue>,
+}
 #[derive(Eq, Hash, PartialOrd)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -158,10 +166,12 @@ pub struct IndexDescriptor {
     pub id: u32,
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
-    #[prost(bool, tag = "3")]
-    pub unique: bool,
+    #[prost(enumeration = "!IndexKind", tag = "3")]
+    pub kind: IndexKind,
+    /// Declared index columns.
     #[prost(uint32, repeated, tag = "4")]
     pub column_ids: ::prost::alloc::vec::Vec<u32>,
+    /// Declared storing columns,
     #[prost(uint32, repeated, tag = "5")]
     pub storing_column_ids: ::prost::alloc::vec::Vec<u32>,
 }
@@ -205,6 +215,38 @@ impl ColumnTypeKind {
             "Float64" => Some(Self::Float64),
             "Bytes" => Some(Self::Bytes),
             "String" => Some(Self::String),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum IndexKind {
+    NotUnique = 0,
+    UniqueNullsDistinct = 1,
+    UniqueNullsNotDistinct = 2,
+    PrimaryKey = 3,
+}
+impl IndexKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            IndexKind::NotUnique => "NotUnique",
+            IndexKind::UniqueNullsDistinct => "UNIQUE_NULLS_DISTINCT",
+            IndexKind::UniqueNullsNotDistinct => "UNIQUE_NULLS_NOT_DISTINCT",
+            IndexKind::PrimaryKey => "PRIMARY_KEY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NotUnique" => Some(Self::NotUnique),
+            "UNIQUE_NULLS_DISTINCT" => Some(Self::UniqueNullsDistinct),
+            "UNIQUE_NULLS_NOT_DISTINCT" => Some(Self::UniqueNullsNotDistinct),
+            "PRIMARY_KEY" => Some(Self::PrimaryKey),
             _ => None,
         }
     }

@@ -13,21 +13,23 @@
 // limitations under the License.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut};
 use tracing::trace;
 
 use super::error::SqlError;
+use super::Row;
 use crate::kv::{KvClient, KvError, KvSemantics, LazyInitTimestampedKvClient, SharedKvClient};
 use crate::protos::{
+    Column,
     ColumnDescriptor,
     ColumnTypeKind,
     ColumnValue,
     DatabaseDescriptor,
     DescriptorMeta,
     IndexDescriptor,
+    IndexKind,
     KeyRange,
     NamespaceDescriptor,
     SchemaDescriptor,
@@ -242,6 +244,25 @@ impl SqlClient {
         }
     }
 
+    fn validate_column(column: &Column, table: &TableDescriptor, desc: &ColumnDescriptor) -> Result<(), SqlError> {
+        let Some(value) = &column.value else {
+            if !desc.nullable {
+                return Err(SqlError::NotNullableColumn { table: table.name.clone(), column: desc.name.clone() });
+            }
+            return Ok(());
+        };
+        let value_type = value.type_kind();
+        if value_type != desc.type_kind {
+            return Err(SqlError::MismatchColumnType {
+                table: table.name.clone(),
+                column: desc.name.clone(),
+                expect: desc.type_kind,
+                actual: value_type,
+            });
+        }
+        Ok(())
+    }
+
     pub async fn prefill_row(&self, table: &TableDescriptor, row: &mut Row) -> Result<(), SqlError> {
         for column_descriptor in table.columns.iter() {
             let Some(column) = row.find_column(column_descriptor.id) else {
@@ -286,7 +307,7 @@ impl SqlClient {
                 }
                 return Err(SqlError::MissingColumn(column_descriptor.name.clone()));
             };
-            column.check(table, column_descriptor)?;
+            Self::validate_column(column, table, column_descriptor)?;
         }
         Ok(())
     }
@@ -421,127 +442,6 @@ impl KvClient for SqlClient {
 //
 //  table/index/primary_keys ==> (version, key1, key2)
 
-#[derive(Debug, Clone)]
-pub struct Column {
-    id: u32,
-    value: Option<ColumnValue>,
-}
-
-impl Column {
-    pub fn new(id: u32, value: Option<ColumnValue>) -> Self {
-        Self { id, value }
-    }
-
-    pub fn with_value(id: u32, value: ColumnValue) -> Self {
-        Self { id, value: Some(value) }
-    }
-
-    pub fn new_null(id: u32) -> Self {
-        Self { id, value: None }
-    }
-
-    pub fn check(&self, table: &TableDescriptor, column: &ColumnDescriptor) -> Result<(), SqlError> {
-        let Some(value) = &self.value else {
-            if !column.nullable {
-                return Err(SqlError::NotNullableColumn { table: table.name.clone(), column: column.name.clone() });
-            }
-            return Ok(());
-        };
-        let value_type = value.type_kind();
-        if value_type != column.type_kind {
-            return Err(SqlError::MismatchColumnType {
-                table: table.name.clone(),
-                column: column.name.clone(),
-                expect: column.type_kind,
-                actual: value_type,
-            });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Row {
-    columns: HashMap<u32, Column>,
-}
-
-impl Row {
-    pub fn serial_column_value(&self, descriptor: &ColumnDescriptor) -> u64 {
-        let Some(column) = self.columns.get(&descriptor.id) else {
-            panic!("row does not have column {}", descriptor.name)
-        };
-        match &column.value {
-            Some(ColumnValue::Int16(i)) => *i as u64,
-            Some(ColumnValue::Int32(i)) => *i as u64,
-            Some(ColumnValue::Int64(i)) => *i as u64,
-            _ => panic!("row does not have serial column {}, value {:?}", descriptor.name, column.value),
-        }
-    }
-
-    pub fn find_column(&self, id: u32) -> Option<&Column> {
-        self.columns.get(&id)
-    }
-
-    pub fn take_column(&mut self, id: u32) -> Option<ColumnValue> {
-        self.columns.remove(&id).and_then(|c| c.value)
-    }
-
-    pub fn index_range(&self, table: &TableDescriptor, index: &IndexDescriptor) -> KeyRange {
-        let mut key = table.index_prefix(index);
-        for id in index.column_ids.iter().copied() {
-            match self.find_column(id) {
-                None => {
-                    let mut end = key.clone();
-                    key.put_i32(id as i32);
-                    end.put_i32((id + 1) as i32);
-                    return KeyRange::new(key, end);
-                },
-                Some(column) => {
-                    key.put_i32(id as i32);
-                    column.value.as_ref().unwrap().encode_as_key(&mut key);
-                },
-            };
-        }
-        let mut end = key.clone();
-        key.put_u32(0);
-        end.put_u32(1);
-        KeyRange::new(key, end)
-    }
-
-    pub fn index_key(&self, table: &TableDescriptor, index: &IndexDescriptor) -> Vec<u8> {
-        let mut key = table.index_prefix(index);
-        for id in index.column_ids.iter().copied() {
-            let column = self.find_column(id).unwrap();
-            key.put_u32(column.id);
-            match column.value.as_ref() {
-                None => key.put_i32(-1),
-                Some(value) => value.encode_as_key(&mut key),
-            }
-        }
-        key.put_u32(0);
-        key
-    }
-
-    pub fn index_kv(&self, table: &TableDescriptor, index: &IndexDescriptor) -> (Vec<u8>, Vec<u8>) {
-        let key = self.index_key(table, index);
-        let mut value_bytes = Vec::new();
-        for id in index.storing_column_ids.iter().copied() {
-            let column = self.find_column(id).unwrap_or_else(|| panic!("no column {id} for index {}", index.id));
-            value_bytes.put_u32(column.id);
-            match column.value.as_ref() {
-                None => value_bytes.put_i32(-1),
-                Some(value) => value.encode(&mut value_bytes),
-            }
-        }
-        value_bytes.put_u32(0);
-        (key, value_bytes)
-    }
-
-    pub fn add_column(&mut self, column: Column) {
-        self.columns.insert(column.id, column);
-    }
-}
-
 pub struct DatabasesTable {
     descriptor: TableDescriptor,
 }
@@ -582,13 +482,13 @@ impl DatabasesTable {
 
     pub fn decode_columns(&self, index: &IndexDescriptor, kv: TimestampedKeyValue) -> (u64, String, Vec<u8>) {
         let mut row = Row::default();
-        for (i, value) in self.descriptor.decode_index_key(index, &kv.key).into_iter().enumerate() {
-            row.add_column(Column::new(index.column_ids[i], Some(value)));
+        for column in self.descriptor.decode_key_columns(index, &kv.key) {
+            row.add_column(column);
         }
-        let index_values =
-            self.descriptor.decode_storing_columns(index, kv.value.read_bytes(&kv.key, "sql key value").unwrap());
-        for (i, value) in index_values.into_iter().enumerate() {
-            row.add_column(Column::new(index.storing_column_ids[i], value));
+        for column in
+            self.descriptor.decode_value_columns(index, kv.value.read_bytes(&kv.key, "sql key value").unwrap())
+        {
+            row.add_column(column);
         }
         let id = row.take_column(self.id_column().id).unwrap().into_u64();
         let name = row.take_column(self.name_column().id).unwrap().into_string();
@@ -647,16 +547,16 @@ fn databases_table_descriptor() -> TableDescriptor {
             IndexDescriptor {
                 id: 1,
                 name: "primary".to_string(),
-                unique: true,
+                kind: IndexKind::PrimaryKey,
                 column_ids: vec![1],
                 storing_column_ids: vec![2, 3, 4],
             },
             IndexDescriptor {
                 id: 2,
                 name: "naming".to_string(),
-                unique: true,
+                kind: IndexKind::UniqueNullsDistinct,
                 column_ids: vec![2, 3],
-                storing_column_ids: vec![1, 4],
+                storing_column_ids: vec![4],
             },
         ],
         last_index_id: 2,

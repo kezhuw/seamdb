@@ -31,7 +31,15 @@ use datafusion::common::arrow::array::builder::{
 };
 use datafusion::common::arrow::datatypes::{self, Field, Fields, Schema, SchemaRef};
 use datafusion::common::arrow::record_batch::RecordBatch;
-use datafusion::common::{not_impl_err, plan_err, Constraint, Constraints, DataFusionError, Result as DFResult};
+use datafusion::common::{
+    not_impl_err,
+    plan_err,
+    Constraint,
+    Constraints,
+    DFSchema,
+    DataFusionError,
+    Result as DFResult,
+};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::logical_plan::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableSource, TableType};
@@ -39,13 +47,23 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{project_schema, Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::sql::ResolvedTableReference;
 use tokio::sync::mpsc;
 
 use super::insert::InsertExec;
 use crate::kv::KvClient;
-use crate::protos::{ColumnTypeKind, ColumnValue, IndexDescriptor, TableDescriptor, TimestampedKeyValue};
+use crate::protos::{
+    ColumnDescriptor,
+    ColumnTypeKind,
+    ColumnValue,
+    IndexDescriptor,
+    IndexKind,
+    TableDescriptor,
+    TimestampedKeyValue,
+};
 use crate::sql::client::SqlClient;
 use crate::sql::error::SqlError;
+use crate::sql::Row;
 
 impl TryFrom<&datatypes::DataType> for ColumnTypeKind {
     type Error = DataFusionError;
@@ -78,7 +96,7 @@ impl From<ColumnTypeKind> for datatypes::DataType {
 #[derive(Clone, Debug)]
 pub struct SqlTable {
     pub descriptor: TableDescriptor,
-    schema: Arc<Schema>,
+    schema: DFSchema,
     constraints: Constraints,
 }
 
@@ -90,26 +108,34 @@ fn build_table_schema_and_constraints(descriptor: &TableDescriptor) -> (Schema, 
         .collect();
     let schema = Schema::new(fields);
     let mut constraints = Vec::with_capacity(descriptor.indices.len());
-    for (i, index) in descriptor.indices.iter().enumerate() {
-        if !index.unique {
-            continue;
-        }
-        let indices = index
-            .column_ids
-            .iter()
-            .copied()
-            .map(|id| descriptor.columns.iter().position(|column| column.id == id).unwrap())
-            .collect();
-        let constraint = if i == 0 { Constraint::PrimaryKey(indices) } else { Constraint::Unique(indices) };
+    for index in descriptor.indices.iter() {
+        let indices = match index.kind {
+            IndexKind::NotUnique => {
+                let primary_index = descriptor.primary_index();
+                let unique_column_ids = index
+                    .column_ids
+                    .iter()
+                    .copied()
+                    .chain(primary_index.column_ids.iter().copied().filter(|id| !index.column_ids.contains(id)));
+                descriptor.column_indices(unique_column_ids)
+            },
+            _ => descriptor.column_indices(index.column_ids.iter().copied()),
+        };
+        let constraint = if index.kind == IndexKind::PrimaryKey {
+            Constraint::PrimaryKey(indices)
+        } else {
+            Constraint::Unique(indices)
+        };
         constraints.push(constraint);
     }
     (schema, Constraints::new_unverified(constraints))
 }
 
 impl SqlTable {
-    pub fn new(descriptor: TableDescriptor) -> Self {
+    pub fn new(reference: ResolvedTableReference, descriptor: TableDescriptor) -> Self {
         let (schema, constraints) = build_table_schema_and_constraints(&descriptor);
-        Self { descriptor, schema: Arc::new(schema), constraints }
+        let schema = DFSchema::try_from(schema).unwrap().replace_qualifier(reference);
+        Self { descriptor, schema, constraints }
     }
 
     pub fn name(&self) -> &str {
@@ -123,7 +149,7 @@ impl TableSource for SqlTable {
     }
 
     fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
+        self.schema.inner().clone()
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -138,7 +164,7 @@ impl TableProvider for SqlTable {
     }
 
     fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
+        self.schema.inner().clone()
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -156,7 +182,7 @@ impl TableProvider for SqlTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let schema = project_schema(&self.schema, projection)?;
+        let schema = project_schema(self.schema.inner(), projection)?;
         Ok(Arc::new(SqlTableScanExec::new(self.clone(), schema)))
     }
 
@@ -244,40 +270,23 @@ impl ExecutionPlan for SqlTableScanExec {
 struct ClusteredRowBuilder<'a> {
     table: &'a TableDescriptor,
     index: &'a IndexDescriptor,
-    columns: Vec<Option<(usize, ColumnTypeKind)>>,
+    row: Row,
+    columns: Vec<&'a ColumnDescriptor>,
+    builder: RowBuilder,
+}
+
+struct RowBuilder {
     builder: StructBuilder,
 }
 
-impl<'a> ClusteredRowBuilder<'a> {
-    pub fn new(fields: Fields, table: &'a TableDescriptor, index: &'a IndexDescriptor) -> Self {
-        let mut columns = Vec::with_capacity(index.column_ids.len() + index.storing_column_ids.len());
-        for column_id in index.column_ids.iter().chain(index.storing_column_ids.iter()).copied() {
-            let column = table.column(column_id).unwrap();
-            let Some((i, _field)) = fields.find(&column.name) else {
-                columns.push(Default::default());
-                continue;
-            };
-            columns.push(Some((i, column.type_kind)));
-        }
-        Self { table, index, columns, builder: StructBuilder::from_fields(fields, 128) }
+impl RowBuilder {
+    pub fn new(fields: Fields) -> Self {
+        Self { builder: StructBuilder::from_fields(fields, 128) }
     }
 
     pub fn finish(&mut self) -> RecordBatch {
         let array = self.builder.finish();
         RecordBatch::from(array)
-    }
-
-    pub fn add_row(&mut self, row: TimestampedKeyValue) {
-        let keys = self.table.decode_index_key(self.index, &row.key);
-        let value_bytes = row.value.read_bytes(&row.key, "sql key value").unwrap();
-        let values = self.table.decode_storing_columns(self.index, value_bytes);
-        for (i, value) in keys.iter().map(Some).chain(values.iter().map(Option::as_ref)).enumerate() {
-            let Some((j, type_kind)) = self.columns[i] else {
-                continue;
-            };
-            self.add_field(j, type_kind, value);
-        }
-        self.builder.append(true);
     }
 
     fn add_boolean_field(builder: &mut BooleanBuilder, value: Option<&ColumnValue>) {
@@ -344,6 +353,10 @@ impl<'a> ClusteredRowBuilder<'a> {
         builder.append_option(bytes);
     }
 
+    fn finish_one_row(&mut self) {
+        self.builder.append(true);
+    }
+
     fn add_field(&mut self, i: usize, type_kind: ColumnTypeKind, value: Option<&ColumnValue>) {
         match type_kind {
             ColumnTypeKind::Boolean => {
@@ -379,6 +392,33 @@ impl<'a> ClusteredRowBuilder<'a> {
                 Self::add_string_field(builder, value);
             },
         }
+    }
+}
+
+impl<'a> ClusteredRowBuilder<'a> {
+    pub fn new(fields: Fields, table: &'a TableDescriptor, index: &'a IndexDescriptor) -> Self {
+        let mut columns = Vec::with_capacity(fields.len());
+        for field in fields.iter() {
+            let column = table.find_column(field.name().as_str()).unwrap();
+            columns.push(column);
+        }
+        Self { table, index, row: Default::default(), columns, builder: RowBuilder::new(fields) }
+    }
+
+    pub fn finish(&mut self) -> RecordBatch {
+        self.builder.finish()
+    }
+
+    pub fn add_row(&mut self, row: TimestampedKeyValue) {
+        self.row.clear();
+        self.table.decode_key_columns_to(self.index, &row.key, self.row.columns_mut());
+        let value_bytes = row.value.read_bytes(&row.key, "sql key value").unwrap();
+        self.table.decode_value_columns_to(self.index, value_bytes, self.row.columns_mut());
+        for (i, desc) in self.columns.iter().copied().enumerate() {
+            let column = self.row.find_column(desc.id).unwrap();
+            self.builder.add_field(i, desc.type_kind, column.value.as_ref());
+        }
+        self.builder.finish_one_row();
     }
 }
 

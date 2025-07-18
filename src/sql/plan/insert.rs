@@ -44,8 +44,8 @@ use tokio::sync::mpsc;
 use tracing::{instrument, trace};
 
 use super::table::SqlTable;
-use crate::protos::{ColumnTypeKind, ColumnValue};
-use crate::sql::client::{Column, Row, SqlClient};
+use crate::protos::{Column, ColumnTypeKind, ColumnValue};
+use crate::sql::{Row, SqlClient};
 
 lazy_static! {
     pub static ref INSERT_COUNT_SCHEMA: Arc<Schema> =

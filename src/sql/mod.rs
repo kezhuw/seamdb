@@ -18,6 +18,7 @@ mod descriptor;
 mod error;
 mod plan;
 pub mod postgresql;
+mod row;
 mod shared;
 mod traits;
 use std::collections::HashMap;
@@ -34,12 +35,13 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::sql::{ResolvedTableReference, TableReference};
 
-use self::client::SqlClient;
+pub use self::client::SqlClient;
 use self::context::SqlContext;
 use self::descriptor::TableDescriptorFetcher;
 pub use self::error::SqlError;
 use self::plan::{CreateDatabaseExec, DropTableExec};
 use self::postgresql::PostgresPlanner;
+pub use self::row::Row;
 use self::traits::*;
 use crate::kv::{KvClient, KvSemantics};
 
@@ -270,5 +272,156 @@ mod tests {
         assert_eq!(column_database.value(0), "test1");
         assert_eq!(column_schema.value(0), "public");
         assert_eq!(column_client_port.value(0), 0);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[tracing_test::traced_test]
+    async fn unique_nulls_distinct() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager = LogManager::from(MemoryLogFactory);
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env).scope(TableDescriptor::POSTGRESQL_DIALECT_PREFIX);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let executor = PostgreSqlExecutor::new(
+            SqlContext::new_unconnected(client, Some("test1".to_string()), "user1".to_string()).into(),
+        );
+        let mut stream = executor.execute_sql("CREATE DATABASE test1").await.unwrap();
+        while let Some(_record) = stream.next().await {}
+
+        let mut stream = executor
+            .execute_sql(
+                r#"CREATE TABLE table1 (
+            id serial PRIMARY KEY,
+            name text,
+            description text,
+            CONSTRAINT unique_name UNIQUE NULLS DISTINCT (name)
+        );"#,
+            )
+            .await
+            .unwrap();
+        while let Some(_record) = stream.next().await {}
+
+        let mut stream = executor
+            .execute_sql(
+                r#"INSERT INTO table1
+                (name, description)
+                VALUES
+                (NULL, 'row1'),
+                ('name2', 'row2'),
+                (NULL, 'row3');
+                "#,
+            )
+            .await
+            .unwrap();
+        let record = stream.next().await.unwrap().unwrap();
+        let column = record.column(0);
+        let array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(array.value(0), 3u64);
+
+        let mut stream =
+            executor.execute_sql("select id, name, description from table1 ORDER BY id ASC;").await.unwrap();
+
+        let record = stream.next().await.unwrap().unwrap();
+        let column_id = record.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let column_name = record.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let column_description = record.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(column_id.value(0), 1);
+        assert!(column_name.is_null(0));
+        assert_eq!(column_description.value(0), "row1");
+
+        assert_eq!(column_id.value(1), 2);
+        assert_eq!(column_name.value(1), "name2");
+        assert_eq!(column_description.value(1), "row2");
+
+        assert_eq!(column_id.value(2), 3);
+        assert!(column_name.is_null(2));
+        assert_eq!(column_description.value(2), "row3");
+
+        let mut stream = executor
+            .execute_sql(
+                r#"INSERT INTO table1
+                (name, description)
+                VALUES
+                ('name2', 'row4');
+                "#,
+            )
+            .await
+            .unwrap();
+        stream.next().await.unwrap().unwrap_err();
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[tracing_test::traced_test]
+    async fn unique_nulls_not_distinct() {
+        let etcd = etcd_container();
+        let cluster_uri = etcd.uri().with_path("/team1/seamdb1").unwrap();
+
+        let node_id = NodeId::new_random();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = Endpoint::try_from(address.as_str()).unwrap();
+        let (nodes, lease) =
+            EtcdNodeRegistry::join(cluster_uri.clone(), node_id.clone(), Some(endpoint.to_owned())).await.unwrap();
+        let log_manager = LogManager::from(MemoryLogFactory);
+        let cluster_env = ClusterEnv::new(log_manager.into(), nodes).with_replicas(1);
+        let mut cluster_meta_handle =
+            EtcdClusterMetaDaemon::start("seamdb1", cluster_uri.clone(), cluster_env.clone()).await.unwrap();
+        let descriptor_watcher = cluster_meta_handle.watch_descriptor(None).await.unwrap();
+        let deployment_watcher = cluster_meta_handle.watch_deployment(None).await.unwrap();
+        let cluster_env = cluster_env.with_descriptor(descriptor_watcher).with_deployment(deployment_watcher.monitor());
+        let _node = TabletNode::start(node_id, listener, lease, cluster_env.clone());
+        let client = TabletClient::new(cluster_env).scope(TableDescriptor::POSTGRESQL_DIALECT_PREFIX);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let executor = PostgreSqlExecutor::new(
+            SqlContext::new_unconnected(client, Some("test1".to_string()), "user1".to_string()).into(),
+        );
+        let mut stream = executor.execute_sql("CREATE DATABASE test1").await.unwrap();
+        while let Some(_record) = stream.next().await {}
+
+        let mut stream = executor
+            .execute_sql(
+                r#"CREATE TABLE table1 (
+            id serial PRIMARY KEY,
+            name text,
+            description text,
+            CONSTRAINT unique_name UNIQUE NULLS NOT DISTINCT (name)
+        );"#,
+            )
+            .await
+            .unwrap();
+        while let Some(_record) = stream.next().await {}
+
+        let mut stream = executor
+            .execute_sql(
+                r#"INSERT INTO table1
+                (name, description)
+                VALUES
+                (NULL, 'row1'),
+                ('name2', 'row2'),
+                (NULL, 'row3');
+                "#,
+            )
+            .await
+            .unwrap();
+        stream.next().await.unwrap().unwrap_err();
     }
 }
