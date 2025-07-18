@@ -432,7 +432,8 @@ pub mod tests {
     // There are request timeouts in case of current_thread scheduler.
     // I guess there are blocking operations in async context. But after
     // bumping both tokio and rdkafka, the phenomenon still exists.
-    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_kafka_basic() {
         let kafka = KafkaContainer::new();

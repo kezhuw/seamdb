@@ -137,7 +137,8 @@ mod tests {
         (cluster_meta_handle, node, client)
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_compact_files() {
         let etcd = etcd_container();

@@ -299,7 +299,8 @@ mod tests {
         assert_eq!(buf.as_slice(), format!("{first_line}{second_line}").as_bytes());
     }
 
-    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn log_based_file() {
         let kafka = KafkaContainer::new();

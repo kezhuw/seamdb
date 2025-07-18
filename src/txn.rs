@@ -642,7 +642,8 @@ mod tests {
     use crate::protos::{HasTxnMeta, TxnStatus, Value};
     use crate::tablet::{TabletClient, TabletNode};
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn txn_write_multiple() {
         let etcd = etcd_container();
@@ -681,7 +682,8 @@ mod tests {
             .is_equal_to((commit_ts, Value::Int(100)));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn txn_write_push_forward() {
         let etcd = etcd_container();
@@ -721,7 +723,8 @@ mod tests {
         assert_that!(read_value).is_equal_to(Value::Int(1));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn txn_read_refresh() {
         let etcd = etcd_container();
@@ -769,7 +772,8 @@ mod tests {
         assert_that!(value).is_equal_to(tablet_id_value);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn txn_read_refresh_scan() {
         let etcd = etcd_container();
@@ -820,7 +824,8 @@ mod tests {
         assert_eq!(sum, 110);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn txn_commit_push_forward() {
         let etcd = etcd_container();
@@ -856,7 +861,8 @@ mod tests {
         assert_that!(txn.wrapped().txn().commit_ts()).is_greater_than(commit_ts);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn txn_abort() {
         let etcd = etcd_container();

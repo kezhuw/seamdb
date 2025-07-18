@@ -170,7 +170,8 @@ mod tests {
     use crate::sql::context::SqlContext;
     use crate::tablet::{TabletClient, TabletNode};
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn query() {
         let etcd = etcd_container();

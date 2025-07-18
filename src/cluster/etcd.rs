@@ -150,7 +150,8 @@ pub mod tests {
         EtcdContainer { container: unsafe { std::mem::transmute(etcd) } }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_etcd_lease() {
         let etcd = etcd_container();

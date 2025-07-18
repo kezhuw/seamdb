@@ -859,7 +859,8 @@ mod tests {
     };
     use crate::utils::{self, DropOwner, WatchConsumer as _};
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     #[should_panic(expected = "cluster deployment not found")]
     async fn test_cluster_deployment_watcher_not_found() {
@@ -867,7 +868,8 @@ mod tests {
         ClusterDeploymentWatcher::new(etcd.uri(), Some(Duration::from_secs(2))).await.unwrap();
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_cluster_deployment_watcher_update() {
         let etcd = etcd_container();
@@ -889,7 +891,8 @@ mod tests {
         }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_cluster_deployment_watcher_deleted() {
         let etcd = etcd_container();
@@ -1012,7 +1015,8 @@ mod tests {
         }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_cluster_meta_deploy() {
         let etcd = etcd_container();

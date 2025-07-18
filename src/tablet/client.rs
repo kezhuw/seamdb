@@ -1230,7 +1230,8 @@ mod tests {
     };
     use crate::tablet::{TabletClient, TabletNode};
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_tablet_client_basic() {
         let etcd = etcd_container();
@@ -1287,7 +1288,8 @@ mod tests {
         assert_that!(client.find(b"kz").await.unwrap().is_none()).is_true();
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_tablet_client_batch() {
         let etcd = etcd_container();
@@ -1368,7 +1370,8 @@ mod tests {
         assert_that!(get.value.unwrap()).is_equal_to(&expect_value);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_tablet_client_find_timestamped() {
         let etcd = etcd_container();
@@ -1416,7 +1419,8 @@ mod tests {
         assert_that!(find1.value.unwrap().value).is_equal_to(Value::Int(10));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_tablet_client_scan_timestamped() {
         let etcd = etcd_container();
@@ -1472,7 +1476,8 @@ mod tests {
         assert_that!(scan.rows[1].value).is_equal_to(Value::Int(10));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn test_tablet_client_scan_transactional() {
         let etcd = etcd_container();
@@ -1544,7 +1549,8 @@ mod tests {
         assert_that!(scan.rows[1].value).is_equal_to(Value::Int(10));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_read_your_write() {
         let etcd = etcd_container();
@@ -1605,7 +1611,8 @@ mod tests {
         assert_eq!(get.value.unwrap().value, Value::Int(5));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_once() {
         let etcd = etcd_container();
@@ -1661,7 +1668,8 @@ mod tests {
         assert_eq!(value, Value::String("v1_1".to_owned()));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_stepped() {
         let etcd = etcd_container();
@@ -1763,7 +1771,8 @@ mod tests {
         }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_resolve_committed() {
         let etcd = etcd_container();
@@ -1894,7 +1903,8 @@ mod tests {
         }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_resolve_aborted() {
         let etcd = etcd_container();
@@ -2024,7 +2034,8 @@ mod tests {
         }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_timeout_aborted() {
         let etcd = etcd_container();
@@ -2122,7 +2133,8 @@ mod tests {
         }
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_refresh_read() {
         let etcd = etcd_container();
@@ -2269,7 +2281,8 @@ mod tests {
         assert_that!(status.message()).contains("conflict with write to key");
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_deadlock() {
         let etcd = etcd_container();
@@ -2436,7 +2449,8 @@ mod tests {
         assert_eq!(value, Value::Int(50));
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_write_beneath_closed_timestamp() {
         let etcd = etcd_container();
@@ -2488,7 +2502,8 @@ mod tests {
         assert_that!(response.into_put().unwrap().write_ts).is_equal_to(written_ts);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_timestamped_write_push_forward() {
         let etcd = etcd_container();
@@ -2601,7 +2616,8 @@ mod tests {
         assert_that!(response.into_put().unwrap().write_ts).is_equal_to(written_ts);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_write_push_forward() {
         let etcd = etcd_container();
@@ -2698,7 +2714,8 @@ mod tests {
         assert_that!(read_value.timestamp).is_equal_to(written_ts);
     }
 
-    #[test_log::test(tokio::test)]
+    #[tokio::test]
+    #[test_log::test]
     #[tracing_test::traced_test]
     async fn tablet_client_transactional_commit_push_forward() {
         let etcd = etcd_container();
